@@ -59,6 +59,8 @@ public interface IConformanceService
 
     Task<string> InspectPointAsync(Point point);
 
+    Task<AllTypes> EchoAllTypesAsync(AllTypes data);
+
     // -- Annotated types -----------------------------------------------------
 
     Task<int> EchoInt32Async(int value);
@@ -135,6 +137,12 @@ public interface IConformanceService
     Task<RpcStream<StreamState>> ProduceWithHeaderAndLogsAsync(long count, ICallContext? ctx = null);
 
     Task<RpcStream<StreamState>> ExchangeWithHeaderAsync(double factor);
+
+    Task<RpcStream<StreamState>> ProduceWithRichHeaderAsync(long seed, long count);
+
+    Task<RpcStream<StreamState>> ExchangeWithRichHeaderAsync(long seed, double factor);
+
+    Task<RpcStream<StreamState>> ProduceDynamicSchemaAsync(long seed, long count, bool includeStrings, bool includeFloats);
 
     // TODO (later milestones — see docs/roadmap.md):
     //   - oversized_unary (HTTP response-cap conformance)

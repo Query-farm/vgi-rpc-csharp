@@ -20,16 +20,21 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       and the wide-Arrow-type methods (need list-of-struct + temporal/decimal support in
       `ValueCodec`), `__describe__`, and `large_payload.*`. See `test_csharp_conformance.py`
       for the exact implemented-subset filter, which grows as more lands.
-- [~] **M3 — Streaming (in progress).** Producer streams (5/5) and the core of exchange streams
-      (7/7: scale/echo/accumulate/with_logs/error_first/error_nth/empty_session) pass the real
-      conformance suite. `RpcServer.ServeStreamAsync`'s lockstep dispatch loop (one continuous
-      output IPC stream + one continuous input/tick stream for the call's lifetime) handles both
-      shapes uniformly — confirmed against the real Python client, not just self-consistently.
+- [~] **M3 — Streaming (nearly done).** Producer streams, exchange streams (core), cancellation,
+      error recovery, stream headers (both `ConformanceHeader` and the multi-type `RichHeader`),
+      and dynamic per-call output schemas all pass the real conformance suite — 89/105 tests
+      overall in the gated subset (`test_csharp_conformance.py`), up from 56/105 at the start of
+      M3. `RpcServer.ServeStreamAsync`'s lockstep dispatch loop handles producer/exchange/
+      cancel/headers uniformly. Also unlocked along the way: list-of-struct support in
+      `ValueCodec` (needed by `RichHeader`/`AllTypes`'s `list_of_nested` fields — hand-built via
+      `ArrowArrayConcatenator` since Arrow's own `ListArray.Builder` factory doesn't support
+      struct elements), which also unblocked `dataclass.echo_all_types(_with_nulls)`.
       Remaining: the `exchange_stream.cast_*` tests (need input-batch type coercion — Python's
-      `_coerce_input_batch`, not yet ported), headers, cancellation, dynamic schema, and
-      client-side stream consumption (`RpcConnection`/`RpcClientProxy` — not needed for
-      conformance, since `vgi-rpc-test` drives our server with its own Python client, but needed
-      before any C#-to-C# streaming test can be written).
+      `_coerce_input_batch`, not yet ported), `large_payload.*` (the known 2GiB+ transport-level
+      gap), `http_response_cap.*` (needs HTTP — M6+), and client-side stream consumption
+      (`RpcConnection`/`RpcClientProxy` — not needed for conformance, since `vgi-rpc-test` drives
+      our server with its own Python client, but needed before any C#-to-C# streaming test can
+      be written).
 - [ ] **M4 — Non-HTTP transports + CLI.** stdio (default), `--unix`, `--tcp`; graceful shutdown.
 - [ ] **M5 — Access log.** JSONL sink matching `access_log.schema.json`.
 - [ ] **M6 — Plain HTTP.** Kestrel server + `HttpClient` client; stream state tokens (AES-GCM).

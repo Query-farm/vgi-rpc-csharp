@@ -41,6 +41,8 @@ public sealed class ConformanceServiceImpl : IConformanceService
 
     public Task<BoundingBox> EchoBoundingBoxAsync(BoundingBox box) => Task.FromResult(box);
 
+    public Task<AllTypes> EchoAllTypesAsync(AllTypes data) => Task.FromResult(data);
+
     public Task<string> InspectPointAsync(Point point) =>
         Task.FromResult($"Point({point.X.ToString(CultureInfo.InvariantCulture)}, {point.Y.ToString(CultureInfo.InvariantCulture)})");
 
@@ -153,5 +155,18 @@ public sealed class ConformanceServiceImpl : IConformanceService
         // that so "2.0" in description-style conformance assertions see what they expect.
         var header = new ConformanceHeader { TotalExpected = 0, Description = $"scaling by {factor.ToString("0.0###############", CultureInfo.InvariantCulture)}" };
         return Task.FromResult(new RpcStream<StreamState>(ExchangeSchemas.Scale, new ScaleExchangeState(factor), InputSchema: ExchangeSchemas.Scale, Header: header));
+    }
+
+    public Task<RpcStream<StreamState>> ProduceWithRichHeaderAsync(long seed, long count) =>
+        Task.FromResult(new RpcStream<StreamState>(ConformanceStreamSchemas.Counter, new CounterState(count), Header: RichHeaderBuilder.Build(seed)));
+
+    public Task<RpcStream<StreamState>> ExchangeWithRichHeaderAsync(long seed, double factor) =>
+        Task.FromResult(new RpcStream<StreamState>(ExchangeSchemas.Scale, new ScaleExchangeState(factor), InputSchema: ExchangeSchemas.Scale, Header: RichHeaderBuilder.Build(seed)));
+
+    public Task<RpcStream<StreamState>> ProduceDynamicSchemaAsync(long seed, long count, bool includeStrings, bool includeFloats)
+    {
+        var schema = DynamicProducerState.BuildSchema(includeStrings, includeFloats);
+        var state = new DynamicProducerState(schema, count, includeStrings, includeFloats);
+        return Task.FromResult(new RpcStream<StreamState>(schema, state, Header: RichHeaderBuilder.Build(seed)));
     }
 }

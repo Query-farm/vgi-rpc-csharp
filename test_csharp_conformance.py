@@ -54,6 +54,11 @@ IMPLEMENTED_FILTER = ",".join(
         "cancel.*",
         "producer_header.*",
         "exchange_header.*",
+        "rich_header_producer.*",
+        "rich_header_exchange.*",
+        "dynamic_schema_producer.*",
+        "dataclass.echo_all_types",
+        "dataclass.echo_all_types_with_nulls",
     ]
 )
 
