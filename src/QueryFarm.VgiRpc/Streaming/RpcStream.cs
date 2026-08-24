@@ -17,6 +17,13 @@ public interface IRpcStream
     Schema? InputSchema { get; }
 
     StreamState State { get; }
+
+    /// <summary>Optional stream header, written as its own complete IPC stream (schema + one
+    /// row + EOS) before the main output stream begins. Its CLR type's own properties become
+    /// that mini-stream's top-level schema (via <see cref="Reflection.SchemaDerivation.InnerSchemaFor"/>)
+    /// — unlike a dataclass-typed RPC parameter/result, a header is not further wrapped in
+    /// <c>binary</c>, since it already IS the top-level content of its own stream.</summary>
+    object? Header { get; }
 }
 
 /// <summary>
@@ -26,7 +33,7 @@ public interface IRpcStream
 /// Python's <c>Stream[StreamState]</c>. Named <c>RpcStream</c>, not <c>Stream</c>, to avoid
 /// colliding with <see cref="System.IO.Stream"/>.
 /// </summary>
-public sealed record RpcStream<TState>(Schema OutputSchema, TState State, Schema? InputSchema = null) : IRpcStream
+public sealed record RpcStream<TState>(Schema OutputSchema, TState State, Schema? InputSchema = null, object? Header = null) : IRpcStream
     where TState : StreamState
 {
     StreamState IRpcStream.State => State;

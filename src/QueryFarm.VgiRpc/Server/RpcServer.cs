@@ -166,6 +166,30 @@ public sealed class RpcServer
             return true;
         }
 
+        // A stream header is its own complete IPC stream (schema + one row + EOS), written
+        // before the main output stream begins — see IRpcStream.Header's doc comment.
+        if (stream.Header is not null)
+        {
+            var headerType = stream.Header.GetType();
+            var headerSchema = SchemaDerivation.InnerSchemaFor(headerType);
+            var headerValues = headerSchema.FieldsList
+                .Select(f => headerType.GetProperty(ValueCodec.FindClrPropertyName(headerType, f))!.GetValue(stream.Header))
+                .ToList();
+            var headerBatch = ValueCodec.BuildRow(headerSchema, headerValues);
+            await using var headerWriter = new WireWriter(transport.Output, headerSchema);
+            if (invokeContext is not null)
+            {
+                foreach (var logMessage in invokeContext.Buffered)
+                {
+                    await headerWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(headerSchema), logMessage.AddToMetadata()), cancellationToken).ConfigureAwait(false);
+                }
+
+                invokeContext.Buffered.Clear();
+            }
+
+            await headerWriter.WriteBatchAsync(new AnnotatedBatch(headerBatch, null), cancellationToken).ConfigureAwait(false);
+        }
+
         var outputSchema = stream.OutputSchema;
         await using var outputWriter = new WireWriter(transport.Output, outputSchema);
         // Write the schema eagerly, not lazily-on-first-batch: a stream that finishes with zero

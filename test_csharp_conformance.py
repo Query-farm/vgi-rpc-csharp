@@ -52,6 +52,8 @@ IMPLEMENTED_FILTER = ",".join(
         "exchange_stream.empty_session",
         "error_recovery.*",
         "cancel.*",
+        "producer_header.*",
+        "exchange_header.*",
     ]
 )
 

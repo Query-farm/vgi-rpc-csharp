@@ -338,7 +338,12 @@ public static class ValueCodec
         return dict;
     }
 
-    private static string FindClrPropertyName(Type clrType, Field wireField)
+    /// <summary>Finds the CLR property on <paramref name="clrType"/> whose wire name (via
+    /// <see cref="WireNaming.ForProperty"/>) matches <paramref name="wireField"/>'s name — the
+    /// reverse of schema derivation, used to bind wire field values back to properties (also
+    /// used by <see cref="Server.RpcServer"/> for stream headers, which follow the same
+    /// property &lt;-&gt; wire-field binding as a struct/embedded-record's own fields).</summary>
+    public static string FindClrPropertyName(Type clrType, Field wireField)
     {
         foreach (var property in clrType.GetProperties())
         {

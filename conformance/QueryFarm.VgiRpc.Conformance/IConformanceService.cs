@@ -128,6 +128,14 @@ public interface IConformanceService
 
     Task ResetCancelProbeAsync();
 
+    // -- Stream headers -------------------------------------------------------
+
+    Task<RpcStream<StreamState>> ProduceWithHeaderAsync(long count);
+
+    Task<RpcStream<StreamState>> ProduceWithHeaderAndLogsAsync(long count, ICallContext? ctx = null);
+
+    Task<RpcStream<StreamState>> ExchangeWithHeaderAsync(double factor);
+
     // TODO (later milestones — see docs/roadmap.md):
     //   - oversized_unary (HTTP response-cap conformance)
     //   - echo_all_types / echo_all_types_with_nulls / echo_wide_types /

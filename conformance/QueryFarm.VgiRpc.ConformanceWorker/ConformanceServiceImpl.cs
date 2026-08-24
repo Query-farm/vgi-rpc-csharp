@@ -133,4 +133,25 @@ public sealed class ConformanceServiceImpl : IConformanceService
         CancelProbe.Reset();
         return Task.CompletedTask;
     }
+
+    public Task<RpcStream<StreamState>> ProduceWithHeaderAsync(long count)
+    {
+        var header = new ConformanceHeader { TotalExpected = count, Description = $"producing {count} batches" };
+        return Task.FromResult(new RpcStream<StreamState>(ConformanceStreamSchemas.Counter, new CounterState(count), Header: header));
+    }
+
+    public Task<RpcStream<StreamState>> ProduceWithHeaderAndLogsAsync(long count, ICallContext? ctx = null)
+    {
+        ctx!.EmitLog(VgiLogLevel.Info, "stream init log");
+        var header = new ConformanceHeader { TotalExpected = count, Description = $"producing {count} with logs" };
+        return Task.FromResult(new RpcStream<StreamState>(ConformanceStreamSchemas.Counter, new CounterState(count), Header: header));
+    }
+
+    public Task<RpcStream<StreamState>> ExchangeWithHeaderAsync(double factor)
+    {
+        // Python's str(float) always shows at least one decimal digit (2.0, not 2) — match
+        // that so "2.0" in description-style conformance assertions see what they expect.
+        var header = new ConformanceHeader { TotalExpected = 0, Description = $"scaling by {factor.ToString("0.0###############", CultureInfo.InvariantCulture)}" };
+        return Task.FromResult(new RpcStream<StreamState>(ExchangeSchemas.Scale, new ScaleExchangeState(factor), InputSchema: ExchangeSchemas.Scale, Header: header));
+    }
 }
