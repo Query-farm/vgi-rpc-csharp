@@ -102,15 +102,31 @@ public static class RpcHttpEndpoints
     /// authenticators yet (Python's mTLS/proxy-proof authenticators self-declare which header
     /// they read; this port doesn't have those yet — see docs/roadmap.md M9/M11), so this is
     /// the spec's "direct way for an operator to state header names" fallback, always.</param>
-    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null, long? maxResponseBytes = null, AuthenticateDelegate? authenticate = null, string? proxyHint = null)
+    /// <param name="corsPolicyName">Name of a CORS policy already registered via
+    /// <see cref="Cors.AddVgiRpcCors"/> (on <c>builder.Services</c>, before this call) —
+    /// <see langword="null"/> (the default) leaves every route CORS-unaware, matching Python's
+    /// default of no <c>cors_origins</c>. See <see cref="Cors"/>'s doc comment for the full
+    /// three-piece wiring (service registration + <c>app.UseCors()</c>/
+    /// <see cref="Cors.UseVgiRpcCorsExtras"/> + this parameter) and why it can't collapse into
+    /// one call here.</param>
+    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null, long? maxResponseBytes = null, AuthenticateDelegate? authenticate = null, string? proxyHint = null, string? corsPolicyName = null)
     {
         tokenKey ??= RandomNumberGenerator.GetBytes(32);
         var registry = new StreamCallRegistry();
-        endpoints.MapMethods($"{prefix}/health", ["GET", "HEAD"], (HttpContext context) => HandleHealthAsync(server, context));
-        endpoints.MapMethods($"{prefix}/health", ["OPTIONS"], (HttpContext context) => HandleCapabilitiesAsync(context, maxResponseBytes));
-        endpoints.MapPost($"{prefix}/{{method}}", (string method, HttpContext context) => HandleUnaryAsync(server, method, context, compressionLevel, maxResponseBytes, authenticate, proxyHint));
-        endpoints.MapPost($"{prefix}/{{method}}/init", (string method, HttpContext context) => HandleStreamInitAsync(server, method, context, compressionLevel, tokenKey, registry, authenticate, proxyHint));
-        endpoints.MapPost($"{prefix}/{{method}}/exchange", (string method, HttpContext context) => HandleStreamExchangeAsync(server, method, context, compressionLevel, tokenKey, registry, maxResponseBytes, authenticate, proxyHint));
+        var health = endpoints.MapMethods($"{prefix}/health", ["GET", "HEAD"], (HttpContext context) => HandleHealthAsync(server, context));
+        var capabilities = endpoints.MapMethods($"{prefix}/health", ["OPTIONS"], (HttpContext context) => HandleCapabilitiesAsync(context, maxResponseBytes));
+        var unary = endpoints.MapPost($"{prefix}/{{method}}", (string method, HttpContext context) => HandleUnaryAsync(server, method, context, compressionLevel, maxResponseBytes, authenticate, proxyHint));
+        var init = endpoints.MapPost($"{prefix}/{{method}}/init", (string method, HttpContext context) => HandleStreamInitAsync(server, method, context, compressionLevel, tokenKey, registry, authenticate, proxyHint));
+        var exchange = endpoints.MapPost($"{prefix}/{{method}}/exchange", (string method, HttpContext context) => HandleStreamExchangeAsync(server, method, context, compressionLevel, tokenKey, registry, maxResponseBytes, authenticate, proxyHint));
+        if (corsPolicyName is not null)
+        {
+            health.RequireCors(corsPolicyName);
+            capabilities.RequireCors(corsPolicyName);
+            unary.RequireCors(corsPolicyName);
+            init.RequireCors(corsPolicyName);
+            exchange.RequireCors(corsPolicyName);
+        }
+
         return endpoints;
     }
 

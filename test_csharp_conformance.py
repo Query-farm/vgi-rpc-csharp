@@ -164,6 +164,16 @@ def http_auth_proxy_worker(worker_binary: Path) -> Iterator[str]:
     )
 
 
+_CORS_ALLOWED_ORIGIN = "https://allowed.example.com"
+
+
+@pytest.fixture
+def cors_worker(worker_binary: Path) -> Iterator[str]:
+    """A --http worker with CORS enabled for a single allowed origin — see
+    docs/roadmap.md M9 CORS and Cors.cs's --conformance-cors-origin flag."""
+    yield from _spawn_http_worker(worker_binary, "--conformance-cors-origin", _CORS_ALLOWED_ORIGIN)
+
+
 def _run_vgi_rpc_test(cmd: str | None = None, *, url: str | None = None, filter_pattern: str | None = None) -> dict:
     assert (cmd is None) != (url is None), "pass exactly one of cmd or url"
     args = [
@@ -474,4 +484,70 @@ class TestUnauthorized:
             headers={"Content-Type": "application/vnd.apache.arrow.stream", "X-Conformance-Auth-Reason": "proxy_required"},
         )
         assert resp.headers["VGI-Auth-Reason"] != "proxy_required"
+
+
+# M9 (see docs/roadmap.md): CORS is a browser-only mechanism — the vgi-rpc-test CLI is a plain
+# HTTP client that never sends Origin/Access-Control-Request-* headers, so it can't exercise this
+# at all. These check the real preflight + actual-response behavior directly, mirroring
+# TestUnauthorized's approach for the same underlying reason (no shared pytest fixture machinery
+# with the canonical Python repo for this either).
+class TestCors:
+    """Verifies Cors.cs's ASP.NET Core wiring against a worker started with
+    --conformance-cors-origin (see the cors_worker fixture)."""
+
+    def test_preflight_allowed_origin_gets_cors_headers(self, cors_worker: str) -> None:
+        import httpx2
+
+        resp = httpx2.request(
+            "OPTIONS",
+            f"{cors_worker}/health",
+            headers={"Origin": _CORS_ALLOWED_ORIGIN, "Access-Control-Request-Method": "GET"},
+        )
+        assert resp.headers["Access-Control-Allow-Origin"] == _CORS_ALLOWED_ORIGIN
+        assert "GET" in resp.headers["Access-Control-Allow-Methods"]
+        assert "POST" in resp.headers["Access-Control-Allow-Methods"]
+        assert resp.headers["Access-Control-Max-Age"] == "7200"
+
+    def test_preflight_disallowed_origin_gets_no_cors_headers(self, cors_worker: str) -> None:
+        import httpx2
+
+        resp = httpx2.request(
+            "OPTIONS",
+            f"{cors_worker}/health",
+            headers={"Origin": "https://evil.example.com", "Access-Control-Request-Method": "GET"},
+        )
+        assert "Access-Control-Allow-Origin" not in resp.headers
+
+    def test_actual_response_exposes_headers(self, cors_worker: str) -> None:
+        import httpx2
+
+        resp = httpx2.get(f"{cors_worker}/health", headers={"Origin": _CORS_ALLOWED_ORIGIN})
+        assert resp.status_code == 200
+        assert resp.headers["Access-Control-Allow-Origin"] == _CORS_ALLOWED_ORIGIN
+        exposed = resp.headers["Access-Control-Expose-Headers"]
+        assert "X-VGI-RPC-Error" in exposed
+        assert "VGI-Max-Response-Bytes" in exposed
+        assert "Cross-Origin-Resource-Policy" in resp.headers
+        assert resp.headers["Cross-Origin-Resource-Policy"] == "cross-origin"
+
+    def test_disallowed_origin_actual_response_has_no_allow_origin(self, cors_worker: str) -> None:
+        """ASP.NET Core's CORS middleware doesn't block a simple/actual request server-side (the
+        browser is what enforces the same-origin restriction on the *response*) — but it must omit
+        Access-Control-Allow-Origin for a disallowed origin, or a browser would let the page read
+        the response."""
+        import httpx2
+
+        resp = httpx2.get(f"{cors_worker}/health", headers={"Origin": "https://evil.example.com"})
+        assert resp.status_code == 200
+        assert "Access-Control-Allow-Origin" not in resp.headers
+
+    def test_no_cors_flag_means_no_cors_headers(self, http_worker: str) -> None:
+        """A worker started without --conformance-cors-origin (the http_worker fixture) must not
+        emit any CORS headers at all — CORS is opt-in, matching corsPolicyName's null default in
+        MapVgiRpc."""
+        import httpx2
+
+        resp = httpx2.get(f"{http_worker}/health", headers={"Origin": _CORS_ALLOWED_ORIGIN})
+        assert "Access-Control-Allow-Origin" not in resp.headers
+        assert "Cross-Origin-Resource-Policy" not in resp.headers
         assert "VGI-Auth-Proxy-Required" not in resp.headers

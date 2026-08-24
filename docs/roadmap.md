@@ -258,7 +258,7 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       sessions' principal binding (M10), proxy proof (M11), token introspection (M12) — this
       milestone was scoped to the shared machinery + the one concrete authenticator, not the
       full auth surface.
-- [~] **M9 — mTLS + JWT, CORS (JWT landed).** `QueryFarm.VgiRpc.Http.OAuth.JwtAuth.Create` builds
+- [~] **M9 — mTLS + JWT, CORS (JWT + CORS landed).** `QueryFarm.VgiRpc.Http.OAuth.JwtAuth.Create` builds
       an `AuthenticateDelegate` that validates Bearer JWTs against a JWKS endpoint discovered via
       OIDC discovery (`{issuer}/.well-known/openid-configuration`), with automatic key-set
       refresh on an unrecognised `kid` — `Microsoft.IdentityModel.Protocols.ConfigurationManager<T>`
@@ -284,18 +284,41 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       — its real writer is `internal`), so the test JWKS endpoint hand-builds the standard RFC
       7517 shape instead. Only the OIDC-discovery flow is supported — a caller-supplied raw
       `jwks_uri` bypassing discovery (Python's `jwt_authenticate(jwks_uri=...)`) isn't wired up.
-      Remaining for M9: mTLS (forwarded-cert authentication — `vgi_rpc/http/_mtls.py`'s ~461
-      lines, not yet started) and CORS. CORS specifically has an architecture wrinkle worth
-      flagging before starting it: `RpcHttpEndpoints.MapVgiRpc` only receives an
+      CORS landed as `QueryFarm.VgiRpc.Http.Cors`, resolving exactly the architecture wrinkle
+      flagged when this milestone started: `RpcHttpEndpoints.MapVgiRpc` only receives an
       `IEndpointRouteBuilder`, but ASP.NET Core's CORS needs service registration
-      (`IServiceCollection.AddCors`) and middleware (`IApplicationBuilder.UseCors`) that
-      `MapVgiRpc`'s current signature can't reach — likely resolved via a `corsPolicyName`
-      parameter (`MapVgiRpc` applies `.RequireCors(name)` to its own routes; the caller registers
-      the policy itself), not by changing what `MapVgiRpc` accepts. Also worth noting: CORS has no
-      automated conformance-suite coverage at all (`vgi-rpc-test` is a plain HTTP client, and CORS
-      is a browser-enforced mechanism a non-browser client never triggers), so verifying it will
-      need the same "write real HTTP-level tests directly" approach M8/M9-JWT already used, not a
-      `vgi-rpc-test --filter` run.
+      (`IServiceCollection.AddCors`) and middleware (`IApplicationBuilder.UseCors`), neither of
+      which that signature can reach. Resolved with three separate pieces rather than widening
+      `MapVgiRpc` itself: `Cors.AddVgiRpcCors(services, policyName, origins, ...)` registers the
+      policy on `builder.Services` before `Build()` (methods GET/HEAD/POST/OPTIONS, any header,
+      an exposed-headers list computed by `Cors.ExposedHeaders` — the same conditional-append
+      pattern as Python's `_factory.py`: a header is exposed only if the corresponding feature,
+      `maxResponseBytes`/`proxyHint`, is actually configured — and a 2-hour preflight
+      `Access-Control-Max-Age`, matching Python's default; every vgi-rpc call is preflighted since
+      the Arrow content type isn't CORS-safelisted, so this matters more here than for a typical
+      REST API); `Cors.UseVgiRpcCorsExtras(app)` is middleware run alongside the framework's own
+      `app.UseCors()` that sets `Cross-Origin-Resource-Policy: cross-origin` on every response
+      (ASP.NET Core's CORS middleware doesn't set this itself, and a page opted into cross-origin
+      isolation needs it even though `Access-Control-Max-Age` doesn't need a Python-style second
+      middleware — ASP.NET Core's CORS middleware already emits that one from
+      `CorsPolicy.PreflightMaxAge`); and `MapVgiRpc` gained a `corsPolicyName: string?` parameter
+      that applies `.RequireCors(name)` to all five of its routes (health, capabilities, unary,
+      init, exchange) when non-null, leaving CORS fully opt-in. As flagged, this has no
+      `vgi-rpc-test` coverage (CORS is browser-enforced; a plain HTTP client never sends
+      `Origin`/`Access-Control-Request-*`), so it was verified the same way M8/JWT were: 7 new
+      `CorsTests` xunit tests (exposed-header-list conditionals, real `IOptions<CorsOptions>`
+      policy-shape assertions off a real `ServiceCollection`, and the `Cross-Origin-Resource-Policy`
+      middleware behavior via a minimal `IApplicationBuilder` stub), plus 5 new `TestCors` httpx2
+      tests in `test_csharp_conformance.py` against a real worker started with a new
+      `--conformance-cors-origin` flag — real preflight `OPTIONS` requests and real actual
+      requests, checking `Access-Control-Allow-Origin`/`-Methods`/`-Max-Age` on preflight,
+      `Access-Control-Expose-Headers`/`Cross-Origin-Resource-Policy` on the actual response, that a
+      disallowed origin gets none of the above, and that a worker started without the flag emits no
+      CORS headers at all (opt-in verified both ways). All 25 Python conformance tests and 70
+      xunit tests (18+46+6 core/Http/OAuth) pass; manually curl-verified against a running worker
+      before writing the automated tests, matching the established habit.
+      Remaining for M9: mTLS (forwarded-cert authentication — `vgi_rpc/http/_mtls.py`'s ~461
+      lines, not yet started).
 - [ ] **M10 — Sticky sessions.**
 - [ ] **M11 — Proxy proof.**
 - [ ] **M12 — Token introspection.**

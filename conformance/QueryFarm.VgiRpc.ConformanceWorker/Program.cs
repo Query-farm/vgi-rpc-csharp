@@ -62,7 +62,19 @@ if (options.Http)
     // silence everything except what the app itself explicitly writes.
     builder.Logging.ClearProviders();
     builder.WebHost.UseUrls($"http://{options.HttpHost}:{options.HttpPort}");
+    const string CorsPolicyName = "vgi-rpc-conformance";
+    var corsEnabled = options.ConformanceCorsOrigins.Count > 0;
+    if (corsEnabled)
+    {
+        builder.Services.AddVgiRpcCors(CorsPolicyName, options.ConformanceCorsOrigins, maxResponseBytes: 65536, proxyHint: options.ConformanceProxyHint);
+    }
+
     var app = builder.Build();
+    if (corsEnabled)
+    {
+        app.UseCors();
+        app.UseVgiRpcCorsExtras();
+    }
     // Not mandatory CLI flags per the porting guide — fixed values only this worker needs so the
     // corresponding conformance tests can run instead of skip:
     //  - maxResponseBytes: 64 KiB, small and fast (http_response_cap.* multiplies it by 4 to
@@ -95,7 +107,7 @@ if (options.Http)
             throw new InvalidOperationException("conformance fixture: no matching X-Conformance-Auth-Reason");
         }
     : null;
-    app.MapVgiRpc(server, maxResponseBytes: 65536, authenticate: authenticate, proxyHint: options.ConformanceProxyHint);
+    app.MapVgiRpc(server, maxResponseBytes: 65536, authenticate: authenticate, proxyHint: options.ConformanceProxyHint, corsPolicyName: corsEnabled ? CorsPolicyName : null);
     await app.StartAsync(cts.Token);
     var boundPort = new Uri(app.Urls.First()).Port;
     Console.WriteLine($"PORT:{boundPort}");
@@ -163,6 +175,7 @@ internal sealed class CliOptions
     public bool AccessLogDebug { get; private init; }
     public bool ConformanceAuthReason { get; private init; }
     public string? ConformanceProxyHint { get; private init; }
+    public IReadOnlyList<string> ConformanceCorsOrigins { get; private init; } = [];
 
     public static CliOptions? Parse(string[] args)
     {
@@ -175,6 +188,7 @@ internal sealed class CliOptions
         var accessLogDebug = false;
         var conformanceAuthReason = false;
         string? conformanceProxyHint = null;
+        var conformanceCorsOrigins = new List<string>();
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -207,6 +221,12 @@ internal sealed class CliOptions
                 case "--conformance-proxy-hint":
                     conformanceProxyHint = RequireValue(args, ref i, "--conformance-proxy-hint");
                     break;
+                case "--conformance-cors-origin":
+                    // Repeatable — mirrors the reference repo's tests/serve_conformance_http_cors.py,
+                    // which accepts a list of allowed origins. A conformance-fixture affordance only
+                    // (see docs/roadmap.md M9 CORS): a production server picks its own origin list.
+                    conformanceCorsOrigins.Add(RequireValue(args, ref i, "--conformance-cors-origin"));
+                    break;
                 default:
                     Console.Error.WriteLine($"Unknown argument: {args[i]}");
                     return null;
@@ -233,6 +253,7 @@ internal sealed class CliOptions
             AccessLogDebug = accessLogDebug,
             ConformanceAuthReason = conformanceAuthReason,
             ConformanceProxyHint = conformanceProxyHint,
+            ConformanceCorsOrigins = conformanceCorsOrigins,
         };
     }
 
