@@ -109,7 +109,7 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       on every exit path, including the pre-dispatch error path. Error records carry
       `error_message` (`exception.Message`, matching Python's `str(exc)`), satisfying the
       schema's `status=error requires error_message` rule.
-- [~] **M6 — Plain HTTP (unary landed; streaming + client + tokens remain).**
+- [~] **M6 — Plain HTTP (unary + streaming dispatch landed; C# client remains).**
       `QueryFarm.VgiRpc.Http` (`RpcHttpEndpoints.MapVgiRpc`) maps an `RpcServer` onto ASP.NET
       Core minimal-API routes matching the canonical Python repo's Falcon resources exactly:
       `POST {prefix}/{method}` for unary calls (`__describe__` included, since it dispatches
@@ -153,31 +153,48 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       environment before pushing. See `RpcHttpEndpoints.s_producibleEncodings`'s comment for the
       full trail; revisit once the ecosystem's zstd support stabilizes. Confirmed manually
       against the real Python client with response-header capture (`Content-Encoding: gzip`) and
-      covered by 12 new `ContentEncodingNegotiationTests`. Verified
-      against the real Python reference client and `vgi-rpc-test` (driven via `--url`, not
-      `--cmd` — HTTP tests an already-running server, unlike pipe/unix/tcp's spawn-and-drive
+      covered by 12 new `ContentEncodingNegotiationTests`.
+      **`/init`/`/exchange` streaming dispatch is now implemented too** — `HandleStreamInitAsync`/
+      `HandleStreamExchangeAsync` in `RpcHttpEndpoints.cs`. Uses the AES-GCM primitive
+      (`QueryFarm.VgiRpc.Http.Crypto.Seal`/`Open` — AES-256-GCM, 12-byte nonce, substituted for
+      Python's XChaCha20-Poly1305 per the plan's reasoning: `ChaCha20Poly1305` throws
+      `PlatformNotSupportedException` on pre-2022 Windows Server, and .NET has no XChaCha20 at
+      all) but with a deliberately simpler *framing* than the canonical Python server's
+      split call/cursor tokens (which carry the serialized `StreamState` bytes so any request can
+      land on any stateless worker process): `StreamCallRegistry` keeps the live
+      `IRpcStream`/`StreamState` object server-side in a `ConcurrentDictionary`, keyed by a
+      random 16-byte call id that the AEAD token just seals and the client echoes back — avoiding
+      the need for generic reflection-based `StreamState` (de)serialization, at the cost of a
+      stream not surviving a process restart or resuming on a different node (fine for a
+      single-process deployment, which is all this port has — no multi-worker HTTP hosting yet).
+      Also deliberately simpler on the *dispatch* side: exactly one lockstep turn per
+      `POST /exchange` (matching the pipe transport's model), not Python's producer loop that
+      accumulates turns until `max_response_bytes` or finish into one HTTP response — simpler,
+      and (unlike accumulate-until-cap) makes mid-stream cancel trivial. Response *shape* still
+      matches the real client's expectations exactly, verified empirically against
+      `vgi_rpc.http._client`: an exchange turn's refreshed continuation token rides on the same
+      data batch's own metadata (`HttpStreamSession.exchange()` reads one terminal batch and
+      pulls `vgi_rpc.stream_state#b64` off it directly); a producer turn's token rides on a
+      *separate* zero-row sentinel batch (`__iter__`/`next_with_token` treat that shape as a
+      distinct "there's more" signal). `/init`'s response is the same for both kinds — an
+      optional header stream plus a zero-row sentinel batch carrying the sealed token on both
+      `vgi_rpc.stream_state#b64` and `vgi_rpc.call_state#b64` — since the real client's init-
+      response reader is generic (it just sees zero data batches this turn, which is valid).
+      Verified against the real Python reference client and `vgi-rpc-test` (driven via `--url`,
+      not `--cmd` — HTTP tests an already-running server, unlike pipe/unix/tcp's spawn-and-drive
       model; see `test_csharp_conformance.py`'s `http_worker` fixture and
-      `test_http_unary_subset_conformant`): 60/60 unary tests green over real HTTP, and a full
-      unfiltered run confirms the *only* failures are the expected streaming categories (already
-      known to be unimplemented) plus the two pre-existing gaps (`dataclass.nested_container_types`,
-      `large_payload.*`) — no new failures, no hangs, no cascades (each HTTP request is
-      independent, unlike the shared-connection desync class of bug documented under M3).
-      Remaining for M6: `/init`/`/exchange` streaming dispatch, and an HTTP-based C# client
-      (`HttpClient`). The state-token AEAD primitive itself is done — `QueryFarm.VgiRpc.Http.Crypto`
-      (`Seal`/`Open`) is AES-256-GCM (12-byte nonce), substituted for Python's `vgi_rpc.crypto`
-      module's XChaCha20-Poly1305 (24-byte nonce) per the plan's reasoning (`ChaCha20Poly1305`
-      throws `PlatformNotSupportedException` on pre-2022 Windows Server; .NET has no XChaCha20 at
-      all) — same envelope shape (`version || nonce || ciphertext || tag`), same API shape
-      (`seal_bytes`/`open_bytes` → `Seal`/`Open`, `normalize_key` → `NormalizeKey`,
-      `SealError` → `SealException`). Safe because state tokens are transport-internal, not part
-      of the cross-language wire contract (every port already picked its own envelope). Covered
-      by `test/QueryFarm.VgiRpc.Http.Tests/CryptoTests.cs` (round-trip, wrong-key, wrong-AAD,
-      tampered-ciphertext, truncated/wrong-version, key normalization — 10/10 passing). Still
-      needed before this is usable: the actual token *framing* (Python's two-token split — a
-      call token minted once by `/init` carrying the frozen schemas + `call_id`, and a cursor
-      token re-minted every turn carrying just the advancing `StreamState` — plus the
-      `_CallStateCache` and zstd-before-seal payload compression) is real, separate work for
-      the `/init`/`/exchange` dispatch itself, not yet started.
+      `test_http_subset_conformant`, now reusing the *same* `IMPLEMENTED_FILTER` gated over
+      stdio): 99/105 tests green over real HTTP — every streaming category 100% (including all
+      7 `cancel.*` tests, confirming the one-turn-per-request simplification's cancel story holds
+      up), the only failure the already-tracked `echo_large_binary` gap, and the 5 skips all
+      legitimate (M7 response-cap tests, M13 external-storage tests, and one `large_payload` test
+      explicitly restricted to pipe/unix/tcp transports upstream). Confirmed in the same
+      Linux x86_64 + Python 3.13 container that caught the earlier zstd regression, before
+      pushing. `QueryFarm.VgiRpc.Http.Crypto` itself is covered by 10
+      `test/QueryFarm.VgiRpc.Http.Tests/CryptoTests.cs` tests (round-trip, wrong-key, wrong-AAD,
+      tampered-ciphertext, truncated/wrong-version, key normalization). Remaining for M6: an
+      HTTP-based C# client (`HttpClient`) — not needed for conformance (`vgi-rpc-test` drives our
+      server with the Python client), same position as the pipe-transport client noted under M3.
 - [~] **M7 — Response caps, capability headers, content-encoding negotiation.**
       Content-encoding negotiation (both directions) landed early, folded into M6 above since
       request decompression turned out to be a hard M6 prerequisite rather than optional M7

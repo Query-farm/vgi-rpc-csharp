@@ -99,30 +99,6 @@ def worker_binary() -> Path:
     return exe
 
 
-# M6 (in progress — see docs/roadmap.md): the HTTP transport serves unary calls only so far,
-# streaming (/init, /exchange) isn't implemented yet — a subset of IMPLEMENTED_FILTER's
-# categories, with every stream-shaped one dropped.
-HTTP_UNARY_FILTER = ",".join(
-    [
-        "scalar_echo.*",
-        "void.*",
-        "complex_types.*",
-        "optional.*",
-        "dataclass.echo_point",
-        "dataclass.echo_bounding_box",
-        "dataclass.inspect_point",
-        "annotated.*",
-        "multi_param.*",
-        "errors.*",
-        "logging.*",
-        "boundary_values.*",
-        "protocol_version.*",
-        "dataclass.echo_all_types",
-        "dataclass.echo_all_types_with_nulls",
-    ]
-)
-
-
 @pytest.fixture
 def http_worker(worker_binary: Path) -> Iterator[str]:
     """Spawns the worker in --http mode and yields its base URL.
@@ -294,13 +270,17 @@ def test_wide_arrow_types_round_trip(worker_binary: Path) -> None:
     assert not failed, "Wide-Arrow-type round-trip failures:\n" + "\n".join(failed)
 
 
-def test_http_unary_subset_conformant(http_worker: str) -> None:
-    """The HTTP transport's unary subset (see docs/roadmap.md M6 — streaming isn't implemented
-    over HTTP yet) must pass 100% against the real Python reference client, driven via `--url`
-    (unlike pipe/unix/tcp's spawn-and-drive `--cmd` — HTTP tests an already-running server)."""
-    report = _run_vgi_rpc_test(url=http_worker, filter_pattern=HTTP_UNARY_FILTER)
+def test_http_subset_conformant(http_worker: str) -> None:
+    """The same IMPLEMENTED_FILTER subset gated over stdio (unary + full streaming — /init,
+    /exchange, headers, cancel, dynamic schemas) must pass 100% against the real Python reference
+    client over HTTP too, driven via `--url` (unlike pipe/unix/tcp's spawn-and-drive `--cmd` —
+    HTTP tests an already-running server). See docs/roadmap.md M6: HTTP streaming dispatch runs
+    exactly one lockstep turn per `/exchange` call (StreamCallRegistry keeps the live
+    IRpcStream/StreamState server-side, keyed by a sealed call-id token) rather than the
+    canonical Python server's accumulate-until-response-cap producer loop — simpler, and
+    (unlike accumulate-until-cap) it makes mid-stream cancel trivial, which is exactly what
+    cancel.* over HTTP exercises."""
+    report = _run_vgi_rpc_test(url=http_worker, filter_pattern=IMPLEMENTED_FILTER)
     failed = [t for t in report["results"] if not t["passed"] and not t["skipped"]]
-    assert not failed, "HTTP conformance failures in the unary subset:\n" + "\n".join(
-        f"  {t['name']}: {t.get('error', '')}" for t in failed
-    )
+    assert not failed, "HTTP conformance failures:\n" + "\n".join(f"  {t['name']}: {t.get('error', '')}" for t in failed)
     assert report["passed"] > 0, "Expected at least one HTTP test to run."

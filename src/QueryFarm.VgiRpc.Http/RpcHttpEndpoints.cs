@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO.Compression;
+using System.Security.Cryptography;
 using Apache.Arrow;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
@@ -9,6 +10,7 @@ using QueryFarm.VgiRpc.Errors;
 using QueryFarm.VgiRpc.Logging;
 using QueryFarm.VgiRpc.Reflection;
 using QueryFarm.VgiRpc.Server;
+using QueryFarm.VgiRpc.Streaming;
 using QueryFarm.VgiRpc.Wire;
 
 namespace QueryFarm.VgiRpc.Http;
@@ -73,19 +75,22 @@ public static class RpcHttpEndpoints
     /// matches Python's <c>make_wsgi_app(compression_level=1)</c> default. <see langword="null"/>
     /// disables response compression outright (request decompression is unaffected either way —
     /// see <see cref="DecompressingRequestBody"/>'s doc comment for why that one isn't optional).</param>
-    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1)
+    /// <param name="tokenKey">AEAD master key sealing stream call-id tokens (see
+    /// <see cref="StreamCallRegistry"/>) — <see langword="null"/> (the default) generates a
+    /// random 32-byte key per call to this method, matching Python's <c>make_wsgi_app</c>
+    /// default. A shared key is only needed for multi-process deployments, which this port
+    /// doesn't support yet (see <see cref="StreamCallRegistry"/>'s doc comment) — provided now
+    /// so the seam exists.</param>
+    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null)
     {
+        tokenKey ??= RandomNumberGenerator.GetBytes(32);
+        var registry = new StreamCallRegistry();
         endpoints.MapMethods($"{prefix}/health", ["GET", "HEAD"], (HttpContext context) => HandleHealthAsync(server, context));
         endpoints.MapPost($"{prefix}/{{method}}", (string method, HttpContext context) => HandleUnaryAsync(server, method, context, compressionLevel));
-        endpoints.MapPost($"{prefix}/{{method}}/init", () => NotYetImplementedStream());
-        endpoints.MapPost($"{prefix}/{{method}}/exchange", () => NotYetImplementedStream());
+        endpoints.MapPost($"{prefix}/{{method}}/init", (string method, HttpContext context) => HandleStreamInitAsync(server, method, context, compressionLevel, tokenKey, registry));
+        endpoints.MapPost($"{prefix}/{{method}}/exchange", (string method, HttpContext context) => HandleStreamExchangeAsync(server, method, context, compressionLevel, tokenKey, registry));
         return endpoints;
     }
-
-    private static IResult NotYetImplementedStream() =>
-        Results.Text(
-            "Streaming methods are not yet supported over the HTTP transport — see docs/roadmap.md M6.",
-            statusCode: StatusCodes.Status501NotImplemented);
 
     private static Task HandleHealthAsync(RpcServer server, HttpContext context)
     {
@@ -240,7 +245,7 @@ public static class RpcHttpEndpoints
             }
             catch (Exception exc)
             {
-                var actual = exc is System.Reflection.TargetInvocationException { InnerException: { } inner } ? inner : exc;
+                var actual = Unwrap(exc);
                 status = "error";
                 errorType = actual.GetType().Name;
                 errorMessage = actual.Message;
@@ -252,13 +257,397 @@ public static class RpcHttpEndpoints
         // status=error still answers HTTP 200 — the body carries a real in-band error batch, and
         // RpcErrorHeader is the signal a client checks instead of the status code (mirrors
         // Python's _set_http_status 500→200 translation).
-        EmitAccessLog(server, info.WireName, status, errorType, errorMessage, start, StatusCodes.Status200OK);
+        EmitAccessLog(server, info.WireName, "unary", status, errorType, errorMessage, start, StatusCodes.Status200OK);
 
         if (status == "error")
         {
             context.Response.Headers[RpcErrorHeader] = "true";
         }
 
+        await WriteBytesAsync(context, StatusCodes.Status200OK, responseBuffer.ToArray(), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// <c>POST {prefix}/{method}/init</c> — dispatches a stream method and registers it under a
+    /// fresh call id (see <see cref="StreamCallRegistry"/>), returning (optional header stream +)
+    /// a zero-row sentinel batch carrying the sealed call-id token on both
+    /// <see cref="MetadataKeys.StreamState"/> and <see cref="MetadataKeys.CallState"/> — the real
+    /// Python client reads both from exactly this shape (see
+    /// <c>vgi_rpc.http._client._init_http_stream_session</c>). Unlike the canonical Python
+    /// server, this never folds a producer's first turn into the init response (see
+    /// <see cref="StreamCallRegistry"/>'s doc comment on why): every turn, producer or exchange,
+    /// happens via <see cref="HandleStreamExchangeAsync"/> — which the client's generic init-response
+    /// reader handles correctly regardless (it just sees zero data batches this turn).
+    /// </summary>
+    private static async Task HandleStreamInitAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry)
+    {
+        var request = context.Request;
+        var cancellationToken = context.RequestAborted;
+        var (encoding, useCustomHeader) = ContentEncodingNegotiation.PickResponseEncoding(
+            request, compressionLevel is null ? s_noEncodings : s_producibleEncodings);
+
+        if (request.ContentType != ArrowContentType)
+        {
+            await ErrorResultAsync(server, method, new RpcException("TypeError", $"Expected Content-Type: '{ArrowContentType}', got '{request.ContentType}'. All vgi-rpc HTTP requests must use Content-Type: {ArrowContentType}"), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+
+        if (!server.Methods.TryGetValue(method, out var info))
+        {
+            var available = string.Join(", ", server.Methods.Keys.OrderBy(k => k, StringComparer.Ordinal));
+            await ErrorResultAsync(server, method, new MethodNotImplementedException($"Unknown method: '{method}'. Available methods: [{available}]"), StatusCodes.Status404NotFound, s_emptySchema, StatusCodes.Status404NotFound, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+
+        if (info.Kind != RpcMethodKind.Stream)
+        {
+            await ErrorResultAsync(server, method, new RpcException("TypeError", $"Method '{method}' is not a stream — call it as a plain unary POST /{method} instead."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+
+        Stream requestBody;
+        try
+        {
+            requestBody = DecompressingRequestBody(request);
+        }
+        catch (NotSupportedException exc)
+        {
+            await ErrorResultAsync(server, method, new RpcException("TypeError", exc.Message), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+
+        AnnotatedBatch? requestBatch;
+        try
+        {
+            using var reader = new WireReader(requestBody);
+            _ = await reader.ReadSchemaAsync(cancellationToken).ConfigureAwait(false);
+            requestBatch = await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exc)
+        {
+            await ErrorResultAsync(server, method, exc, StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+        finally
+        {
+            if (!ReferenceEquals(requestBody, request.Body))
+            {
+                await requestBody.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+
+        if (requestBatch is null)
+        {
+            await ErrorResultAsync(server, method, new RpcException("RpcException", "Request body carried no batch."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+
+        var ipcMethod = requestBatch.GetMetadata(MetadataKeys.Method);
+        if (ipcMethod != method)
+        {
+            await ErrorResultAsync(server, method, new RpcException("TypeError", $"Method name mismatch: URL path has '{method}' but Arrow IPC custom_metadata 'vgi_rpc.method' has '{ipcMethod}'. These must match."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+
+        object?[] args;
+        try
+        {
+            args = ValueCodec.ExtractRow(requestBatch.Batch, info.Parameters.Select(p => p.ParameterType).ToArray());
+        }
+        catch (Exception exc)
+        {
+            await ErrorResultAsync(server, method, exc, StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+
+        var start = Stopwatch.GetTimestamp();
+        var invokeContext = info.HasContextParameter ? new BufferedHttpCallContext() : null;
+
+        IRpcStream stream;
+        try
+        {
+            var raw = await info.InvokeAsync(server.Implementation, args, invokeContext).ConfigureAwait(false);
+            stream = (IRpcStream)raw!;
+        }
+        catch (Exception exc)
+        {
+            var actual = Unwrap(exc);
+            await ErrorResultAsync(server, method, actual, StatusCodes.Status500InternalServerError, s_emptySchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+
+        var callKey = registry.Register(stream);
+        var tokenBase64 = Convert.ToBase64String(Crypto.Seal(Convert.FromHexString(callKey), tokenKey, aad: []));
+
+        var responseBuffer = new MemoryStream();
+
+        // A stream header is its own complete IPC stream (schema + one row + EOS), written
+        // before the main output stream begins — see IRpcStream.Header's doc comment. Mirrors
+        // RpcServer.ServeStreamAsync's header-writing block exactly (duplicated, not shared —
+        // see this class's own doc comment on why HTTP dispatch can't reuse that method).
+        if (stream.Header is not null)
+        {
+            var headerType = stream.Header.GetType();
+            var headerSchema = SchemaDerivation.InnerSchemaFor(headerType);
+            var headerValues = headerSchema.FieldsList
+                .Select(f => headerType.GetProperty(ValueCodec.FindClrPropertyName(headerType, f))!.GetValue(stream.Header))
+                .ToList();
+            var headerBatch = ValueCodec.BuildRow(headerSchema, headerValues);
+            await using (var headerWriter = new WireWriter(responseBuffer, headerSchema))
+            {
+                if (invokeContext is not null)
+                {
+                    foreach (var logMessage in invokeContext.Buffered)
+                    {
+                        await headerWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(headerSchema), logMessage.AddToMetadata()), cancellationToken).ConfigureAwait(false);
+                    }
+
+                    invokeContext.Buffered.Clear();
+                }
+
+                await headerWriter.WriteBatchAsync(new AnnotatedBatch(headerBatch, null), cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        var outputSchema = stream.OutputSchema;
+        await using (var outputWriter = new WireWriter(responseBuffer, outputSchema))
+        {
+            if (invokeContext is not null)
+            {
+                foreach (var logMessage in invokeContext.Buffered)
+                {
+                    await outputWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), logMessage.AddToMetadata()), cancellationToken).ConfigureAwait(false);
+                }
+            }
+
+            var tokenMetadata = new Dictionary<string, string>
+            {
+                [MetadataKeys.StreamState] = tokenBase64,
+                [MetadataKeys.CallState] = tokenBase64,
+            };
+            await outputWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), tokenMetadata), cancellationToken).ConfigureAwait(false);
+        }
+
+        EmitAccessLog(server, info.WireName, "stream", "ok", "", "", start, StatusCodes.Status200OK, callKey);
+        await WriteBytesAsync(context, StatusCodes.Status200OK, responseBuffer.ToArray(), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// <c>POST {prefix}/{method}/exchange</c> — runs exactly one lockstep turn against the stream
+    /// <see cref="HandleStreamInitAsync"/> registered, resolved from the request's echoed
+    /// <see cref="MetadataKeys.StreamState"/> token. Handles both producer ticks (an empty-schema
+    /// request batch — the HTTP analog of the pipe transport's <c>_TICK_BATCH</c>) and real
+    /// exchange data uniformly, since both just become one <see cref="StreamState.ProcessAsync"/>
+    /// call. Response shape differs by kind, matching the real Python client's expectations
+    /// exactly (see <c>vgi_rpc.http._client.HttpStreamSession</c>):
+    /// <list type="bullet">
+    /// <item>Exchange: the refreshed continuation token rides on the SAME data batch's own
+    /// metadata (<c>HttpStreamSession.exchange()</c> reads exactly one terminal batch and pulls
+    /// <see cref="MetadataKeys.StreamState"/> off it directly).</item>
+    /// <item>Producer: token rides on a SEPARATE zero-row sentinel batch, appended only when the
+    /// stream isn't finished (<c>HttpStreamSession.__iter__</c>/<c>next_with_token</c> explicitly
+    /// look for a zero-row batch carrying the token as a distinct "there's more" signal, separate
+    /// from real data batches).</item>
+    /// </list>
+    /// Deliberately simpler than Python's producer turn (which loops <c>process()</c> until
+    /// <c>max_response_bytes</c> or finish, batching several turns into one HTTP response): this
+    /// always runs exactly one turn per request, matching the pipe transport's lockstep model and
+    /// (unlike accumulate-until-cap) trivially supporting mid-stream cancel — see
+    /// <see cref="StreamCallRegistry"/>'s doc comment for the same simplification's rationale.
+    /// </summary>
+    private static async Task HandleStreamExchangeAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry)
+    {
+        var request = context.Request;
+        var cancellationToken = context.RequestAborted;
+        var (encoding, useCustomHeader) = ContentEncodingNegotiation.PickResponseEncoding(
+            request, compressionLevel is null ? s_noEncodings : s_producibleEncodings);
+
+        if (request.ContentType != ArrowContentType)
+        {
+            await ErrorResultAsync(server, method, new RpcException("TypeError", $"Expected Content-Type: '{ArrowContentType}', got '{request.ContentType}'. All vgi-rpc HTTP requests must use Content-Type: {ArrowContentType}"), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+
+        if (!server.Methods.TryGetValue(method, out var info) || info.Kind != RpcMethodKind.Stream)
+        {
+            await ErrorResultAsync(server, method, new MethodNotImplementedException($"Unknown stream method: '{method}'."), StatusCodes.Status404NotFound, s_emptySchema, StatusCodes.Status404NotFound, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+
+        Stream requestBody;
+        try
+        {
+            requestBody = DecompressingRequestBody(request);
+        }
+        catch (NotSupportedException exc)
+        {
+            await ErrorResultAsync(server, method, new RpcException("TypeError", exc.Message), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+
+        AnnotatedBatch? requestBatch;
+        try
+        {
+            using var reader = new WireReader(requestBody);
+            _ = await reader.ReadSchemaAsync(cancellationToken).ConfigureAwait(false);
+            requestBatch = await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exc)
+        {
+            await ErrorResultAsync(server, method, exc, StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+        finally
+        {
+            if (!ReferenceEquals(requestBody, request.Body))
+            {
+                await requestBody.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+
+        if (requestBatch is null)
+        {
+            await ErrorResultAsync(server, method, new RpcException("RpcException", "Request body carried no batch."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+
+        var tokenB64 = requestBatch.GetMetadata(MetadataKeys.StreamState);
+        if (tokenB64 is null)
+        {
+            await ErrorResultAsync(server, method, new RpcException("TypeError", $"Exchange request is missing the {MetadataKeys.StreamState} continuation token."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+
+        string callKey;
+        try
+        {
+            callKey = Convert.ToHexStringLower(Crypto.Open(Convert.FromBase64String(tokenB64), tokenKey, aad: []));
+        }
+        catch (Exception)
+        {
+            await ErrorResultAsync(server, method, new SessionLostException("Stream continuation token is invalid, tampered, or expired."), StatusCodes.Status500InternalServerError, s_emptySchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+
+        if (!registry.TryGet(callKey, out var stream))
+        {
+            await ErrorResultAsync(server, method, new SessionLostException("No active stream for this token — it may have expired, been cancelled, or this server process restarted."), StatusCodes.Status500InternalServerError, s_emptySchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
+            return;
+        }
+
+        var start = Stopwatch.GetTimestamp();
+        var outputSchema = stream.OutputSchema;
+        var isProducer = stream.InputSchema is not { FieldsList.Count: > 0 };
+
+        if (requestBatch.GetMetadata(MetadataKeys.Cancel) is not null)
+        {
+            stream.State.OnCancel(null);
+            registry.Remove(callKey);
+            EmitAccessLog(server, info.WireName, "stream", "ok", "", "", start, StatusCodes.Status200OK, callKey);
+            var cancelBuffer = new MemoryStream();
+            await using (var cancelWriter = new WireWriter(cancelBuffer, outputSchema))
+            {
+                // No batches — an empty (schema, EOS) IPC stream the client just drains, matching
+                // Python's cancel response. WriteStartAsync forces the schema message even with
+                // zero batches (WireWriter otherwise defers it lazily to the first batch write).
+                await cancelWriter.WriteStartAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            await WriteBytesAsync(context, StatusCodes.Status200OK, cancelBuffer.ToArray(), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        var turnBatch = requestBatch;
+        if (!isProducer && stream.InputSchema is { } declaredInputSchema)
+        {
+            try
+            {
+                turnBatch = turnBatch with { Batch = ValueCodec.CoerceBatch(turnBatch.Batch, declaredInputSchema) };
+            }
+            catch (Exception exc)
+            {
+                registry.Remove(callKey);
+                await ErrorResultAsync(server, method, exc, StatusCodes.Status500InternalServerError, outputSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
+                return;
+            }
+        }
+
+        var collector = new OutputCollector(outputSchema);
+        var turnContext = info.HasContextParameter ? new StreamHttpCallContext(collector) : null;
+        Exception? turnException = null;
+        try
+        {
+            await stream.State.ProcessAsync(turnBatch, collector, turnContext, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exc)
+        {
+            turnException = Unwrap(exc);
+        }
+
+        if (turnException is not null)
+        {
+            registry.Remove(callKey);
+            await ErrorResultAsync(server, method, turnException, StatusCodes.Status500InternalServerError, outputSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
+            return;
+        }
+
+        var finished = collector.Finished;
+        string? freshTokenB64 = null;
+        if (!finished)
+        {
+            // The call id hasn't changed — the same sealed token still resolves to this entry,
+            // so there's nothing to re-seal (unlike Python's cursor token, ours carries no
+            // serialized StreamState to refresh — see StreamCallRegistry's doc comment).
+            freshTokenB64 = tokenB64;
+        }
+        else
+        {
+            registry.Remove(callKey);
+        }
+
+        var responseBuffer = new MemoryStream();
+        await using (var writer = new WireWriter(responseBuffer, outputSchema))
+        {
+            foreach (var logMessage in collector.Logs)
+            {
+                await writer.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), logMessage.AddToMetadata()), cancellationToken).ConfigureAwait(false);
+            }
+
+            if (isProducer)
+            {
+                if (collector.EmittedBatch is not null)
+                {
+                    await writer.WriteBatchAsync(new AnnotatedBatch(collector.EmittedBatch, null), cancellationToken).ConfigureAwait(false);
+                }
+
+                if (freshTokenB64 is not null)
+                {
+                    var sentinelMetadata = new Dictionary<string, string> { [MetadataKeys.StreamState] = freshTokenB64 };
+                    await writer.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), sentinelMetadata), cancellationToken).ConfigureAwait(false);
+                }
+                else if (collector.EmittedBatch is null)
+                {
+                    // Finished with no data this turn — an empty (schema, EOS) response tells the
+                    // client's __iter__/next_with_token the producer is done (mirrors WireStartAsync
+                    // in the cancel branch above).
+                    await writer.WriteStartAsync(cancellationToken).ConfigureAwait(false);
+                }
+            }
+            else
+            {
+                // Exchange: the refreshed token rides on the data batch's own metadata, not a
+                // separate sentinel — see this method's doc comment. ExchangeState never finishes
+                // server-side (the client ends the exchange by simply stopping calling exchange()),
+                // so freshTokenB64 is always set here in practice.
+                var dataMetadata = freshTokenB64 is not null
+                    ? new Dictionary<string, string> { [MetadataKeys.StreamState] = freshTokenB64 }
+                    : null;
+                var dataBatch = collector.EmittedBatch ?? ValueCodec.EmptyRow(outputSchema);
+                await writer.WriteBatchAsync(new AnnotatedBatch(dataBatch, dataMetadata), cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        EmitAccessLog(server, info.WireName, "stream", "ok", "", "", start, StatusCodes.Status200OK, callKey);
         await WriteBytesAsync(context, StatusCodes.Status200OK, responseBuffer.ToArray(), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
     }
 
@@ -272,7 +661,9 @@ public static class RpcHttpEndpoints
         HttpContext context,
         ContentEncoding? encoding,
         bool useCustomHeader,
-        int? compressionLevel)
+        int? compressionLevel,
+        string methodType = "unary",
+        string? streamId = null)
     {
         var start = Stopwatch.GetTimestamp();
         using var buffer = new MemoryStream();
@@ -282,7 +673,7 @@ public static class RpcHttpEndpoints
             await writer.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(schema), metadata)).ConfigureAwait(false);
         }
 
-        EmitAccessLog(server, method, "error", exception.GetType().Name, exception.Message, start, httpStatusForLog);
+        EmitAccessLog(server, method, methodType, "error", exception.GetType().Name, exception.Message, start, httpStatusForLog, streamId);
 
         // Matches Python's _set_http_status: only a 500 gets folded into 200+header — 4xx/415
         // protocol-level rejections keep their real status code.
@@ -366,7 +757,7 @@ public static class RpcHttpEndpoints
         return output.ToArray();
     }
 
-    private static void EmitAccessLog(RpcServer server, string method, string status, string errorType, string errorMessage, long startTimestamp, int httpStatus)
+    private static void EmitAccessLog(RpcServer server, string method, string methodType, string status, string errorType, string errorMessage, long startTimestamp, int httpStatus, string? streamId = null)
     {
         if (server.AccessLog is not { } sink)
         {
@@ -380,19 +771,27 @@ public static class RpcHttpEndpoints
             Protocol: server.ProtocolName,
             ProtocolHash: server.ProtocolHash,
             Method: method,
-            MethodType: "unary",
+            MethodType: methodType,
             Status: status,
             DurationMs: durationMs,
             ErrorType: errorType,
             ErrorMessage: string.IsNullOrEmpty(errorMessage) ? null : errorMessage,
-            ServerVersion: server.ServerVersion));
+            ServerVersion: server.ServerVersion,
+            StreamId: streamId));
     }
 
+    /// <summary>Unwraps a reflection-invocation exception to the real one it wraps — matches
+    /// <see cref="RpcServer"/>'s private helper of the same name (see that type for why one
+    /// exists in each: HTTP dispatch is a genuinely separate code path).</summary>
+    private static Exception Unwrap(Exception exc) =>
+        exc is System.Reflection.TargetInvocationException { InnerException: { } inner } ? inner : exc;
+
     /// <summary>
-    /// Buffers <see cref="Server.ICallContext.EmitLog"/> calls for one HTTP unary dispatch,
-    /// flushed as zero-row log batches ahead of the result batch — the HTTP-transport analog of
-    /// <see cref="RpcServer"/>'s own private nested type of the same shape (duplicated rather
-    /// than shared since that one isn't part of the core assembly's public/internal surface).
+    /// Buffers <see cref="Server.ICallContext.EmitLog"/> calls for one HTTP unary dispatch or
+    /// stream init call, flushed as zero-row log batches ahead of the result/header batch — the
+    /// HTTP-transport analog of <see cref="RpcServer"/>'s own private nested type of the same
+    /// shape (duplicated rather than shared since that one isn't part of the core assembly's
+    /// public/internal surface).
     /// </summary>
     private sealed class BufferedHttpCallContext : Server.ICallContext
     {
@@ -400,5 +799,14 @@ public static class RpcHttpEndpoints
 
         public void EmitLog(VgiLogLevel level, string message, IReadOnlyDictionary<string, object?>? extra = null) =>
             Buffered.Add(new LogMessage(level, message, extra));
+    }
+
+    /// <summary>Forwards a stream turn's <see cref="Server.ICallContext.EmitLog"/> calls into
+    /// that turn's <see cref="OutputCollector"/> — the HTTP-transport analog of
+    /// <see cref="RpcServer"/>'s private nested type of the same shape.</summary>
+    private sealed class StreamHttpCallContext(OutputCollector collector) : Server.ICallContext
+    {
+        public void EmitLog(VgiLogLevel level, string message, IReadOnlyDictionary<string, object?>? extra = null) =>
+            collector.ClientLog(level, message, extra);
     }
 }
