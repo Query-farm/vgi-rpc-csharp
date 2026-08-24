@@ -11,27 +11,24 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
 - [x] **M1 — Core unary RPC engine.** Reflection-based schema derivation, `RpcServer`/
       `RpcConnection`/`DispatchProxy` client over the in-process pipe transport. (`__describe__`
       itself is not yet implemented — see the note under M2.)
-- [~] **M2 — Unary conformance (in progress).** 56/105 tests in the real cross-language
-      `vgi-rpc-test` suite pass against the C# worker over stdio — the full scalar/void/
-      complex_types/optional/multi_param/errors/logging/boundary_values/protocol_version
-      categories, plus `dataclass.echo_point`/`echo_bounding_box`/`inspect_point` and
-      `annotated.*`. Confirmed empirically (not just self-consistently) against the canonical
-      Python reference client. Remaining for this milestone: `dataclass.echo_all_types(_with_nulls)`
-      and the wide-Arrow-type methods (need list-of-struct + temporal/decimal support in
-      `ValueCodec`), `__describe__`, and `large_payload.*`. See `test_csharp_conformance.py`
-      for the exact implemented-subset filter, which grows as more lands.
-- [~] **M3 — Streaming (nearly done).** Producer streams, exchange streams (core), cancellation,
-      error recovery, stream headers (both `ConformanceHeader` and the multi-type `RichHeader`),
-      and dynamic per-call output schemas all pass the real conformance suite — 89/105 tests
-      overall in the gated subset (`test_csharp_conformance.py`), up from 56/105 at the start of
-      M3. `RpcServer.ServeStreamAsync`'s lockstep dispatch loop handles producer/exchange/
-      cancel/headers uniformly. Also unlocked along the way: list-of-struct support in
-      `ValueCodec` (needed by `RichHeader`/`AllTypes`'s `list_of_nested` fields — hand-built via
-      `ArrowArrayConcatenator` since Arrow's own `ListArray.Builder` factory doesn't support
-      struct elements), which also unblocked `dataclass.echo_all_types(_with_nulls)`.
-      Remaining: the `exchange_stream.cast_*` tests (need input-batch type coercion — Python's
-      `_coerce_input_batch`, not yet ported), `large_payload.*` (the known 2GiB+ transport-level
-      gap), `http_response_cap.*` (needs HTTP — M6+), and client-side stream consumption
+- [x] **M2 — Unary conformance.** Every unary conformance category passes against the real
+      `vgi-rpc-test` tool over stdio, confirmed empirically (not just self-consistently) against
+      the canonical Python reference client: scalar/void/complex_types/optional/multi_param/
+      errors/logging/boundary_values/protocol_version/annotated, `dataclass.*` (including
+      `echo_all_types(_with_nulls)`, unblocked by M3's list-of-struct work). `__describe__` is
+      still a stub (not yet needed by conformance — deferred).
+- [x] **M3 — Streaming.** 94/105 tests pass in the gated conformance subset
+      (`test_csharp_conformance.py`) — every category except `large_payload.*` (2, a known
+      2GiB+ transport-level gap, documented below) and `http_response_cap.*` (4, needs HTTP —
+      M6+) is fully green: producer streams, exchange streams (including the `cast_*`
+      input-batch-coercion tests — `ValueCodec.CoerceBatch`, strict on field set, tolerant of
+      column order and int32/int64/float32→float64 widening, mirrors Python's
+      `_coerce_input_batch`), cancellation, error recovery, stream headers (both
+      `ConformanceHeader` and the multi-type `RichHeader`), and dynamic per-call output schemas.
+      `RpcServer.ServeStreamAsync`'s lockstep dispatch loop handles producer/exchange/cancel/
+      headers uniformly. Also landed along the way: list-of-struct support in `ValueCodec`
+      (`ArrowArrayConcatenator`-based, since Arrow's own `ListArray.Builder` factory doesn't
+      support struct elements). Remaining: client-side stream consumption
       (`RpcConnection`/`RpcClientProxy` — not needed for conformance, since `vgi-rpc-test` drives
       our server with its own Python client, but needed before any C#-to-C# streaming test can
       be written).

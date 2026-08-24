@@ -120,6 +120,8 @@ public interface IConformanceService
 
     Task<RpcStream<StreamState>> ExchangeErrorOnNthAsync(long failOn);
 
+    Task<RpcStream<StreamState>> ExchangeCastCompatibleAsync();
+
     // -- Cancellation ---------------------------------------------------------
 
     Task<RpcStream<StreamState>> CancellableProducerAsync();

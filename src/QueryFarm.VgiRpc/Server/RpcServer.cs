@@ -241,6 +241,11 @@ public sealed class RpcServer
             var turnContext = info.HasContextParameter ? new StreamCallContext(collector) : null;
             try
             {
+                if (stream.InputSchema is { FieldsList.Count: > 0 } declaredInputSchema)
+                {
+                    inputBatch = inputBatch with { Batch = ValueCodec.CoerceBatch(inputBatch.Batch, declaredInputSchema) };
+                }
+
                 await stream.State.ProcessAsync(inputBatch, collector, turnContext, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception exc)

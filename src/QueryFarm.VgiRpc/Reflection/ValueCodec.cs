@@ -30,6 +30,74 @@ public static class ValueCodec
         return new RecordBatch(schema, arrays, length: 1);
     }
 
+    /// <summary>
+    /// Reconciles an inbound stream batch to a declared input schema: strict on the field set,
+    /// tolerant of column order and compatible numeric widening (int32/int64/float32 → float64).
+    /// Mirrors Python's <c>_coerce_input_batch</c>. Throws when the field set doesn't match or a
+    /// same-named column's type isn't a coercion this port knows how to perform.
+    /// </summary>
+    public static RecordBatch CoerceBatch(RecordBatch batch, Schema targetSchema)
+    {
+        if (SchemasEqual(batch.Schema, targetSchema))
+        {
+            return batch;
+        }
+
+        var targetNames = targetSchema.FieldsList.Select(f => f.Name).ToList();
+        var batchNames = batch.Schema.FieldsList.Select(f => f.Name).ToList();
+        if (!new HashSet<string>(batchNames).SetEquals(targetNames))
+        {
+            throw new InvalidOperationException(
+                $"Input schema mismatch (wrong column type/name set): expected [{string.Join(", ", targetNames)}], got [{string.Join(", ", batchNames)}].");
+        }
+
+        var arrays = new IArrowArray[targetSchema.FieldsList.Count];
+        for (var i = 0; i < arrays.Length; i++)
+        {
+            var targetField = targetSchema.GetFieldByIndex(i);
+            var sourceIndex = batchNames.IndexOf(targetField.Name);
+            var sourceArray = batch.Column(sourceIndex);
+            arrays[i] = CoerceArray(sourceArray, targetField.DataType);
+        }
+
+        return new RecordBatch(targetSchema, arrays, batch.Length);
+    }
+
+    private static bool SchemasEqual(Schema a, Schema b)
+    {
+        if (a.FieldsList.Count != b.FieldsList.Count)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < a.FieldsList.Count; i++)
+        {
+            if (a.GetFieldByIndex(i).Name != b.GetFieldByIndex(i).Name || a.GetFieldByIndex(i).DataType.TypeId != b.GetFieldByIndex(i).DataType.TypeId)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static IArrowArray CoerceArray(IArrowArray array, IArrowType targetType)
+    {
+        if (array.Data.DataType.TypeId == targetType.TypeId)
+        {
+            return array;
+        }
+
+        return (array, targetType) switch
+        {
+            (Int32Array a, DoubleType) => new DoubleArray.Builder().AppendRange(a.Values.ToArray().Select(v => (double)v)).Build(),
+            (Int64Array a, DoubleType) => new DoubleArray.Builder().AppendRange(a.Values.ToArray().Select(v => (double)v)).Build(),
+            (FloatArray a, DoubleType) => new DoubleArray.Builder().AppendRange(a.Values.ToArray().Select(v => (double)v)).Build(),
+            _ => throw new InvalidOperationException(
+                $"Input schema mismatch (wrong column type): cannot cast {array.Data.DataType} to {targetType}."),
+        };
+    }
+
     /// <summary>Builds a zero-row batch for the given schema (used for log/error batches and void results).</summary>
     public static RecordBatch EmptyRow(Schema schema)
     {
