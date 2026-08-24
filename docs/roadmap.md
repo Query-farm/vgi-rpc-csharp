@@ -138,9 +138,22 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       silently override a VGI-aware caller's stated zstd-first preference), an explicit
       `identity` first in the list wins outright, and the codec actually picked is stamped on
       `Content-Encoding` or `X-VGI-Content-Encoding` depending on which header the client's
-      choice came from. Empty bodies are never compressed. Confirmed manually against the real
-      Python client with response-header capture (`Content-Encoding: zstd`, a 5000-byte echo
-      compressed to 159 bytes) and covered by 12 new `ContentEncodingNegotiationTests`. Verified
+      choice came from. Empty bodies are never compressed. **Response compression only ever
+      picks gzip, never zstd** — an initial zstd-preferring version passed everywhere locally
+      (macOS, Python 3.14) but broke CI outright (every HTTP unary test: `OSError: Invalid IPC
+      stream: negative continuation token`), root-caused by reproducing the exact CI environment
+      in a Linux x86_64 container (Docker `--platform linux/amd64`, `python:3.13-slim`): the
+      reference client advertises zstd support whenever the third-party `zstandard` package is
+      importable, but httpx2 2.12's own response auto-decompression stopped using that package
+      and now needs Python 3.14's stdlib `compression.zstd` or a separate `backports.zstd`
+      package — neither installed by `vgi-rpc[http]`. Request compression is unaffected (vgi_rpc
+      calls `zstandard` directly, never through httpx2's decoder), so this is a response-only,
+      real bug in the *published Python client's* dependency story on Python ≤3.13, not specific
+      to this port — confirmed the fix (gzip-only) 6/6 green in the same reproduced container
+      environment before pushing. See `RpcHttpEndpoints.s_producibleEncodings`'s comment for the
+      full trail; revisit once the ecosystem's zstd support stabilizes. Confirmed manually
+      against the real Python client with response-header capture (`Content-Encoding: gzip`) and
+      covered by 12 new `ContentEncodingNegotiationTests`. Verified
       against the real Python reference client and `vgi-rpc-test` (driven via `--url`, not
       `--cmd` — HTTP tests an already-running server, unlike pipe/unix/tcp's spawn-and-drive
       model; see `test_csharp_conformance.py`'s `http_worker` fixture and

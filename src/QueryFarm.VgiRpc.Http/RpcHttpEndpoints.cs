@@ -41,7 +41,27 @@ public static class RpcHttpEndpoints
 
     private static readonly Schema s_emptySchema = new([], metadata: null);
 
-    private static readonly IReadOnlySet<ContentEncoding> s_producibleEncodings = new HashSet<ContentEncoding> { ContentEncoding.Zstd, ContentEncoding.Gzip };
+    // zstd is deliberately excluded from *response* compression (gzip only) — a real,
+    // version-dependent incompatibility in the reference Python client's dependency stack, found
+    // by reproducing a CI-only failure ("Invalid IPC stream: negative continuation token" on
+    // every HTTP unary test) in a Linux x86_64 container: the client advertises zstd support
+    // via `Accept-Encoding` whenever `vgi_rpc._codec.available_encodings()` sees the third-party
+    // `zstandard` package importable — but as of httpx2 2.12, httpx2's own *response*
+    // auto-decompression for zstd no longer uses that package at all; it requires Python 3.14's
+    // stdlib `compression.zstd` or the separate `backports.zstd` package, neither of which
+    // `vgi-rpc[http]` installs. On Python 3.13 (what this repo's CI runs) with only `zstandard`
+    // present, the client claims zstd support it cannot actually exercise: request compression
+    // still works (vgi_rpc's own code calls `zstandard` directly, never touching httpx2's
+    // decoder), but a zstd-compressed *response* comes back to the client still compressed, and
+    // pyarrow fails trying to parse it as a plain IPC stream. This is a pre-existing bug in the
+    // published `vgi-rpc[http]` package's interaction with recent httpx2 versions, not specific
+    // to this port — any server (Python's own reference included) would hit it against this
+    // exact client/Python-version combination. gzip has no such gap: httpx2 auto-decompresses it
+    // unconditionally via stdlib `zlib`. Revisit once the ecosystem's zstd story stabilizes (or
+    // `vgi-rpc[http]` starts installing `backports.zstd` on <3.14). Request decompression
+    // (DecompressingRequestBody) is entirely unaffected by any of this — it doesn't depend on
+    // this set or on the client's HTTP library at all.
+    private static readonly IReadOnlySet<ContentEncoding> s_producibleEncodings = new HashSet<ContentEncoding> { ContentEncoding.Gzip };
     private static readonly IReadOnlySet<ContentEncoding> s_noEncodings = new HashSet<ContentEncoding>();
 
     /// <summary>Registers <paramref name="server"/>'s routes under <paramref name="prefix"/>
