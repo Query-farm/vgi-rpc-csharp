@@ -1,5 +1,6 @@
 using QueryFarm.VgiRpc.Conformance.Types;
 using QueryFarm.VgiRpc.Server;
+using QueryFarm.VgiRpc.Streaming;
 
 namespace QueryFarm.VgiRpc.Conformance;
 
@@ -90,6 +91,23 @@ public interface IConformanceService
 
     Task<string> EchoWithAllLogLevelsAsync(string value, ICallContext? ctx = null);
 
+    // -- Producer streams ------------------------------------------------------
+
+    // Declared as Task<RpcStream<StreamState>> (the base state type) rather than each
+    // method's own concrete state type — mirrors Python's Protocol declaring `Stream[StreamState]`
+    // loosely while each impl method's concrete return narrows it; C# needs one shared
+    // interface-level type since (unlike Python duck typing) it enforces exact signature
+    // matching between interface and implementation, and RpcStream<TState> isn't covariant.
+    Task<RpcStream<StreamState>> ProduceNAsync(long count);
+
+    Task<RpcStream<StreamState>> ProduceEmptyAsync();
+
+    Task<RpcStream<StreamState>> ProduceSingleAsync();
+
+    Task<RpcStream<StreamState>> ProduceWithLogsAsync(long count);
+
+    Task<RpcStream<StreamState>> ProduceErrorMidStreamAsync(long emitBeforeError);
+
     // TODO (later milestones — see docs/roadmap.md):
     //   - oversized_unary (HTTP response-cap conformance)
     //   - echo_all_types / echo_all_types_with_nulls / echo_wide_types /
@@ -97,5 +115,6 @@ public interface IConformanceService
     //     echo_dict_encoded_string (need list-of-struct + wide Arrow type support)
     //   - echo_int8/int16/uint8/uint16/uint32/uint64/date/timestamp/timestamp_utc/time/
     //     duration/decimal/large_string/large_binary/fixed_binary (wide Arrow types)
-    //   - produce_* / exchange_* / cancel_* / *_header / dynamic_schema_producer (Milestone 3)
+    //   - produce_large_batches / *_header / rich_header_* / dynamic_schema_producer / cancel_*
+    //   - exchange_* (Milestone 3, continued)
 }

@@ -1,6 +1,7 @@
 using System.Reflection;
 using Apache.Arrow;
 using QueryFarm.VgiRpc.Server;
+using QueryFarm.VgiRpc.Streaming;
 
 namespace QueryFarm.VgiRpc.Reflection;
 
@@ -14,6 +15,10 @@ public sealed class RpcMethodInfo
     public MethodInfo Method { get; }
     public RpcMethodKind Kind { get; }
     public Schema ParamsSchema { get; }
+
+    /// <summary>The unary result schema — meaningless for a stream method (<see cref="Kind"/>
+    /// is <see cref="RpcMethodKind.Stream"/>), whose output/input schemas come from the
+    /// per-call <see cref="IRpcStream"/> instance the method returns instead.</summary>
     public Schema ResultSchema { get; }
 
     /// <summary>The subset of <see cref="Method"/>'s parameters that ARE wire fields, in
@@ -37,7 +42,6 @@ public sealed class RpcMethodInfo
     {
         Method = method;
         WireName = WireNaming.ForMethod(method);
-        Kind = RpcMethodKind.Unary;
 
         var allParams = method.GetParameters();
         HasContextParameter = allParams.Length > 0 && typeof(ICallContext).IsAssignableFrom(allParams[^1].ParameterType);
@@ -49,9 +53,19 @@ public sealed class RpcMethodInfo
         ParamsSchema = new Schema(paramFields, metadata: null);
 
         (ResultClrType, IsAsync) = UnwrapReturnType(method.ReturnType);
-        ResultSchema = ResultClrType == typeof(void)
-            ? new Schema([], metadata: null)
-            : new Schema([SchemaDerivation.FieldFor("result", ResultClrType)], metadata: null);
+
+        if (typeof(IRpcStream).IsAssignableFrom(ResultClrType))
+        {
+            Kind = RpcMethodKind.Stream;
+            ResultSchema = new Schema([], metadata: null); // unused for streams
+        }
+        else
+        {
+            Kind = RpcMethodKind.Unary;
+            ResultSchema = ResultClrType == typeof(void)
+                ? new Schema([], metadata: null)
+                : new Schema([SchemaDerivation.FieldFor("result", ResultClrType)], metadata: null);
+        }
     }
 
     private static (Type ClrType, bool IsAsync) UnwrapReturnType(Type returnType)

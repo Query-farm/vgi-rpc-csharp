@@ -2,6 +2,7 @@ using Apache.Arrow;
 using QueryFarm.VgiRpc.Errors;
 using QueryFarm.VgiRpc.Logging;
 using QueryFarm.VgiRpc.Reflection;
+using QueryFarm.VgiRpc.Streaming;
 using QueryFarm.VgiRpc.Transport;
 using QueryFarm.VgiRpc.Wire;
 
@@ -110,6 +111,11 @@ public sealed class RpcServer
             return true;
         }
 
+        if (info.Kind == RpcMethodKind.Stream)
+        {
+            return await ServeStreamAsync(transport, info, args, cancellationToken).ConfigureAwait(false);
+        }
+
         await using var writer = new WireWriter(transport.Output, info.ResultSchema);
         var context = info.HasContextParameter ? new BufferedCallContext() : null;
         try
@@ -130,12 +136,125 @@ public sealed class RpcServer
         }
         catch (Exception exc)
         {
-            var actual = exc is System.Reflection.TargetInvocationException { InnerException: { } inner } ? inner : exc;
+            var actual = Unwrap(exc);
             var metadata = LogMessage.FromException(actual).AddToMetadata();
             await writer.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(info.ResultSchema), metadata), cancellationToken).ConfigureAwait(false);
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Drives a streaming call's lockstep turns: one continuous output IPC stream (opened once,
+    /// for <see cref="IRpcStream.OutputSchema"/>) and one continuous input IPC stream (opened
+    /// once, reading successive tick/exchange batches) for the lifetime of the call. See
+    /// <see cref="StreamState"/>/<see cref="ProducerState"/>/<see cref="ExchangeState"/> and
+    /// WIRE_PROTOCOL.md's lockstep streaming section (canonical Python repo).
+    /// </summary>
+    private async Task<bool> ServeStreamAsync(IRpcTransport transport, RpcMethodInfo info, object?[] args, CancellationToken cancellationToken)
+    {
+        var invokeContext = info.HasContextParameter ? new BufferedCallContext() : null;
+        IRpcStream stream;
+        try
+        {
+            var raw = await info.InvokeAsync(_implementation, args, invokeContext).ConfigureAwait(false);
+            stream = (IRpcStream)raw!;
+        }
+        catch (Exception exc)
+        {
+            await WriteErrorStreamAsync(transport.Output, s_emptySchema, Unwrap(exc), cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+
+        var outputSchema = stream.OutputSchema;
+        await using var outputWriter = new WireWriter(transport.Output, outputSchema);
+        // Write the schema eagerly, not lazily-on-first-batch: a stream that finishes with zero
+        // batches (e.g. an empty producer) must still produce a valid (schema, EOS) IPC stream.
+        await outputWriter.WriteStartAsync(cancellationToken).ConfigureAwait(false);
+
+        if (invokeContext is not null)
+        {
+            foreach (var logMessage in invokeContext.Buffered)
+            {
+                await outputWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), logMessage.AddToMetadata()), cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        using var inputReader = new WireReader(transport.Input);
+        try
+        {
+            _ = await inputReader.ReadSchemaAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            return true; // client never opened the tick/exchange input stream
+        }
+
+        while (true)
+        {
+            AnnotatedBatch? inputBatch;
+            try
+            {
+                inputBatch = await inputReader.ReadNextAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception) when (!cancellationToken.IsCancellationRequested)
+            {
+                break; // client disconnected mid-stream
+            }
+
+            if (inputBatch is null)
+            {
+                break; // client closed its input stream (EOS) — the normal way an exchange ends
+            }
+
+            if (inputBatch.GetMetadata(MetadataKeys.Cancel) is not null)
+            {
+                stream.State.OnCancel(invokeContext);
+                break;
+            }
+
+            var collector = new OutputCollector(outputSchema);
+            var turnContext = info.HasContextParameter ? new StreamCallContext(collector) : null;
+            try
+            {
+                await stream.State.ProcessAsync(inputBatch, collector, turnContext, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception exc)
+            {
+                var metadata = LogMessage.FromException(Unwrap(exc)).AddToMetadata();
+                await outputWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), metadata), cancellationToken).ConfigureAwait(false);
+                break;
+            }
+
+            foreach (var logMessage in collector.Logs)
+            {
+                await outputWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), logMessage.AddToMetadata()), cancellationToken).ConfigureAwait(false);
+            }
+
+            if (collector.EmittedBatch is not null)
+            {
+                await outputWriter.WriteBatchAsync(new AnnotatedBatch(collector.EmittedBatch, null), cancellationToken).ConfigureAwait(false);
+            }
+
+            if (collector.Finished)
+            {
+                break;
+            }
+        }
+
+        return true;
+    }
+
+    private static Exception Unwrap(Exception exc) =>
+        exc is System.Reflection.TargetInvocationException { InnerException: { } inner } ? inner : exc;
+
+    /// <summary>Forwards a stream turn's <see cref="ICallContext.EmitLog"/> calls into that
+    /// turn's <see cref="OutputCollector"/> — matching Python's unified <c>ctx.emit_client_log</c>/
+    /// <c>out.client_log()</c> (the same sink) during stream processing.</summary>
+    private sealed class StreamCallContext(OutputCollector collector) : ICallContext
+    {
+        public void EmitLog(VgiLogLevel level, string message, IReadOnlyDictionary<string, object?>? extra = null) =>
+            collector.ClientLog(level, message, extra);
     }
 
     /// <summary>

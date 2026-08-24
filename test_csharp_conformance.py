@@ -42,6 +42,7 @@ IMPLEMENTED_FILTER = ",".join(
         "logging.*",
         "boundary_values.*",
         "protocol_version.*",
+        "producer_stream.*",
     ]
 )
 

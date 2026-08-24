@@ -20,7 +20,15 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       and the wide-Arrow-type methods (need list-of-struct + temporal/decimal support in
       `ValueCodec`), `__describe__`, and `large_payload.*`. See `test_csharp_conformance.py`
       for the exact implemented-subset filter, which grows as more lands.
-- [ ] **M3 — Streaming.** Producer + exchange streams, headers, cancellation.
+- [~] **M3 — Streaming (in progress).** Producer streams work end-to-end and pass the real
+      `producer_stream.*` conformance suite (5/5): `RpcStream<TState>`/`StreamState`/
+      `ProducerState`/`ExchangeState`/`OutputCollector`, and `RpcServer.ServeStreamAsync`'s
+      lockstep dispatch loop (one continuous output IPC stream + one continuous input/tick
+      stream for the call's lifetime — confirmed against the real Python client, not just
+      self-consistently). Remaining: exchange streams, headers, cancellation, dynamic schema,
+      client-side stream consumption (`RpcConnection`/`RpcClientProxy` — not needed for
+      conformance, since `vgi-rpc-test` drives our server with its own Python client, but needed
+      before any C#-to-C# streaming test can be written).
 - [ ] **M4 — Non-HTTP transports + CLI.** stdio (default), `--unix`, `--tcp`; graceful shutdown.
 - [ ] **M5 — Access log.** JSONL sink matching `access_log.schema.json`.
 - [ ] **M6 — Plain HTTP.** Kestrel server + `HttpClient` client; stream state tokens (AES-GCM).

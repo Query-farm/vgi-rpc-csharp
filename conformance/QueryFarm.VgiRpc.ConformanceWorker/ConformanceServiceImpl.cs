@@ -4,6 +4,7 @@ using QueryFarm.VgiRpc.Conformance.Errors;
 using QueryFarm.VgiRpc.Conformance.Types;
 using QueryFarm.VgiRpc.Logging;
 using QueryFarm.VgiRpc.Server;
+using QueryFarm.VgiRpc.Streaming;
 
 namespace QueryFarm.VgiRpc.ConformanceWorker;
 
@@ -91,4 +92,19 @@ public sealed class ConformanceServiceImpl : IConformanceService
         ctx.EmitLog(VgiLogLevel.Exception, value);
         return Task.FromResult(value);
     }
+
+    public Task<RpcStream<StreamState>> ProduceNAsync(long count) =>
+        Task.FromResult(new RpcStream<StreamState>(ConformanceStreamSchemas.Counter, new CounterState(count)));
+
+    public Task<RpcStream<StreamState>> ProduceEmptyAsync() =>
+        Task.FromResult(new RpcStream<StreamState>(ConformanceStreamSchemas.Counter, new EmptyProducerState()));
+
+    public Task<RpcStream<StreamState>> ProduceSingleAsync() =>
+        Task.FromResult(new RpcStream<StreamState>(ConformanceStreamSchemas.Counter, new SingleProducerState()));
+
+    public Task<RpcStream<StreamState>> ProduceWithLogsAsync(long count) =>
+        Task.FromResult(new RpcStream<StreamState>(ConformanceStreamSchemas.Counter, new LoggingProducerState(count)));
+
+    public Task<RpcStream<StreamState>> ProduceErrorMidStreamAsync(long emitBeforeError) =>
+        Task.FromResult(new RpcStream<StreamState>(ConformanceStreamSchemas.Counter, new ErrorAfterNState(emitBeforeError)));
 }
