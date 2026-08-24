@@ -50,6 +50,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: pip install "vgi-rpc[conformance]"
+      - run: pip install "vgi-rpc[conformance]" pytest
       # test_csharp_conformance.py's worker_binary fixture builds the worker itself.
       - run: python -m pytest test_csharp_conformance.py -v
