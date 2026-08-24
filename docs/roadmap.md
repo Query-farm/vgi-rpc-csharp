@@ -140,9 +140,22 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       known to be unimplemented) plus the two pre-existing gaps (`dataclass.nested_container_types`,
       `large_payload.*`) — no new failures, no hangs, no cascades (each HTTP request is
       independent, unlike the shared-connection desync class of bug documented under M3).
-      Remaining for M6: `/init`/`/exchange` streaming dispatch, the state-token codec (AES-GCM,
-      per the plan's substitution for Python's XChaCha20-Poly1305 — see the plan doc), and an
-      HTTP-based C# client (`HttpClient`).
+      Remaining for M6: `/init`/`/exchange` streaming dispatch, and an HTTP-based C# client
+      (`HttpClient`). The state-token AEAD primitive itself is done — `QueryFarm.VgiRpc.Http.Crypto`
+      (`Seal`/`Open`) is AES-256-GCM (12-byte nonce), substituted for Python's `vgi_rpc.crypto`
+      module's XChaCha20-Poly1305 (24-byte nonce) per the plan's reasoning (`ChaCha20Poly1305`
+      throws `PlatformNotSupportedException` on pre-2022 Windows Server; .NET has no XChaCha20 at
+      all) — same envelope shape (`version || nonce || ciphertext || tag`), same API shape
+      (`seal_bytes`/`open_bytes` → `Seal`/`Open`, `normalize_key` → `NormalizeKey`,
+      `SealError` → `SealException`). Safe because state tokens are transport-internal, not part
+      of the cross-language wire contract (every port already picked its own envelope). Covered
+      by `test/QueryFarm.VgiRpc.Http.Tests/CryptoTests.cs` (round-trip, wrong-key, wrong-AAD,
+      tampered-ciphertext, truncated/wrong-version, key normalization — 10/10 passing). Still
+      needed before this is usable: the actual token *framing* (Python's two-token split — a
+      call token minted once by `/init` carrying the frozen schemas + `call_id`, and a cursor
+      token re-minted every turn carrying just the advancing `StreamState` — plus the
+      `_CallStateCache` and zstd-before-seal payload compression) is real, separate work for
+      the `/init`/`/exchange` dispatch itself, not yet started.
 - [ ] **M7 — Response caps, capability headers, content-encoding negotiation.**
 - [ ] **M8 — Unauthorized-response spec + bearer auth.**
 - [ ] **M9 — mTLS + JWT, CORS.**
