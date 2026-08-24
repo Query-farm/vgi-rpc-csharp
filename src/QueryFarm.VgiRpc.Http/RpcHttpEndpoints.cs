@@ -81,15 +81,46 @@ public static class RpcHttpEndpoints
     /// default. A shared key is only needed for multi-process deployments, which this port
     /// doesn't support yet (see <see cref="StreamCallRegistry"/>'s doc comment) — provided now
     /// so the seam exists.</param>
-    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null)
+    /// <param name="maxResponseBytes">HTTP body cap enforced on unary results and exchange turns
+    /// (hard — no escape valve) — <see langword="null"/> (the default) means unbounded. Producer
+    /// turns don't enforce this yet (Python's own wire cap is *soft* there — a continuation token
+    /// carries the overshoot to the next turn — which this port doesn't implement; see
+    /// docs/roadmap.md M7). Advertised via <c>VGI-Max-Response-Bytes</c> on
+    /// <c>OPTIONS {prefix}/health</c>, matching <c>vgi_rpc.http._client.http_capabilities</c>'s
+    /// discovery contract.</param>
+    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null, long? maxResponseBytes = null)
     {
         tokenKey ??= RandomNumberGenerator.GetBytes(32);
         var registry = new StreamCallRegistry();
         endpoints.MapMethods($"{prefix}/health", ["GET", "HEAD"], (HttpContext context) => HandleHealthAsync(server, context));
-        endpoints.MapPost($"{prefix}/{{method}}", (string method, HttpContext context) => HandleUnaryAsync(server, method, context, compressionLevel));
+        endpoints.MapMethods($"{prefix}/health", ["OPTIONS"], (HttpContext context) => HandleCapabilitiesAsync(context, maxResponseBytes));
+        endpoints.MapPost($"{prefix}/{{method}}", (string method, HttpContext context) => HandleUnaryAsync(server, method, context, compressionLevel, maxResponseBytes));
         endpoints.MapPost($"{prefix}/{{method}}/init", (string method, HttpContext context) => HandleStreamInitAsync(server, method, context, compressionLevel, tokenKey, registry));
-        endpoints.MapPost($"{prefix}/{{method}}/exchange", (string method, HttpContext context) => HandleStreamExchangeAsync(server, method, context, compressionLevel, tokenKey, registry));
+        endpoints.MapPost($"{prefix}/{{method}}/exchange", (string method, HttpContext context) => HandleStreamExchangeAsync(server, method, context, compressionLevel, tokenKey, registry, maxResponseBytes));
         return endpoints;
+    }
+
+    /// <summary>
+    /// <c>OPTIONS {prefix}/health</c> — capability discovery, matching
+    /// <c>vgi_rpc.http._client.http_capabilities</c>'s contract exactly: <c>VGI-Max-Response-Bytes</c>
+    /// when a cap is configured, <c>VGI-Externalization-Enabled: false</c> and
+    /// <c>VGI-Upload-URL-Support: false</c> (neither is implemented yet — see docs/roadmap.md M13),
+    /// and <c>VGI-Supported-Encodings</c> naming the codecs this server can actually produce for
+    /// responses (see <see cref="s_producibleEncodings"/> — gzip only, for now).
+    /// </summary>
+    private static Task HandleCapabilitiesAsync(HttpContext context, long? maxResponseBytes)
+    {
+        var headers = context.Response.Headers;
+        if (maxResponseBytes is { } cap)
+        {
+            headers["VGI-Max-Response-Bytes"] = cap.ToString();
+        }
+
+        headers["VGI-Externalization-Enabled"] = "false";
+        headers["VGI-Upload-URL-Support"] = "false";
+        headers["VGI-Supported-Encodings"] = "gzip";
+        context.Response.StatusCode = StatusCodes.Status200OK;
+        return Task.CompletedTask;
     }
 
     private static Task HandleHealthAsync(RpcServer server, HttpContext context)
@@ -113,7 +144,7 @@ public static class RpcHttpEndpoints
         return context.Response.Body.WriteAsync(body, context.RequestAborted).AsTask();
     }
 
-    private static async Task HandleUnaryAsync(RpcServer server, string method, HttpContext context, int? compressionLevel)
+    private static async Task HandleUnaryAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, long? maxResponseBytes)
     {
         var request = context.Request;
         var cancellationToken = context.RequestAborted;
@@ -252,6 +283,21 @@ public static class RpcHttpEndpoints
                 var metadata = LogMessage.FromException(actual).AddToMetadata();
                 await writer.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(info.ResultSchema), metadata), cancellationToken).ConfigureAwait(false);
             }
+        }
+
+        // Hard wire-body cap — checked post-flush since building the buffer is free. On overshoot,
+        // discard the oversize body and answer with only the error batch instead (mirrors
+        // Python's _enforce_response_budgets + its post-overshoot re-write of resp_buf).
+        if (status == "ok" && maxResponseBytes is { } cap && responseBuffer.Length > cap)
+        {
+            var overshoot = new RpcException("RuntimeError", $"HTTP body exceeds max_response_bytes ({responseBuffer.Length} > {cap}) for method '{method}'");
+            status = "error";
+            errorType = "RuntimeError";
+            errorMessage = overshoot.Message;
+            responseBuffer = new MemoryStream();
+            await using var errWriter = new WireWriter(responseBuffer, info.ResultSchema);
+            var errMetadata = LogMessage.FromException(overshoot).AddToMetadata();
+            await errWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(info.ResultSchema), errMetadata), cancellationToken).ConfigureAwait(false);
         }
 
         // status=error still answers HTTP 200 — the body carries a real in-band error batch, and
@@ -455,7 +501,7 @@ public static class RpcHttpEndpoints
     /// (unlike accumulate-until-cap) trivially supporting mid-stream cancel — see
     /// <see cref="StreamCallRegistry"/>'s doc comment for the same simplification's rationale.
     /// </summary>
-    private static async Task HandleStreamExchangeAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry)
+    private static async Task HandleStreamExchangeAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry, long? maxResponseBytes = null)
     {
         var request = context.Request;
         var cancellationToken = context.RequestAborted;
@@ -645,6 +691,25 @@ public static class RpcHttpEndpoints
                 var dataBatch = collector.EmittedBatch ?? ValueCodec.EmptyRow(outputSchema);
                 await writer.WriteBatchAsync(new AnnotatedBatch(dataBatch, dataMetadata), cancellationToken).ConfigureAwait(false);
             }
+        }
+
+        // Hard wire-body cap, exchange turns only — matches Python's _skip_if_no_wire_cap
+        // reasoning: producer turns have a *soft* cap (a continuation token carries the
+        // overshoot to the next turn), which this port doesn't implement, so producer turns
+        // aren't capped at all yet. Exchange has no such escape valve.
+        if (!isProducer && maxResponseBytes is { } cap && responseBuffer.Length > cap)
+        {
+            var overshoot = new RpcException("RuntimeError", $"HTTP body exceeds max_response_bytes ({responseBuffer.Length} > {cap}) for method '{method}'");
+            responseBuffer = new MemoryStream();
+            await using (var errWriter = new WireWriter(responseBuffer, outputSchema))
+            {
+                var errMetadata = LogMessage.FromException(overshoot).AddToMetadata();
+                await errWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), errMetadata), cancellationToken).ConfigureAwait(false);
+            }
+
+            EmitAccessLog(server, info.WireName, "stream", "error", "RuntimeError", overshoot.Message, start, StatusCodes.Status200OK, callKey);
+            await WriteBytesAsync(context, StatusCodes.Status200OK, responseBuffer.ToArray(), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
+            return;
         }
 
         EmitAccessLog(server, info.WireName, "stream", "ok", "", "", start, StatusCodes.Status200OK, callKey);

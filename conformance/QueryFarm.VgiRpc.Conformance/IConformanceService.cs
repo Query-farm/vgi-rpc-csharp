@@ -108,6 +108,13 @@ public interface IConformanceService
 
     Task<decimal> EchoDecimalAsync(decimal value);
 
+    // -- HTTP response-cap conformance (M7) -----------------------------------
+
+    /// <summary>Returns a bytes payload of approximately <paramref name="targetBytes"/> bytes —
+    /// used by HTTP-only conformance tests to deliberately overshoot the operator-configured
+    /// <c>max_response_bytes</c> so strict-fail behavior can be verified.</summary>
+    Task<byte[]> OversizedUnaryAsync(long targetBytes);
+
     // -- Multi-param & defaults ---------------------------------------------
 
     Task<double> AddFloatsAsync(double a, double b);
@@ -164,6 +171,10 @@ public interface IConformanceService
     Task<RpcStream<StreamState>> ExchangeErrorOnNthAsync(long failOn);
 
     Task<RpcStream<StreamState>> ExchangeCastCompatibleAsync();
+
+    /// <summary>Companion to <see cref="OversizedUnaryAsync"/> for the lockstep exchange path —
+    /// emits <paramref name="rowsPerBatch"/> rows for any input, sized to overshoot the response cap.</summary>
+    Task<RpcStream<StreamState>> ExchangeOversizedAsync(long rowsPerBatch);
 
     // -- Cancellation ---------------------------------------------------------
 

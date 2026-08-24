@@ -198,12 +198,35 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
 - [~] **M7 — Response caps, capability headers, content-encoding negotiation.**
       Content-encoding negotiation (both directions) landed early, folded into M6 above since
       request decompression turned out to be a hard M6 prerequisite rather than optional M7
-      scope. Remaining: `max_response_bytes`/`max_externalized_response_bytes` enforcement,
-      whatever capability-header surface turns out to be real beyond the 3 `X-VGI-*` headers
-      already covered (`X-VGI-RPC-Error`, `X-VGI-Accept-Encoding`, `X-VGI-Content-Encoding`) —
-      the plan doc's "CapabilityHeaderWriter" framing looks larger than what the actual Python
-      implementation has; re-check against `vgi_rpc/http/server/_middleware.py` before assuming
-      more scope than that.
+      scope. **`max_response_bytes` capability discovery + enforcement now landed too**:
+      `OPTIONS {prefix}/health` (`RpcHttpEndpoints.HandleCapabilitiesAsync`) advertises
+      `VGI-Max-Response-Bytes`, `VGI-Externalization-Enabled: false`, `VGI-Upload-URL-Support: false`,
+      `VGI-Supported-Encodings: gzip` — matching `vgi_rpc.http._client.http_capabilities`'s
+      discovery contract exactly (this — not a generic "CapabilityHeaderWriter" — turned out to
+      be the real scope; the plan doc's framing suggested something larger than what the actual
+      Python implementation has). Unary and exchange responses that exceed the configured cap are
+      discarded and replaced with an in-band `RuntimeError: HTTP body exceeds max_response_bytes
+      (N > cap) for method '<name>'` batch (exact message format matches the porting guide's
+      documented wire contract), 200+`X-VGI-RPC-Error`. Producer turns are deliberately **not**
+      capped yet — Python's own wire cap is *soft* there (a continuation token carries the
+      overshoot to the next turn, which this port's one-turn-per-request model doesn't need but
+      also doesn't implement the capping variant of); matches
+      `_skip_if_no_wire_cap`'s own reasoning for why producer isn't tested this way either.
+      Added the two conformance methods this needed (`oversized_unary`, `exchange_oversized` —
+      neither existed yet) and wired the conformance worker to advertise a 64 KiB cap for `--http`
+      (not a mandatory CLI flag; a fixed value only this worker needs, so the response-cap tests
+      can run instead of skip). Verified: `http_response_cap.unary_strict_fail` and
+      `.exchange_strict_fail` now genuinely PASS (not skip) — added to `IMPLEMENTED_FILTER`,
+      confirmed skipped (not failed) over stdio via the `transports=("http",)` restriction and
+      passing over HTTP, 6/6 in both the local run and the Linux x86_64 container. The other two
+      `http_response_cap.*` tests (`producer_external_strict_fail`, `externalized_strict_fail`)
+      correctly still skip — they need M13 (external storage), not implemented.
+      Remaining for M7: whatever capability-header surface exists beyond what's now covered (the
+      `VGI-Max-Request-Bytes`/`VGI-Max-Upload-Bytes` headers exist in Python but aren't exercised
+      by any conformance test yet, so not implemented — re-check
+      `vgi_rpc/http/server/_middleware.py` before assuming more scope than that), and
+      `max_request_bytes` enforcement (413 for oversized inline request bodies) if a conformance
+      test ever needs it.
 - [ ] **M8 — Unauthorized-response spec + bearer auth.**
 - [ ] **M9 — mTLS + JWT, CORS.**
 - [ ] **M10 — Sticky sessions.**

@@ -58,6 +58,27 @@ public sealed class LoggingExchangeState : ExchangeState
     }
 }
 
+/// <summary>Emits <c>rowsPerBatch</c> {index, value} rows for any input, regardless of input
+/// size — sized by the caller to deliberately overshoot the operator-configured response cap, so
+/// HTTP strict-fail behaviour (see docs/roadmap.md M7) can be verified. Mirrors
+/// <c>OversizedExchangeState</c>.</summary>
+public sealed class OversizedExchangeState(long rowsPerBatch) : ExchangeState
+{
+    public override Task ExchangeAsync(AnnotatedBatch input, OutputCollector output, ICallContext? ctx, CancellationToken cancellationToken)
+    {
+        var indexBuilder = new Int64Array.Builder();
+        var valueBuilder = new Int64Array.Builder();
+        for (var i = 0L; i < rowsPerBatch; i++)
+        {
+            indexBuilder.Append(i);
+            valueBuilder.Append(i * 10);
+        }
+
+        output.Emit(new RecordBatch(ConformanceStreamSchemas.Counter, [indexBuilder.Build(), valueBuilder.Build()], checked((int)rowsPerBatch)));
+        return Task.CompletedTask;
+    }
+}
+
 /// <summary>Raises on the Nth exchange (1-indexed). Mirrors <c>FailOnExchangeNState</c>.</summary>
 public sealed class FailOnExchangeNState(long failOn) : ExchangeState
 {

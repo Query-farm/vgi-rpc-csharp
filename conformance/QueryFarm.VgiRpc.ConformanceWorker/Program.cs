@@ -63,7 +63,10 @@ if (options.Http)
     builder.Logging.ClearProviders();
     builder.WebHost.UseUrls($"http://{options.HttpHost}:{options.HttpPort}");
     var app = builder.Build();
-    app.MapVgiRpc(server);
+    // Not a mandatory CLI flag per the porting guide — 64 KiB is just a small, fast value that
+    // lets the http_response_cap.* conformance tests (which multiply it by 4 to guarantee
+    // overshoot) run quickly. See docs/roadmap.md M7.
+    app.MapVgiRpc(server, maxResponseBytes: 65536);
     await app.StartAsync(cts.Token);
     var boundPort = new Uri(app.Urls.First()).Port;
     Console.WriteLine($"PORT:{boundPort}");

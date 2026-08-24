@@ -62,6 +62,8 @@ IMPLEMENTED_FILTER = ",".join(
         "dynamic_schema_producer.*",
         "dataclass.echo_all_types",
         "dataclass.echo_all_types_with_nulls",
+        "http_response_cap.unary_strict_fail",
+        "http_response_cap.exchange_strict_fail",
         "exchange_stream.cast_int32_to_float64",
         "exchange_stream.cast_int64_to_float64",
         "exchange_stream.cast_float32_to_float64",

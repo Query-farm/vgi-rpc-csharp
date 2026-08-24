@@ -80,6 +80,16 @@ public sealed class ConformanceServiceImpl : IConformanceService
 
     public Task<decimal> EchoDecimalAsync(decimal value) => Task.FromResult(value);
 
+    public Task<byte[]> OversizedUnaryAsync(long targetBytes)
+    {
+        if (targetBytes < 0)
+        {
+            throw new ValueError("target_bytes must be non-negative");
+        }
+
+        return Task.FromResult(new byte[targetBytes]);
+    }
+
     public Task<double> AddFloatsAsync(double a, double b) => Task.FromResult(a + b);
 
     public Task<string> ConcatenateAsync(string prefix, string suffix, string separator) =>
@@ -157,6 +167,9 @@ public sealed class ConformanceServiceImpl : IConformanceService
 
     public Task<RpcStream<StreamState>> ExchangeCastCompatibleAsync() =>
         Task.FromResult(new RpcStream<StreamState>(ExchangeSchemas.Scale, new ScaleExchangeState(1.0), InputSchema: ExchangeSchemas.Scale));
+
+    public Task<RpcStream<StreamState>> ExchangeOversizedAsync(long rowsPerBatch) =>
+        Task.FromResult(new RpcStream<StreamState>(ConformanceStreamSchemas.Counter, new OversizedExchangeState(rowsPerBatch), InputSchema: ExchangeSchemas.Scale));
 
     public Task<RpcStream<StreamState>> CancellableProducerAsync() =>
         Task.FromResult(new RpcStream<StreamState>(ConformanceStreamSchemas.Counter, new CancellableProducerState()));
