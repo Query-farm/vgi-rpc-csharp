@@ -1,10 +1,18 @@
 using QueryFarm.VgiRpc.Client;
 using QueryFarm.VgiRpc.Errors;
+using QueryFarm.VgiRpc.Logging;
 using QueryFarm.VgiRpc.Server;
 using QueryFarm.VgiRpc.Transport;
 using Xunit;
 
 namespace QueryFarm.VgiRpc.Tests.Server;
+
+public enum Status
+{
+    Pending,
+    Active,
+    Closed,
+}
 
 public interface IGreeter
 {
@@ -19,6 +27,12 @@ public interface IGreeter
     Task<List<long>> EchoListAsync(List<long> values);
 
     Task ThrowAsync();
+
+    Task<Status> EchoStatusAsync(Status value);
+
+    Task<Dictionary<string, long>> EchoMapAsync(Dictionary<string, long> value);
+
+    Task<string> EchoWithLogAsync(string value, ICallContext? ctx = null);
 }
 
 public sealed class Greeter : IGreeter
@@ -34,6 +48,16 @@ public sealed class Greeter : IGreeter
     public Task<List<long>> EchoListAsync(List<long> values) => Task.FromResult(values);
 
     public Task ThrowAsync() => throw new InvalidOperationException("boom");
+
+    public Task<Status> EchoStatusAsync(Status value) => Task.FromResult(value);
+
+    public Task<Dictionary<string, long>> EchoMapAsync(Dictionary<string, long> value) => Task.FromResult(value);
+
+    public Task<string> EchoWithLogAsync(string value, ICallContext? ctx = null)
+    {
+        ctx!.EmitLog(VgiLogLevel.Info, "processing", new Dictionary<string, object?> { ["value"] = value });
+        return Task.FromResult(value);
+    }
 }
 
 /// <summary>
@@ -143,5 +167,41 @@ public sealed class RpcServerClientTests
     public interface IOther
     {
         Task DoSomethingAsync();
+    }
+
+    [Fact]
+    public async Task Enum_RoundTrips()
+    {
+        var (server, client, serverTransport) = Setup();
+        var serveTask = server.ServeOneAsync(serverTransport);
+
+        var result = await client.EchoStatusAsync(Status.Active);
+
+        Assert.Equal(Status.Active, result);
+        await serveTask;
+    }
+
+    [Fact]
+    public async Task Map_RoundTrips()
+    {
+        var (server, client, serverTransport) = Setup();
+        var serveTask = server.ServeOneAsync(serverTransport);
+
+        var result = await client.EchoMapAsync(new Dictionary<string, long> { ["a"] = 1, ["b"] = 2 });
+
+        Assert.Equal(new Dictionary<string, long> { ["a"] = 1, ["b"] = 2 }, result);
+        await serveTask;
+    }
+
+    [Fact]
+    public async Task CallContext_EmitLog_DoesNotBreakTheCall()
+    {
+        var (server, client, serverTransport) = Setup();
+        var serveTask = server.ServeOneAsync(serverTransport);
+
+        var result = await client.EchoWithLogAsync("hi");
+
+        Assert.Equal("hi", result);
+        await serveTask;
     }
 }

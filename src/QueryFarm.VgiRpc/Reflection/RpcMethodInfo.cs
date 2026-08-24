@@ -1,5 +1,6 @@
 using System.Reflection;
 using Apache.Arrow;
+using QueryFarm.VgiRpc.Server;
 
 namespace QueryFarm.VgiRpc.Reflection;
 
@@ -15,8 +16,14 @@ public sealed class RpcMethodInfo
     public Schema ParamsSchema { get; }
     public Schema ResultSchema { get; }
 
-    /// <summary>Wire field name → the CLR parameter it's bound to, in schema field order.</summary>
+    /// <summary>The subset of <see cref="Method"/>'s parameters that ARE wire fields, in
+    /// <see cref="ParamsSchema"/> field order — i.e. everything except a trailing
+    /// <see cref="ICallContext"/> parameter, if the method declares one.</summary>
     public IReadOnlyList<ParameterInfo> Parameters { get; }
+
+    /// <summary>True if the method's last parameter is an <see cref="ICallContext"/> the server
+    /// must inject at invocation time (not a wire field — see <see cref="ICallContext"/>).</summary>
+    public bool HasContextParameter { get; }
 
     /// <summary>The CLR type actually returned by the method body — <see cref="void"/> for a
     /// void/Task result, else the unwrapped Task&lt;T&gt;/ValueTask&lt;T&gt;/plain-T type.</summary>
@@ -32,7 +39,10 @@ public sealed class RpcMethodInfo
         WireName = WireNaming.ForMethod(method);
         Kind = RpcMethodKind.Unary;
 
-        Parameters = method.GetParameters();
+        var allParams = method.GetParameters();
+        HasContextParameter = allParams.Length > 0 && typeof(ICallContext).IsAssignableFrom(allParams[^1].ParameterType);
+        Parameters = HasContextParameter ? allParams[..^1] : allParams;
+
         var paramFields = Parameters
             .Select(p => SchemaDerivation.FieldForParameter(WireNaming.ForParameter(p), p))
             .ToArray();
@@ -65,12 +75,14 @@ public sealed class RpcMethodInfo
 
     /// <summary>
     /// Invokes the method against <paramref name="implementation"/> with positional
-    /// <paramref name="args"/> (in <see cref="Parameters"/> order), awaiting a Task/ValueTask
+    /// <paramref name="wireArgs"/> (in <see cref="Parameters"/> order — <paramref name="context"/>
+    /// is appended automatically when <see cref="HasContextParameter"/>), awaiting a Task/ValueTask
     /// result if <see cref="IsAsync"/>, and returns the unwrapped result value
     /// (<see langword="null"/> for a void/Task-without-result method).
     /// </summary>
-    public async Task<object?> InvokeAsync(object implementation, object?[] args)
+    public async Task<object?> InvokeAsync(object implementation, object?[] wireArgs, ICallContext? context = null)
     {
+        var args = HasContextParameter ? [.. wireArgs, context] : wireArgs;
         var raw = Method.Invoke(implementation, args);
         if (!IsAsync)
         {

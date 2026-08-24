@@ -1,4 +1,6 @@
+using System.Reflection;
 using Apache.Arrow;
+using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
 
 namespace QueryFarm.VgiRpc.Reflection;
@@ -7,13 +9,12 @@ namespace QueryFarm.VgiRpc.Reflection;
 /// Encodes/decodes single CLR values to/from single-row Arrow arrays, per the type mapping in
 /// <see cref="SchemaDerivation"/>.
 ///
-/// <para><b>Milestone 1 scope note</b>: covers scalars (bool/all integer widths/float/double/
-/// string/byte[]), <see cref="Nullable{T}"/>/nullable reference wrapping any of those,
-/// <c>List&lt;T&gt;</c>/<c>T[]</c> of a supported scalar, and nested structs of supported
-/// scalars. Enum (dictionary-encoded), <c>Dictionary&lt;K,V&gt;</c> (map), <c>HashSet&lt;T&gt;</c>,
-/// and the temporal/decimal types are deferred to Milestone 2's conformance-service work — see
-/// docs/roadmap.md — where they'll be built out against real conformance test vectors rather
-/// than speculatively here.</para>
+/// <para><b>Milestone 2 scope note</b>: covers scalars, <see cref="Nullable{T}"/>/nullable
+/// reference wrapping any of those, <c>List&lt;T&gt;</c>/<c>T[]</c> (including nested lists) of
+/// a supported element type, <c>Dictionary&lt;K,V&gt;</c> (map), enums (dictionary-encoded), and
+/// nested dataclass-equivalents (embedded-IPC-in-binary — see
+/// <see cref="BuildEmbeddedRecordArray"/>). The wide/temporal/decimal Arrow types and
+/// list-of-struct are deferred — see docs/roadmap.md.</para>
 /// </summary>
 public static class ValueCodec
 {
@@ -39,6 +40,11 @@ public static class ValueCodec
     /// <summary>Extracts row 0 of each column in <paramref name="batch"/>, decoded to the given CLR types, in order.</summary>
     public static object?[] ExtractRow(RecordBatch batch, IReadOnlyList<Type> clrTypes)
     {
+        if (clrTypes.Count == 0)
+        {
+            return [];
+        }
+
         if (batch.Length == 0)
         {
             throw new InvalidOperationException("Expected a 1-row batch but got a zero-row batch.");
@@ -68,7 +74,8 @@ public static class ValueCodec
         return field.DataType switch
         {
             StringType => new StringArray.Builder().Append((string)value).Build(),
-            BinaryType => new BinaryArray.Builder().Append((byte[])value).Build(),
+            BinaryType when value is byte[] bytes => new BinaryArray.Builder().Append(bytes).Build(),
+            BinaryType => BuildEmbeddedRecordArray(value),
             BooleanType => new BooleanArray.Builder().Append((bool)value).Build(),
             Int8Type => new Int8Array.Builder().Append((sbyte)value).Build(),
             UInt8Type => new UInt8Array.Builder().Append((byte)value).Build(),
@@ -81,7 +88,9 @@ public static class ValueCodec
             FloatType => new FloatArray.Builder().Append((float)value).Build(),
             DoubleType => new DoubleArray.Builder().Append((double)value).Build(),
             ListType listType => BuildListArray(listType, (System.Collections.IEnumerable)value),
-            StructType structType => BuildStructArray(structType, value),
+            StructType structType => BuildStructArray(structType, value, isEmpty: false),
+            DictionaryType dictType => BuildEnumArray(dictType, value),
+            MapType mapType => BuildMapArray(mapType, (System.Collections.IDictionary)value),
             var other => throw NotSupportedYet(other),
         };
     }
@@ -90,6 +99,8 @@ public static class ValueCodec
         type switch
         {
             StringType => nullRow ? new StringArray.Builder().AppendNull().Build() : new StringArray.Builder().Build(),
+            // Whether this BinaryType represents a byte[] or an embedded record is
+            // indistinguishable (and irrelevant) for an empty/null array — both encode identically.
             BinaryType => nullRow ? new BinaryArray.Builder().AppendNull().Build() : new BinaryArray.Builder().Build(),
             BooleanType => nullRow ? new BooleanArray.Builder().AppendNull().Build() : new BooleanArray.Builder().Build(),
             Int8Type => nullRow ? new Int8Array.Builder().AppendNull().Build() : new Int8Array.Builder().Build(),
@@ -103,13 +114,15 @@ public static class ValueCodec
             FloatType => nullRow ? new FloatArray.Builder().AppendNull().Build() : new FloatArray.Builder().Build(),
             DoubleType => nullRow ? new DoubleArray.Builder().AppendNull().Build() : new DoubleArray.Builder().Build(),
             ListType listType => nullRow ? BuildListArray(listType, null) : BuildListArray(listType, System.Array.Empty<object>()),
-            StructType structType => nullRow ? BuildStructArray(structType, null) : BuildStructArray(structType, EmptyEnumerable(structType)),
+            StructType structType => nullRow ? BuildStructArray(structType, value: null, isEmpty: false) : BuildStructArray(structType, value: null, isEmpty: true),
+            DictionaryType dictType => nullRow
+                ? new DictionaryArray(dictType, new Int16Array.Builder().AppendNull().Build(), new StringArray.Builder().Build())
+                : new DictionaryArray(dictType, new Int16Array.Builder().Build(), new StringArray.Builder().Build()),
+            MapType mapType => nullRow ? BuildMapArray(mapType, null) : BuildMapArray(mapType, new System.Collections.Hashtable()),
             var other => throw NotSupportedYet(other),
         };
 
     private static IArrowArray BuildEmptyArray(IArrowType type) => BuildEmptyArrayOrNull(type, nullRow: false);
-
-    private static IEnumerable<object?> EmptyEnumerable(StructType _) => [];
 
     private static IArrowArray BuildListArray(ListType listType, System.Collections.IEnumerable? items)
     {
@@ -129,31 +142,200 @@ public static class ValueCodec
         return builder.Build();
     }
 
-    private static IArrowArray BuildStructArray(StructType structType, object? value)
+    /// <summary>
+    /// Builds a native Arrow <c>struct</c> array for a dataclass NESTED inside another
+    /// dataclass's own fields (the "nested" tier of <see cref="SchemaDerivation"/>'s two-tier
+    /// rule — the top-level tier uses <see cref="BuildEmbeddedRecordArray"/> instead).
+    /// </summary>
+    private static IArrowArray BuildStructArray(StructType structType, object? value, bool isEmpty)
     {
         var childArrays = new IArrowArray[structType.Fields.Count];
         for (var i = 0; i < childArrays.Length; i++)
         {
             var field = structType.Fields[i];
-            object? childValue = null;
-            if (value is not null)
+            if (isEmpty)
+            {
+                childArrays[i] = BuildEmptyArrayOrNull(field.DataType, nullRow: false);
+            }
+            else if (value is null)
+            {
+                childArrays[i] = BuildEmptyArrayOrNull(field.DataType, nullRow: true);
+            }
+            else
             {
                 var property = value.GetType().GetProperty(FindClrPropertyName(value.GetType(), field));
-                childValue = property?.GetValue(value);
+                childArrays[i] = BuildSingleValueArray(field, property?.GetValue(value));
             }
-
-            childArrays[i] = value is null
-                ? BuildEmptyArrayOrNull(field.DataType, nullRow: true)
-                : BuildSingleValueArray(field, childValue);
         }
 
-        var length = value is null ? 0 : 1;
-        var nullCount = value is null ? 1 : 0;
-        var validityBuffer = value is null
-            ? Apache.Arrow.ArrowBuffer.Empty
-            : new Apache.Arrow.ArrowBuffer.BitmapBuilder().Append(true).Build();
+        var length = isEmpty ? 0 : 1;
+        var nullCount = !isEmpty && value is null ? 1 : 0;
+        var validityBuffer = nullCount > 0
+            ? new Apache.Arrow.ArrowBuffer.BitmapBuilder().Append(false).Build()
+            : Apache.Arrow.ArrowBuffer.Empty;
         var data = new ArrayData(structType, length, nullCount, 0, [validityBuffer], childArrays.Select(a => a.Data).ToArray());
         return new StructArray(data);
+    }
+
+    private static object ExtractStruct(StructArray array, int index, Type clrType)
+    {
+        var instance = Activator.CreateInstance(clrType)
+            ?? throw new InvalidOperationException($"Cannot construct '{clrType}' — it needs a public parameterless constructor.");
+        var structType = (StructType)array.Data.DataType;
+        for (var i = 0; i < structType.Fields.Count; i++)
+        {
+            var field = structType.Fields[i];
+            var property = clrType.GetProperty(FindClrPropertyName(clrType, field))!;
+            property.SetValue(instance, ExtractSingleValue(array.Fields[i], index, property.PropertyType));
+        }
+
+        return instance;
+    }
+
+    /// <summary>
+    /// Encodes a nested dataclass-equivalent as <c>binary</c> containing an embedded Arrow IPC
+    /// stream: a schema message (from <see cref="SchemaDerivation.InnerSchemaFor"/>) followed by
+    /// exactly one row and the EOS marker — matching the canonical Python implementation's
+    /// encoding exactly (confirmed against the real reference client; a native Arrow
+    /// <c>struct</c> column does NOT round-trip against it). Uses the stock, synchronous
+    /// <see cref="ArrowStreamWriter"/> directly rather than <see cref="Wire.WireWriter"/>: this
+    /// is a tiny in-memory serialization (never real I/O), doesn't need custom_metadata, and
+    /// benefits from not needing to bridge to async for what's fundamentally synchronous work.
+    /// </summary>
+    private static IArrowArray BuildEmbeddedRecordArray(object value)
+    {
+        var clrType = value.GetType();
+        var innerSchema = SchemaDerivation.InnerSchemaFor(clrType);
+        var rowValues = new object?[innerSchema.FieldsList.Count];
+        for (var i = 0; i < rowValues.Length; i++)
+        {
+            var field = innerSchema.GetFieldByIndex(i);
+            var property = clrType.GetProperty(FindClrPropertyName(clrType, field))!;
+            rowValues[i] = property.GetValue(value);
+        }
+
+        var row = BuildRow(innerSchema, rowValues);
+
+        using var stream = new MemoryStream();
+        using (var writer = new ArrowStreamWriter(stream, innerSchema, leaveOpen: true))
+        {
+            writer.WriteStart();
+            writer.WriteRecordBatch(row);
+            writer.WriteEnd();
+        }
+
+        return new BinaryArray.Builder().Append(stream.ToArray()).Build();
+    }
+
+    private static object ExtractEmbeddedRecord(byte[] bytes, Type clrType)
+    {
+        var innerSchema = SchemaDerivation.InnerSchemaFor(clrType);
+        using var stream = new MemoryStream(bytes);
+        using var reader = new ArrowStreamReader(stream);
+        var row = reader.ReadNextRecordBatch()
+            ?? throw new InvalidOperationException($"Embedded record for '{clrType}' had no data batch.");
+
+        var instance = Activator.CreateInstance(clrType)
+            ?? throw new InvalidOperationException($"Cannot construct '{clrType}' — it needs a public parameterless constructor.");
+        for (var i = 0; i < innerSchema.FieldsList.Count; i++)
+        {
+            var field = innerSchema.GetFieldByIndex(i);
+            var property = clrType.GetProperty(FindClrPropertyName(clrType, field))!;
+            property.SetValue(instance, ExtractSingleValue(row.Column(i), 0, property.PropertyType));
+        }
+
+        return instance;
+    }
+
+    /// <summary>
+    /// Builds a single-row dictionary-encoded array for an enum value: the dictionary holds
+    /// every member's wire name (in declaration order — a stable, deterministic ordering both
+    /// sides can reproduce independently), and the one index selects <paramref name="value"/>'s
+    /// member. Per WIRE_PROTOCOL.md §4: enum → dictionary(int16, utf8) by member name.
+    /// </summary>
+    private static IArrowArray BuildEnumArray(DictionaryType dictType, object value)
+    {
+        var enumType = value.GetType();
+        var names = new List<string>();
+        short selectedIndex = -1;
+        short i = 0;
+        foreach (var field in EnumFields(enumType))
+        {
+            names.Add(WireNaming.ForEnumMember(field));
+            if (field.GetValue(null)!.Equals(value))
+            {
+                selectedIndex = i;
+            }
+
+            i++;
+        }
+
+        if (selectedIndex < 0)
+        {
+            throw new InvalidOperationException($"'{value}' is not a member of enum '{enumType}'.");
+        }
+
+        var dictionaryValues = new StringArray.Builder().AppendRange(names).Build();
+        var indices = new Int16Array.Builder().Append(selectedIndex).Build();
+        return new DictionaryArray(dictType, indices, dictionaryValues);
+    }
+
+    private static object ExtractEnum(DictionaryArray array, int index, Type enumType)
+    {
+        var indices = (Int16Array)array.Indices;
+        var dictionaryValues = (StringArray)array.Dictionary;
+        var wireIndex = indices.Values[index];
+        var name = dictionaryValues.GetString(wireIndex);
+        foreach (var field in EnumFields(enumType))
+        {
+            if (WireNaming.ForEnumMember(field) == name)
+            {
+                return field.GetValue(null)!;
+            }
+        }
+
+        throw new InvalidOperationException($"Enum '{enumType}' has no member matching wire name '{name}'.");
+    }
+
+    private static IEnumerable<FieldInfo> EnumFields(Type enumType) =>
+        enumType.GetFields(BindingFlags.Public | BindingFlags.Static);
+
+    private static IArrowArray BuildMapArray(MapType mapType, System.Collections.IDictionary? entries)
+    {
+        var builder = new MapArray.Builder(mapType);
+        if (entries is null)
+        {
+            builder.AppendNull();
+            return builder.Build();
+        }
+
+        builder.Append();
+        foreach (System.Collections.DictionaryEntry entry in entries)
+        {
+            AppendScalarToBuilder(builder.KeyBuilder, mapType.KeyField.DataType, entry.Key);
+            AppendScalarToBuilder(builder.ValueBuilder, mapType.ValueField.DataType, entry.Value);
+        }
+
+        return builder.Build();
+    }
+
+    private static object ExtractMap(MapArray array, int index, Type clrDictType)
+    {
+        var typeArgs = clrDictType.IsGenericType ? clrDictType.GetGenericArguments() : [];
+        var keyType = typeArgs.Length > 0 ? typeArgs[0] : typeof(object);
+        var valueType = typeArgs.Length > 1 ? typeArgs[1] : typeof(object);
+
+        var start = array.ValueOffsets[index];
+        var end = array.ValueOffsets[index + 1];
+        var dict = (System.Collections.IDictionary)Activator.CreateInstance(typeof(Dictionary<,>).MakeGenericType(keyType, valueType))!;
+        for (var i = start; i < end; i++)
+        {
+            var key = ExtractSingleValue(array.Keys, i, keyType);
+            var val = ExtractSingleValue(array.Values, i, valueType);
+            dict[key!] = val;
+        }
+
+        return dict;
     }
 
     private static string FindClrPropertyName(Type clrType, Field wireField)
@@ -201,6 +383,24 @@ public static class ValueCodec
                 var floatBuilder = (FloatArray.Builder)builder;
                 if (value is null) { floatBuilder.AppendNull(); } else { floatBuilder.Append((float)value); }
                 break;
+            case ListType innerListType:
+                // Nested list (e.g. List<List<long>>) — ArrowArrayBuilderFactory already built
+                // `builder` as a ListArray.Builder for this element field, so recurse into it.
+                var innerListBuilder = (ListArray.Builder)builder;
+                if (value is null)
+                {
+                    innerListBuilder.AppendNull();
+                }
+                else
+                {
+                    innerListBuilder.Append();
+                    foreach (var innerItem in (System.Collections.IEnumerable)value)
+                    {
+                        AppendScalarToBuilder(innerListBuilder.ValueBuilder, innerListType.ValueDataType, innerItem);
+                    }
+                }
+
+                break;
             default:
                 throw NotSupportedYet(elementType);
         }
@@ -221,7 +421,8 @@ public static class ValueCodec
         return array switch
         {
             StringArray a => a.GetString(index),
-            BinaryArray a => a.GetBytes(index).ToArray(),
+            BinaryArray a when effectiveType == typeof(byte[]) => a.GetBytes(index).ToArray(),
+            BinaryArray a => ExtractEmbeddedRecord(a.GetBytes(index).ToArray(), effectiveType),
             BooleanArray a => a.GetValue(index)!.Value,
             Int8Array a => a.Values[index],
             UInt8Array a => a.Values[index],
@@ -233,8 +434,10 @@ public static class ValueCodec
             UInt64Array a => a.Values[index],
             FloatArray a => a.Values[index],
             DoubleArray a => a.Values[index],
+            MapArray a => ExtractMap(a, index, effectiveType),
             ListArray a => ExtractList(a, index, effectiveType),
             StructArray a => ExtractStruct(a, index, effectiveType),
+            DictionaryArray a => ExtractEnum(a, index, effectiveType),
             _ => throw NotSupportedYet(array.Data.DataType),
         };
     }
@@ -272,22 +475,6 @@ public static class ValueCodec
         }
 
         return listInstance;
-    }
-
-    private static object ExtractStruct(StructArray array, int index, Type clrType)
-    {
-        var instance = Activator.CreateInstance(clrType) ?? throw new InvalidOperationException($"Cannot construct '{clrType}' — it needs a public parameterless constructor.");
-        var structType = (StructType)array.Data.DataType;
-        for (var i = 0; i < structType.Fields.Count; i++)
-        {
-            var field = structType.Fields[i];
-            var propertyName = FindClrPropertyName(clrType, field);
-            var property = clrType.GetProperty(propertyName)!;
-            var value = ExtractSingleValue(array.Fields[i], index, property.PropertyType);
-            property.SetValue(instance, value);
-        }
-
-        return instance;
     }
 
     private static NotSupportedException NotSupportedYet(IArrowType type) =>

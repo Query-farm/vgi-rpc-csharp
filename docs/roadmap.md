@@ -5,13 +5,21 @@ ports (Go, Rust, TypeScript, Java). Everything below is in scope — this list o
 dependency*, not what eventually ships. See `~/Development/vgi-rpc/docs/porting-guide.md` (in the
 canonical Python repo) for the language-agnostic porting checklist this plan is built on.
 
-- [ ] **M0 — Wire spike.** A thin `QueryFarm.VgiRpc.Wire` layer over a vendored, patched
+- [x] **M0 — Wire spike.** A thin `QueryFarm.VgiRpc.Wire` layer over a vendored, patched
       `Apache.Arrow` (`third_party/apache-arrow-dotnet/`) that adds per-batch `custom_metadata`
       support the stock NuGet package lacks — see `docs/wire-protocol.md`.
-- [ ] **M1 — `__describe__` round-trip.** Reflection-based schema derivation, `RpcServer`/
-      `RpcConnection`/`DispatchProxy` client over the in-process pipe transport.
-- [ ] **M2 — Full unary conformance.** All `IConformanceService` unary methods; `RpcException`
-      hierarchy; first NuGet dry-run pack in CI.
+- [x] **M1 — Core unary RPC engine.** Reflection-based schema derivation, `RpcServer`/
+      `RpcConnection`/`DispatchProxy` client over the in-process pipe transport. (`__describe__`
+      itself is not yet implemented — see the note under M2.)
+- [~] **M2 — Unary conformance (in progress).** 56/105 tests in the real cross-language
+      `vgi-rpc-test` suite pass against the C# worker over stdio — the full scalar/void/
+      complex_types/optional/multi_param/errors/logging/boundary_values/protocol_version
+      categories, plus `dataclass.echo_point`/`echo_bounding_box`/`inspect_point` and
+      `annotated.*`. Confirmed empirically (not just self-consistently) against the canonical
+      Python reference client. Remaining for this milestone: `dataclass.echo_all_types(_with_nulls)`
+      and the wide-Arrow-type methods (need list-of-struct + temporal/decimal support in
+      `ValueCodec`), `__describe__`, and `large_payload.*`. See `test_csharp_conformance.py`
+      for the exact implemented-subset filter, which grows as more lands.
 - [ ] **M3 — Streaming.** Producer + exchange streams, headers, cancellation.
 - [ ] **M4 — Non-HTTP transports + CLI.** stdio (default), `--unix`, `--tcp`; graceful shutdown.
 - [ ] **M5 — Access log.** JSONL sink matching `access_log.schema.json`.

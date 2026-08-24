@@ -49,15 +49,19 @@ public sealed class RpcServer
     public async Task<bool> ServeOneAsync(IRpcTransport transport, CancellationToken cancellationToken = default)
     {
         using var reader = new WireReader(transport.Input);
-        Schema paramsSchema;
         AnnotatedBatch? request;
         try
         {
-            paramsSchema = await reader.ReadSchemaAsync(cancellationToken).ConfigureAwait(false);
+            _ = await reader.ReadSchemaAsync(cancellationToken).ConfigureAwait(false);
             request = await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false);
         }
-        catch (EndOfStreamException)
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
         {
+            // The channel closed (cleanly or otherwise) before a full request arrived — the
+            // normal way a ServeAsync loop ends when the client disconnects. Apache.Arrow
+            // doesn't document a single exception type for "stream ended mid-schema", so this
+            // catches broadly rather than risk an unhandled exception tearing down the worker
+            // on a plain client disconnect.
             return false;
         }
 
@@ -107,9 +111,18 @@ public sealed class RpcServer
         }
 
         await using var writer = new WireWriter(transport.Output, info.ResultSchema);
+        var context = info.HasContextParameter ? new BufferedCallContext() : null;
         try
         {
-            var result = await info.InvokeAsync(_implementation, args).ConfigureAwait(false);
+            var result = await info.InvokeAsync(_implementation, args, context).ConfigureAwait(false);
+            if (context is not null)
+            {
+                foreach (var logMessage in context.Buffered)
+                {
+                    await writer.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(info.ResultSchema), logMessage.AddToMetadata()), cancellationToken).ConfigureAwait(false);
+                }
+            }
+
             var resultBatch = info.ResultSchema.FieldsList.Count == 0
                 ? ValueCodec.EmptyRow(info.ResultSchema)
                 : ValueCodec.BuildRow(info.ResultSchema, [result]);
@@ -123,6 +136,20 @@ public sealed class RpcServer
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Buffers <see cref="ICallContext.EmitLog"/> calls made during a synchronous method body,
+    /// flushed as zero-row log batches immediately before the result batch. Since a method body
+    /// runs to completion before <see cref="ServeOneAsync"/> gets a chance to write anything,
+    /// buffer-then-flush produces the same wire sequence true incremental interleaving would.
+    /// </summary>
+    private sealed class BufferedCallContext : ICallContext
+    {
+        public List<LogMessage> Buffered { get; } = [];
+
+        public void EmitLog(VgiLogLevel level, string message, IReadOnlyDictionary<string, object?>? extra = null) =>
+            Buffered.Add(new LogMessage(level, message, extra));
     }
 
     private static readonly Schema s_emptySchema = new([], metadata: null);

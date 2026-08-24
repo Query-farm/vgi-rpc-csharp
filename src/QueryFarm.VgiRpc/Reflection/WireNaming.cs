@@ -41,11 +41,17 @@ public static class WireNaming
             ? attr.WireName
             : ToSnakeCase(property.Name);
 
-    /// <summary>Wire name for an enum member (dictionary-encoded by member name, per WIRE_PROTOCOL.md §4).</summary>
+    /// <summary>
+    /// Wire name for an enum member (dictionary-encoded by member name, per WIRE_PROTOCOL.md §4).
+    /// Defaults to SCREAMING_SNAKE_CASE (e.g. C#'s <c>Pending</c> → <c>PENDING</c>) — Python enum
+    /// members are used on the wire verbatim, and Python's own convention for them is
+    /// upper-case, so this is the default most likely to match a hand-written Python enum
+    /// without needing an <see cref="RpcNameAttribute"/> override on every member.
+    /// </summary>
     public static string ForEnumMember(FieldInfo enumField) =>
         enumField.GetCustomAttribute<RpcNameAttribute>() is { } attr
             ? attr.WireName
-            : ToSnakeCase(enumField.Name);
+            : ToSnakeCase(enumField.Name).ToUpperInvariant();
 
     /// <summary>
     /// Converts a PascalCase or camelCase identifier to snake_case: a lowercase letter/digit

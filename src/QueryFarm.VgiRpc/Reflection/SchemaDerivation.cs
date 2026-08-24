@@ -1,4 +1,3 @@
-using System.Collections;
 using System.Collections.Concurrent;
 using System.Reflection;
 using Apache.Arrow;
@@ -15,73 +14,71 @@ namespace QueryFarm.VgiRpc.Reflection;
 /// Type mapping: string→utf8, byte[]→binary, bool→bool, integer widths→matching Arrow int
 /// width, float/double→float32/float64, enum→dictionary(int16,utf8) by member name (see
 /// <see cref="WireNaming.ForEnumMember"/>), List&lt;T&gt;/T[]→list, HashSet&lt;T&gt;→list,
-/// Dictionary&lt;K,V&gt;→map(K,V), Nullable&lt;T&gt;/a nullable reference→a nullable field,
-/// and any other class/record→struct (fields from its public instance properties) — this repo
-/// follows the Java port's precedent of struct-for-nested-records rather than Python's
-/// embedded-IPC-stream-as-binary encoding, since a native Arrow struct column round-trips
-/// through every Arrow implementation without needing a nested IPC parse.
+/// Dictionary&lt;K,V&gt;→map(K,V), Nullable&lt;T&gt;/a nullable reference→a nullable field.
+///
+/// A nested dataclass-equivalent is a two-tier rule, confirmed empirically against the real
+/// Python reference client via <c>vgi-rpc-test</c> (a uniform native-Arrow-<c>struct</c>
+/// encoding — which is what the Java port uses — does NOT round-trip against it):
+/// <list type="bullet">
+/// <item>At the TOP LEVEL (a service method's own parameter or return type) → <c>binary</c>
+/// containing an embedded Arrow IPC stream (the dataclass's own schema + one row + EOS). See
+/// <see cref="InnerSchemaFor"/> and <see cref="ValueCodec"/>'s embedded-record helpers.</item>
+/// <item>NESTED inside another dataclass's own fields (i.e. once already inside an embedded
+/// IPC stream's schema) → a native Arrow <c>struct</c> column — no need for a further nested
+/// IPC stream when the enclosing schema can just describe it directly.</item>
+/// </list>
 /// </summary>
 public static class SchemaDerivation
 {
-    private static readonly ConcurrentDictionary<Type, IArrowType> s_structTypeCache = new();
+    private static readonly ConcurrentDictionary<Type, Schema> s_innerSchemaCache = new();
+    private static readonly ConcurrentDictionary<Type, StructType> s_nestedStructTypeCache = new();
 
-    /// <summary>Builds the Arrow field for a CLR type under the given wire name.</summary>
+    /// <summary>Builds the top-level Arrow field for a CLR type under the given wire name.</summary>
     public static Field FieldFor(string wireName, Type clrType) =>
         new(wireName, ArrowTypeFor(clrType, out var nullable), nullable);
 
     /// <summary>
-    /// Resolves the Arrow type for a CLR type, unwrapping <see cref="Nullable{T}"/> and
-    /// reporting whether the field should be nullable on the wire.
+    /// Resolves the top-level Arrow type for a CLR type, unwrapping <see cref="Nullable{T}"/>
+    /// and reporting whether the field should be nullable on the wire.
     /// </summary>
     public static IArrowType ArrowTypeFor(Type clrType, out bool nullable)
     {
         if (Nullable.GetUnderlyingType(clrType) is { } underlying)
         {
             nullable = true;
-            return ArrowTypeForNonNullable(underlying);
+            return ArrowTypeForNonNullable(underlying, nested: false);
         }
 
         // Reference types default to nullable on the wire unless a caller has independently
         // established (e.g. via NullabilityInfoContext on the originating member) that they
         // aren't — this overload doesn't have access to that context, so it errs permissive.
         nullable = clrType.IsClass || clrType.IsInterface;
-        return ArrowTypeForNonNullable(clrType);
+        return ArrowTypeForNonNullable(clrType, nested: false);
     }
 
     /// <summary>
     /// Resolves nullability from a parameter's actual nullable-reference-type annotation (via
     /// <see cref="NullabilityInfoContext"/>) rather than guessing from "is a reference type".
     /// </summary>
-    public static Field FieldForParameter(string wireName, ParameterInfo parameter)
+    public static Field FieldForParameter(string wireName, ParameterInfo parameter) =>
+        FieldForMember(wireName, parameter.ParameterType, new NullabilityInfoContext().Create(parameter), nested: false);
+
+    /// <summary>Same as <see cref="FieldForParameter"/>, for a property of a dataclass-equivalent's own fields.</summary>
+    public static Field FieldForProperty(string wireName, PropertyInfo property) =>
+        FieldForMember(wireName, property.PropertyType, new NullabilityInfoContext().Create(property), nested: true);
+
+    private static Field FieldForMember(string wireName, Type clrType, NullabilityInfo info, bool nested)
     {
-        var context = new NullabilityInfoContext();
-        var info = context.Create(parameter);
-        var clrType = parameter.ParameterType;
         if (Nullable.GetUnderlyingType(clrType) is { } underlying)
         {
-            return new Field(wireName, ArrowTypeForNonNullable(underlying), nullable: true);
+            return new Field(wireName, ArrowTypeForNonNullable(underlying, nested), nullable: true);
         }
 
         var nullable = info.WriteState is NullabilityState.Nullable || !clrType.IsValueType && info.WriteState != NullabilityState.NotNull;
-        return new Field(wireName, ArrowTypeForNonNullable(clrType), nullable);
+        return new Field(wireName, ArrowTypeForNonNullable(clrType, nested), nullable);
     }
 
-    /// <summary>Same as <see cref="FieldForParameter"/>, for a property (used for nested struct fields).</summary>
-    public static Field FieldForProperty(string wireName, PropertyInfo property)
-    {
-        var context = new NullabilityInfoContext();
-        var info = context.Create(property);
-        var clrType = property.PropertyType;
-        if (Nullable.GetUnderlyingType(clrType) is { } underlying)
-        {
-            return new Field(wireName, ArrowTypeForNonNullable(underlying), nullable: true);
-        }
-
-        var nullable = info.WriteState is NullabilityState.Nullable || !clrType.IsValueType && info.WriteState != NullabilityState.NotNull;
-        return new Field(wireName, ArrowTypeForNonNullable(clrType), nullable);
-    }
-
-    private static IArrowType ArrowTypeForNonNullable(Type type)
+    private static IArrowType ArrowTypeForNonNullable(Type type, bool nested)
     {
         if (type == typeof(string))
         {
@@ -175,16 +172,35 @@ public static class SchemaDerivation
 
         if (TryGetElementType(type, out var elementType))
         {
-            return new ListType(FieldFor("item", elementType));
+            return new ListType(ElementField("item", elementType, nested, forceNonNullable: false));
         }
 
         if (TryGetMapTypes(type, out var keyType, out var valueType))
         {
-            var valueField = new Field("value", ArrowTypeFor(valueType, out var valueNullable), valueNullable);
-            return new MapType(FieldFor("key", keyType), valueField);
+            // Map keys must be non-nullable (Arrow's own constraint) regardless of what a
+            // reference-type key's default nullability would otherwise be.
+            var keyField = ElementField("key", keyType, nested, forceNonNullable: true);
+            var valueField = ElementField("value", valueType, nested, forceNonNullable: false);
+            return new MapType(keyField, valueField);
         }
 
-        return StructTypeFor(type);
+        // A nested dataclass-equivalent: see the two-tier rule in this class's doc comment.
+        return nested ? NestedStructTypeFor(type) : BinaryType.Default;
+    }
+
+    /// <summary>A list/map element field — unwraps <see cref="Nullable{T}"/> (there's no
+    /// <see cref="NullabilityInfoContext"/> source for a bare generic-argument type, so
+    /// reference-type elements default to nullable, matching <see cref="ArrowTypeFor"/>'s
+    /// top-level-parameter behavior).</summary>
+    private static Field ElementField(string name, Type elementType, bool nested, bool forceNonNullable)
+    {
+        if (Nullable.GetUnderlyingType(elementType) is { } underlying)
+        {
+            return new Field(name, ArrowTypeForNonNullable(underlying, nested), nullable: !forceNonNullable);
+        }
+
+        var nullable = !forceNonNullable && (elementType.IsClass || elementType.IsInterface);
+        return new Field(name, ArrowTypeForNonNullable(elementType, nested), nullable);
     }
 
     /// <summary>List/set element type: <c>T[]</c>, <c>List&lt;T&gt;</c>, <c>IEnumerable&lt;T&gt;</c>,
@@ -247,15 +263,24 @@ public static class SchemaDerivation
         }
     }
 
-    /// <summary>Struct type for a nested record/class, from its public instance properties, cached per type.</summary>
-    private static IArrowType StructTypeFor(Type type) =>
-        s_structTypeCache.GetOrAdd(type, static t =>
-        {
-            var fields = t
-                .GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                .Where(p => p.CanRead && p.GetIndexParameters().Length == 0)
-                .Select(p => FieldForProperty(WireNaming.ForProperty(p), p))
-                .ToArray();
-            return new StructType(fields);
-        });
+    /// <summary>
+    /// The Arrow schema for a TOP-LEVEL dataclass-equivalent's own fields (its public instance
+    /// properties) — used as the embedded IPC stream's schema when encoding/decoding it as a
+    /// <c>binary</c> wire value. Fields that are themselves dataclasses resolve as nested
+    /// <c>struct</c> (the "nested" tier of the two-tier rule). See <see cref="ValueCodec"/>'s
+    /// embedded-record helpers.
+    /// </summary>
+    public static Schema InnerSchemaFor(Type type) =>
+        s_innerSchemaCache.GetOrAdd(type, static t => new Schema(PropertyFields(t, nested: true), metadata: null));
+
+    /// <summary>Native Arrow <c>struct</c> type for a dataclass nested inside another dataclass's own fields.</summary>
+    private static StructType NestedStructTypeFor(Type type) =>
+        s_nestedStructTypeCache.GetOrAdd(type, static t => new StructType(PropertyFields(t, nested: true)));
+
+    private static Field[] PropertyFields(Type type, bool nested) =>
+        type
+            .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+            .Where(p => p.CanRead && p.GetIndexParameters().Length == 0)
+            .Select(p => FieldForMember(WireNaming.ForProperty(p), p.PropertyType, new NullabilityInfoContext().Create(p), nested))
+            .ToArray();
 }

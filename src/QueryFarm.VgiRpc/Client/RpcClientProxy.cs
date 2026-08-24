@@ -47,7 +47,16 @@ public class RpcClientProxy<T> : DispatchProxy
                 $"'{targetMethod}' must return Task or Task<T> to be callable through {nameof(RpcClientProxy<T>)} — synchronous service interfaces aren't supported client-side. See docs/roadmap.md.");
         }
 
-        var callTask = _connection.CallUnaryAsync(info, args ?? [], CancellationToken.None);
+        // A trailing ICallContext parameter (see RpcMethodInfo.HasContextParameter) is a
+        // server-injected value, not a wire field — the interface declares it with a `= null`
+        // default purely so client call sites can omit it; trim it before marshaling.
+        var wireArgs = args ?? [];
+        if (info.HasContextParameter)
+        {
+            wireArgs = wireArgs[..^1];
+        }
+
+        var callTask = _connection.CallUnaryAsync(info, wireArgs, CancellationToken.None);
 
         if (info.ResultClrType == typeof(void))
         {
