@@ -37,6 +37,12 @@ public sealed class ConformanceServiceImpl : IConformanceService
 
     public Task<long?> EchoOptionalIntAsync(long? value) => Task.FromResult(value);
 
+    public Task<Point?> EchoOptionalPointAsync(Point? point) => Task.FromResult(point);
+
+    public Task<int?> EchoAnnotatedOptionalIntAsync(int? value) => Task.FromResult(value);
+
+    public Task<int?> EchoOuterOptionalNonNullAsync(int? value) => Task.FromResult(value);
+
     public Task<Point> EchoPointAsync(Point point) => Task.FromResult(point);
 
     public Task<BoundingBox> EchoBoundingBoxAsync(BoundingBox box) => Task.FromResult(box);
@@ -97,6 +103,9 @@ public sealed class ConformanceServiceImpl : IConformanceService
 
     public Task<RpcStream<StreamState>> ProduceNAsync(long count) =>
         Task.FromResult(new RpcStream<StreamState>(ConformanceStreamSchemas.Counter, new CounterState(count)));
+
+    public Task<RpcStream<StreamState>> ProduceTickMetadataAsync(long count) =>
+        Task.FromResult(new RpcStream<StreamState>(TickMetadataSchemas.Output, new TickMetadataState(count)));
 
     public Task<RpcStream<StreamState>> ProduceEmptyAsync() =>
         Task.FromResult(new RpcStream<StreamState>(ConformanceStreamSchemas.Counter, new EmptyProducerState()));

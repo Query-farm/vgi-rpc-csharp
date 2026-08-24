@@ -32,6 +32,28 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       (`RpcConnection`/`RpcClientProxy` — not needed for conformance, since `vgi-rpc-test` drives
       our server with its own Python client, but needed before any C#-to-C# streaming test can
       be written).
+- **Spec-drift catch-up (2026-08-24).** CI's conformance job had been silently broken (missing
+      `pytest` in the workflow, fixed alongside this) since M4, so it never caught that the
+      published `vgi-rpc[conformance]` PyPI package (0.43.0) had grown new conformance surface
+      past what this repo's `IConformanceService` implemented: `echo_optional_point`,
+      `echo_annotated_optional_int`, `echo_outer_optional_non_null` (three `optional.*`
+      sub-tests), and `produce_tick_metadata` (`producer_stream.tick_metadata` — reports the
+      `vgi.conformance.tick` custom_metadata observed on each producer tick; needed a `StreamState`
+      implemented directly rather than via `ProducerState`, since only `ProcessAsync` sees the
+      input batch's metadata). All four are now implemented and green. Along the way, found and
+      confirmed (via an isolated `--filter` run) a real transport-desync bug that these new tests
+      exposed but did not cause: when a client believes a call is stream-shaped but the server
+      doesn't recognize the method, the server correctly writes one error response and returns —
+      but a real stream-shaped Python client (headerless streams defer error detection to the
+      first `tick()`/`exchange()`/`close()`, and `close()` unconditionally writes a final
+      IPC stream on the input channel first) can still write bytes the server never reads,
+      corrupting the framing for every call after it on that connection. This is the same failure
+      class as the already-known `large_payload.echo_binary_over_int32_max` gap below (both wedge
+      the shared connection for the rest of that worker process's run) — implementing the missing
+      methods sidesteps it here; the underlying "unknown method the client believes is a stream"
+      case remains unhardened. Still-unimplemented and NOT in `IMPLEMENTED_FILTER` (so not
+      gating CI): `dataclass.nested_container_types` (`pack_nested_containers`) and
+      `large_payload.echo_binary_4mib`/`echo_large_binary`.
 - [~] **M4 — Non-HTTP transports + CLI (in progress).** `SocketTransport` (Unix domain socket +
       TCP, both server accept-loop and client dial) plus the conformance worker's `--unix`/
       `--tcp [host:]port` CLI flags (printing the `UNIX:<path>`/`PORT:<port>` discovery lines

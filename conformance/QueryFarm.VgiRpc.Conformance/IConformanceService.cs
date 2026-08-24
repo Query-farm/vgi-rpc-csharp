@@ -51,6 +51,17 @@ public interface IConformanceService
 
     Task<long?> EchoOptionalIntAsync(long? value);
 
+    Task<Point?> EchoOptionalPointAsync(Point? point);
+
+    // Python declares these two as `Annotated[int | None, ArrowType(pa.int32())]` and
+    // `Annotated[int, ArrowType(pa.int32(), nullable=False)] | None` respectively — testing
+    // Optional-vs-Annotated resolution order that has no distinct C# equivalent (a nullable CLR
+    // value type already maps to a nullable Arrow field regardless of where "the" nullability
+    // marker sits), so both are simply nullable-int32 echoes on the wire.
+    Task<int?> EchoAnnotatedOptionalIntAsync(int? value);
+
+    Task<int?> EchoOuterOptionalNonNullAsync(int? value);
+
     // -- Dataclass round-trip ------------------------------------------------
 
     Task<Point> EchoPointAsync(Point point);
@@ -101,6 +112,8 @@ public interface IConformanceService
     // interface-level type since (unlike Python duck typing) it enforces exact signature
     // matching between interface and implementation, and RpcStream<TState> isn't covariant.
     Task<RpcStream<StreamState>> ProduceNAsync(long count);
+
+    Task<RpcStream<StreamState>> ProduceTickMetadataAsync(long count);
 
     Task<RpcStream<StreamState>> ProduceEmptyAsync();
 
