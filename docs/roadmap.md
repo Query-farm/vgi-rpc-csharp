@@ -130,8 +130,17 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       `Content-Encoding`) turned out to be a hard prerequisite for M6's *unary* slice, not an M7
       refinement as originally scoped; discovered by capturing the raw request bytes against a
       throwaway Python `http.server` and finding a zstd magic number where an Arrow IPC schema
-      message was expected. Response compression (server → client) is not yet implemented — the
-      client tolerates a plain, uncompressed body when `Content-Encoding` is absent. Verified
+      message was expected. **Response compression is now implemented too** (this was M7 scope
+      pulled forward): `ContentEncodingNegotiation` mirrors Python's
+      `_CompressionMiddleware._pick_response_encoding`/`parse_encoding_list` — `X-VGI-Accept-Encoding`
+      takes precedence over the generic `Accept-Encoding` (some HTTP client libraries inject their
+      own `Accept-Encoding: deflate, gzip, br, zstd` listing gzip before zstd, which would
+      silently override a VGI-aware caller's stated zstd-first preference), an explicit
+      `identity` first in the list wins outright, and the codec actually picked is stamped on
+      `Content-Encoding` or `X-VGI-Content-Encoding` depending on which header the client's
+      choice came from. Empty bodies are never compressed. Confirmed manually against the real
+      Python client with response-header capture (`Content-Encoding: zstd`, a 5000-byte echo
+      compressed to 159 bytes) and covered by 12 new `ContentEncodingNegotiationTests`. Verified
       against the real Python reference client and `vgi-rpc-test` (driven via `--url`, not
       `--cmd` — HTTP tests an already-running server, unlike pipe/unix/tcp's spawn-and-drive
       model; see `test_csharp_conformance.py`'s `http_worker` fixture and
@@ -156,7 +165,15 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       token re-minted every turn carrying just the advancing `StreamState` — plus the
       `_CallStateCache` and zstd-before-seal payload compression) is real, separate work for
       the `/init`/`/exchange` dispatch itself, not yet started.
-- [ ] **M7 — Response caps, capability headers, content-encoding negotiation.**
+- [~] **M7 — Response caps, capability headers, content-encoding negotiation.**
+      Content-encoding negotiation (both directions) landed early, folded into M6 above since
+      request decompression turned out to be a hard M6 prerequisite rather than optional M7
+      scope. Remaining: `max_response_bytes`/`max_externalized_response_bytes` enforcement,
+      whatever capability-header surface turns out to be real beyond the 3 `X-VGI-*` headers
+      already covered (`X-VGI-RPC-Error`, `X-VGI-Accept-Encoding`, `X-VGI-Content-Encoding`) —
+      the plan doc's "CapabilityHeaderWriter" framing looks larger than what the actual Python
+      implementation has; re-check against `vgi_rpc/http/server/_middleware.py` before assuming
+      more scope than that.
 - [ ] **M8 — Unauthorized-response spec + bearer auth.**
 - [ ] **M9 — mTLS + JWT, CORS.**
 - [ ] **M10 — Sticky sessions.**

@@ -41,12 +41,22 @@ public static class RpcHttpEndpoints
 
     private static readonly Schema s_emptySchema = new([], metadata: null);
 
+    private static readonly IReadOnlySet<ContentEncoding> s_producibleEncodings = new HashSet<ContentEncoding> { ContentEncoding.Zstd, ContentEncoding.Gzip };
+    private static readonly IReadOnlySet<ContentEncoding> s_noEncodings = new HashSet<ContentEncoding>();
+
     /// <summary>Registers <paramref name="server"/>'s routes under <paramref name="prefix"/>
     /// (default the root — matches Python's default <c>prefix=""</c>).</summary>
-    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "")
+    /// <param name="endpoints">The route builder to register onto.</param>
+    /// <param name="server">The dispatch target.</param>
+    /// <param name="prefix">URL prefix for every route (default the root).</param>
+    /// <param name="compressionLevel">zstd/gzip level applied to compressible response bodies —
+    /// matches Python's <c>make_wsgi_app(compression_level=1)</c> default. <see langword="null"/>
+    /// disables response compression outright (request decompression is unaffected either way —
+    /// see <see cref="DecompressingRequestBody"/>'s doc comment for why that one isn't optional).</param>
+    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1)
     {
         endpoints.MapMethods($"{prefix}/health", ["GET", "HEAD"], (HttpContext context) => HandleHealthAsync(server, context));
-        endpoints.MapPost($"{prefix}/{{method}}", (string method, HttpContext context) => HandleUnaryAsync(server, method, context));
+        endpoints.MapPost($"{prefix}/{{method}}", (string method, HttpContext context) => HandleUnaryAsync(server, method, context, compressionLevel));
         endpoints.MapPost($"{prefix}/{{method}}/init", () => NotYetImplementedStream());
         endpoints.MapPost($"{prefix}/{{method}}/exchange", () => NotYetImplementedStream());
         return endpoints;
@@ -78,10 +88,12 @@ public static class RpcHttpEndpoints
         return context.Response.Body.WriteAsync(body, context.RequestAborted).AsTask();
     }
 
-    private static async Task HandleUnaryAsync(RpcServer server, string method, HttpContext context)
+    private static async Task HandleUnaryAsync(RpcServer server, string method, HttpContext context, int? compressionLevel)
     {
         var request = context.Request;
         var cancellationToken = context.RequestAborted;
+        var (encoding, useCustomHeader) = ContentEncodingNegotiation.PickResponseEncoding(
+            request, compressionLevel is null ? s_noEncodings : s_producibleEncodings);
 
         if (request.ContentType != ArrowContentType)
         {
@@ -91,7 +103,7 @@ public static class RpcHttpEndpoints
                 new RpcException("TypeError", $"Expected Content-Type: '{ArrowContentType}', got '{request.ContentType}'. All vgi-rpc HTTP requests must use Content-Type: {ArrowContentType}"),
                 StatusCodes.Status415UnsupportedMediaType,
                 s_emptySchema,
-                httpStatusForLog: StatusCodes.Status415UnsupportedMediaType, context).ConfigureAwait(false);
+                httpStatusForLog: StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
         }
 
@@ -104,7 +116,7 @@ public static class RpcHttpEndpoints
                 new MethodNotImplementedException($"Unknown method: '{method}'. Available methods: [{available}]"),
                 StatusCodes.Status404NotFound,
                 s_emptySchema,
-                httpStatusForLog: StatusCodes.Status404NotFound, context).ConfigureAwait(false);
+                httpStatusForLog: StatusCodes.Status404NotFound, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
         }
 
@@ -116,7 +128,7 @@ public static class RpcHttpEndpoints
                 new RpcException("TypeError", $"Stream method '{method}' requires /init and /exchange endpoints"),
                 StatusCodes.Status400BadRequest,
                 s_emptySchema,
-                httpStatusForLog: StatusCodes.Status400BadRequest, context).ConfigureAwait(false);
+                httpStatusForLog: StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
         }
 
@@ -127,7 +139,7 @@ public static class RpcHttpEndpoints
         }
         catch (NotSupportedException exc)
         {
-            await ErrorResultAsync(server, method, new RpcException("TypeError", exc.Message), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, httpStatusForLog: StatusCodes.Status415UnsupportedMediaType, context).ConfigureAwait(false);
+            await ErrorResultAsync(server, method, new RpcException("TypeError", exc.Message), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, httpStatusForLog: StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
         }
 
@@ -140,7 +152,7 @@ public static class RpcHttpEndpoints
         }
         catch (Exception exc)
         {
-            await ErrorResultAsync(server, method, exc, StatusCodes.Status400BadRequest, info.ResultSchema, httpStatusForLog: StatusCodes.Status400BadRequest, context).ConfigureAwait(false);
+            await ErrorResultAsync(server, method, exc, StatusCodes.Status400BadRequest, info.ResultSchema, httpStatusForLog: StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
         }
         finally
@@ -153,7 +165,7 @@ public static class RpcHttpEndpoints
 
         if (requestBatch is null)
         {
-            await ErrorResultAsync(server, method, new RpcException("RpcException", "Request body carried no batch."), StatusCodes.Status400BadRequest, info.ResultSchema, httpStatusForLog: StatusCodes.Status400BadRequest, context).ConfigureAwait(false);
+            await ErrorResultAsync(server, method, new RpcException("RpcException", "Request body carried no batch."), StatusCodes.Status400BadRequest, info.ResultSchema, httpStatusForLog: StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
         }
 
@@ -166,7 +178,7 @@ public static class RpcHttpEndpoints
                 new RpcException("TypeError", $"Method name mismatch: URL path has '{method}' but Arrow IPC custom_metadata 'vgi_rpc.method' has '{ipcMethod}'. These must match."),
                 StatusCodes.Status400BadRequest,
                 info.ResultSchema,
-                httpStatusForLog: StatusCodes.Status400BadRequest, context).ConfigureAwait(false);
+                httpStatusForLog: StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
         }
 
@@ -177,7 +189,7 @@ public static class RpcHttpEndpoints
         }
         catch (Exception exc)
         {
-            await ErrorResultAsync(server, method, exc, StatusCodes.Status400BadRequest, info.ResultSchema, httpStatusForLog: StatusCodes.Status400BadRequest, context).ConfigureAwait(false);
+            await ErrorResultAsync(server, method, exc, StatusCodes.Status400BadRequest, info.ResultSchema, httpStatusForLog: StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
         }
 
@@ -227,10 +239,20 @@ public static class RpcHttpEndpoints
             context.Response.Headers[RpcErrorHeader] = "true";
         }
 
-        await WriteBytesAsync(context, StatusCodes.Status200OK, responseBuffer.ToArray(), cancellationToken).ConfigureAwait(false);
+        await WriteBytesAsync(context, StatusCodes.Status200OK, responseBuffer.ToArray(), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
     }
 
-    private static async Task ErrorResultAsync(RpcServer server, string method, Exception exception, int httpStatusCode, Schema schema, int httpStatusForLog, HttpContext context)
+    private static async Task ErrorResultAsync(
+        RpcServer server,
+        string method,
+        Exception exception,
+        int httpStatusCode,
+        Schema schema,
+        int httpStatusForLog,
+        HttpContext context,
+        ContentEncoding? encoding,
+        bool useCustomHeader,
+        int? compressionLevel)
     {
         var start = Stopwatch.GetTimestamp();
         using var buffer = new MemoryStream();
@@ -247,11 +269,11 @@ public static class RpcHttpEndpoints
         if (httpStatusCode == StatusCodes.Status500InternalServerError)
         {
             context.Response.Headers[RpcErrorHeader] = "true";
-            await WriteBytesAsync(context, StatusCodes.Status200OK, buffer.ToArray(), context.RequestAborted).ConfigureAwait(false);
+            await WriteBytesAsync(context, StatusCodes.Status200OK, buffer.ToArray(), encoding, useCustomHeader, compressionLevel, context.RequestAborted).ConfigureAwait(false);
         }
         else
         {
-            await WriteBytesAsync(context, httpStatusCode, buffer.ToArray(), context.RequestAborted).ConfigureAwait(false);
+            await WriteBytesAsync(context, httpStatusCode, buffer.ToArray(), encoding, useCustomHeader, compressionLevel, context.RequestAborted).ConfigureAwait(false);
         }
     }
 
@@ -275,12 +297,53 @@ public static class RpcHttpEndpoints
         };
     }
 
-    private static Task WriteBytesAsync(HttpContext context, int statusCode, byte[] body, CancellationToken cancellationToken)
+    /// <summary>
+    /// Writes <paramref name="body"/> as the response, compressing it with <paramref name="encoding"/>
+    /// first when one was negotiated and the body isn't empty (an empty body carries nothing worth
+    /// compressing — matches Python's early-return on <c>size == 0</c>). Mirrors
+    /// <c>_CompressionMiddleware.process_response</c>'s codec dispatch and header choice
+    /// (<c>X-VGI-Content-Encoding</c> when the client's preference came from the custom
+    /// <c>X-VGI-Accept-Encoding</c> header, else the standard <c>Content-Encoding</c>).
+    /// </summary>
+    private static Task WriteBytesAsync(HttpContext context, int statusCode, byte[] body, ContentEncoding? encoding, bool useCustomHeader, int? compressionLevel, CancellationToken cancellationToken)
     {
         context.Response.StatusCode = statusCode;
         context.Response.ContentType = ArrowContentType;
+
+        if (encoding is { } enc && compressionLevel is { } level && body.Length > 0)
+        {
+            body = CompressBody(body, enc, level);
+            context.Response.Headers[useCustomHeader ? "X-VGI-Content-Encoding" : "Content-Encoding"] = enc switch
+            {
+                ContentEncoding.Zstd => "zstd",
+                ContentEncoding.Gzip => "gzip",
+                _ => throw new InvalidOperationException($"Unexpected response encoding '{enc}'."),
+            };
+        }
+
         context.Response.ContentLength = body.Length;
         return context.Response.Body.WriteAsync(body, cancellationToken).AsTask();
+    }
+
+    private static byte[] CompressBody(byte[] body, ContentEncoding encoding, int level)
+    {
+        if (encoding == ContentEncoding.Zstd)
+        {
+            using var compressor = new ZstdSharp.Compressor(level);
+            return compressor.Wrap(body).ToArray();
+        }
+
+        // .NET's GZipStream takes System.IO.Compression's four-level CompressionLevel enum, not
+        // zstd's/zlib's finer numeric scale — level<=1 (Python's own default) maps to Fastest,
+        // matching the "cheap, not maximal" intent; anything higher goes to Optimal.
+        var gzipLevel = level <= 1 ? CompressionLevel.Fastest : CompressionLevel.Optimal;
+        using var output = new MemoryStream();
+        using (var gzip = new GZipStream(output, gzipLevel, leaveOpen: true))
+        {
+            gzip.Write(body);
+        }
+
+        return output.ToArray();
     }
 
     private static void EmitAccessLog(RpcServer server, string method, string status, string errorType, string errorMessage, long startTimestamp, int httpStatus)
