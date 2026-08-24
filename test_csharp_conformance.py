@@ -43,6 +43,13 @@ IMPLEMENTED_FILTER = ",".join(
         "boundary_values.*",
         "protocol_version.*",
         "producer_stream.*",
+        "exchange_stream.scale",
+        "exchange_stream.echo",
+        "exchange_stream.accumulate",
+        "exchange_stream.with_logs",
+        "exchange_stream.error_first",
+        "exchange_stream.error_nth",
+        "exchange_stream.empty_session",
     ]
 )
 

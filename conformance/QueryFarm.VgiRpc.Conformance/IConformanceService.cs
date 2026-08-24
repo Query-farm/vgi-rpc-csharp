@@ -108,6 +108,16 @@ public interface IConformanceService
 
     Task<RpcStream<StreamState>> ProduceErrorMidStreamAsync(long emitBeforeError);
 
+    // -- Exchange streams --------------------------------------------------
+
+    Task<RpcStream<StreamState>> ExchangeScaleAsync(double factor);
+
+    Task<RpcStream<StreamState>> ExchangeAccumulateAsync();
+
+    Task<RpcStream<StreamState>> ExchangeWithLogsAsync();
+
+    Task<RpcStream<StreamState>> ExchangeErrorOnNthAsync(long failOn);
+
     // TODO (later milestones — see docs/roadmap.md):
     //   - oversized_unary (HTTP response-cap conformance)
     //   - echo_all_types / echo_all_types_with_nulls / echo_wide_types /

@@ -20,12 +20,13 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       and the wide-Arrow-type methods (need list-of-struct + temporal/decimal support in
       `ValueCodec`), `__describe__`, and `large_payload.*`. See `test_csharp_conformance.py`
       for the exact implemented-subset filter, which grows as more lands.
-- [~] **M3 — Streaming (in progress).** Producer streams work end-to-end and pass the real
-      `producer_stream.*` conformance suite (5/5): `RpcStream<TState>`/`StreamState`/
-      `ProducerState`/`ExchangeState`/`OutputCollector`, and `RpcServer.ServeStreamAsync`'s
-      lockstep dispatch loop (one continuous output IPC stream + one continuous input/tick
-      stream for the call's lifetime — confirmed against the real Python client, not just
-      self-consistently). Remaining: exchange streams, headers, cancellation, dynamic schema,
+- [~] **M3 — Streaming (in progress).** Producer streams (5/5) and the core of exchange streams
+      (7/7: scale/echo/accumulate/with_logs/error_first/error_nth/empty_session) pass the real
+      conformance suite. `RpcServer.ServeStreamAsync`'s lockstep dispatch loop (one continuous
+      output IPC stream + one continuous input/tick stream for the call's lifetime) handles both
+      shapes uniformly — confirmed against the real Python client, not just self-consistently.
+      Remaining: the `exchange_stream.cast_*` tests (need input-batch type coercion — Python's
+      `_coerce_input_batch`, not yet ported), headers, cancellation, dynamic schema, and
       client-side stream consumption (`RpcConnection`/`RpcClientProxy` — not needed for
       conformance, since `vgi-rpc-test` drives our server with its own Python client, but needed
       before any C#-to-C# streaming test can be written).

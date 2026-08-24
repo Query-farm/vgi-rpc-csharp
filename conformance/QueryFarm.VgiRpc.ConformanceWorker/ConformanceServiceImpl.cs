@@ -107,4 +107,16 @@ public sealed class ConformanceServiceImpl : IConformanceService
 
     public Task<RpcStream<StreamState>> ProduceErrorMidStreamAsync(long emitBeforeError) =>
         Task.FromResult(new RpcStream<StreamState>(ConformanceStreamSchemas.Counter, new ErrorAfterNState(emitBeforeError)));
+
+    public Task<RpcStream<StreamState>> ExchangeScaleAsync(double factor) =>
+        Task.FromResult(new RpcStream<StreamState>(ExchangeSchemas.Scale, new ScaleExchangeState(factor), InputSchema: ExchangeSchemas.Scale));
+
+    public Task<RpcStream<StreamState>> ExchangeAccumulateAsync() =>
+        Task.FromResult(new RpcStream<StreamState>(ExchangeSchemas.Accumulate, new AccumulatingExchangeState(), InputSchema: ExchangeSchemas.Scale));
+
+    public Task<RpcStream<StreamState>> ExchangeWithLogsAsync() =>
+        Task.FromResult(new RpcStream<StreamState>(ExchangeSchemas.Scale, new LoggingExchangeState(), InputSchema: ExchangeSchemas.Scale));
+
+    public Task<RpcStream<StreamState>> ExchangeErrorOnNthAsync(long failOn) =>
+        Task.FromResult(new RpcStream<StreamState>(ExchangeSchemas.Scale, new FailOnExchangeNState(failOn), InputSchema: ExchangeSchemas.Scale));
 }
