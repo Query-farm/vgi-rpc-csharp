@@ -50,6 +50,8 @@ IMPLEMENTED_FILTER = ",".join(
         "exchange_stream.error_first",
         "exchange_stream.error_nth",
         "exchange_stream.empty_session",
+        "error_recovery.*",
+        "cancel.*",
     ]
 )
 

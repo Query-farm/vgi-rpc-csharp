@@ -119,4 +119,18 @@ public sealed class ConformanceServiceImpl : IConformanceService
 
     public Task<RpcStream<StreamState>> ExchangeErrorOnNthAsync(long failOn) =>
         Task.FromResult(new RpcStream<StreamState>(ExchangeSchemas.Scale, new FailOnExchangeNState(failOn), InputSchema: ExchangeSchemas.Scale));
+
+    public Task<RpcStream<StreamState>> CancellableProducerAsync() =>
+        Task.FromResult(new RpcStream<StreamState>(ConformanceStreamSchemas.Counter, new CancellableProducerState()));
+
+    public Task<RpcStream<StreamState>> CancellableExchangeAsync() =>
+        Task.FromResult(new RpcStream<StreamState>(ExchangeSchemas.Scale, new CancellableExchangeState(), InputSchema: ExchangeSchemas.Scale));
+
+    public Task<List<long>> CancelProbeCountersAsync() => Task.FromResult(CancelProbe.Snapshot());
+
+    public Task ResetCancelProbeAsync()
+    {
+        CancelProbe.Reset();
+        return Task.CompletedTask;
+    }
 }

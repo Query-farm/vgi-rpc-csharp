@@ -118,6 +118,16 @@ public interface IConformanceService
 
     Task<RpcStream<StreamState>> ExchangeErrorOnNthAsync(long failOn);
 
+    // -- Cancellation ---------------------------------------------------------
+
+    Task<RpcStream<StreamState>> CancellableProducerAsync();
+
+    Task<RpcStream<StreamState>> CancellableExchangeAsync();
+
+    Task<List<long>> CancelProbeCountersAsync();
+
+    Task ResetCancelProbeAsync();
+
     // TODO (later milestones — see docs/roadmap.md):
     //   - oversized_unary (HTTP response-cap conformance)
     //   - echo_all_types / echo_all_types_with_nulls / echo_wide_types /
