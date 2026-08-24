@@ -172,15 +172,20 @@ public static class SchemaDerivation
 
         if (TryGetElementType(type, out var elementType))
         {
-            return new ListType(ElementField("item", elementType, nested, forceNonNullable: false));
+            // A collection element is always "nested" for the dataclass two-tier rule,
+            // regardless of whether the collection itself is a top-level parameter/result: only
+            // the TOP-LEVEL value gets the embedded-IPC-in-binary treatment; anything inside a
+            // container is already native Arrow, so a dataclass element is a struct, not another
+            // layer of embedded binary.
+            return new ListType(ElementField("item", elementType, nested: true, forceNonNullable: false));
         }
 
         if (TryGetMapTypes(type, out var keyType, out var valueType))
         {
             // Map keys must be non-nullable (Arrow's own constraint) regardless of what a
             // reference-type key's default nullability would otherwise be.
-            var keyField = ElementField("key", keyType, nested, forceNonNullable: true);
-            var valueField = ElementField("value", valueType, nested, forceNonNullable: false);
+            var keyField = ElementField("key", keyType, nested: true, forceNonNullable: true);
+            var valueField = ElementField("value", valueType, nested: true, forceNonNullable: false);
             return new MapType(keyField, valueField);
         }
 

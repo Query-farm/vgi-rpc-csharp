@@ -126,6 +126,16 @@ public static class ValueCodec
 
     private static IArrowArray BuildListArray(ListType listType, System.Collections.IEnumerable? items)
     {
+        // ArrowArrayBuilderFactory (which ListArray.Builder's constructor uses internally to
+        // build its ValueBuilder) doesn't support struct-typed elements at all — list-of-struct
+        // (needed for e.g. RichHeader.list_of_nested: List<Point>) has to be hand-built instead:
+        // build each element as its own 1-row array (reusing BuildSingleValueArray, which
+        // already knows how to build a struct), then concatenate them.
+        if (listType.ValueDataType is StructType elementStructType)
+        {
+            return BuildListOfStructArray(listType, elementStructType, items);
+        }
+
         var builder = new ListArray.Builder(listType.ValueField);
         if (items is null)
         {
@@ -140,6 +150,35 @@ public static class ValueCodec
         }
 
         return builder.Build();
+    }
+
+    /// <summary>Builds a <c>list&lt;struct&gt;</c> array by building each element as its own
+    /// 1-row struct array and concatenating them — see <see cref="BuildListArray"/>'s comment
+    /// for why this bypasses the normal builder path.</summary>
+    private static IArrowArray BuildListOfStructArray(ListType listType, StructType elementType, System.Collections.IEnumerable? items)
+    {
+        if (items is null)
+        {
+            var emptyValues = BuildStructArray(elementType, value: null, isEmpty: true);
+            var offsets = new ArrowBuffer.Builder<int>().Append(0).Append(0).Build();
+            var validity = new ArrowBuffer.BitmapBuilder().Append(false).Build();
+            var data = new ArrayData(listType, length: 1, nullCount: 1, 0, [validity, offsets], [emptyValues.Data]);
+            return new ListArray(data);
+        }
+
+        var elements = items.Cast<object?>().ToList();
+        var elementArrays = elements
+            .Select(item => (IArrowArray)BuildStructArray(elementType, item, isEmpty: false))
+            .ToList();
+        var values = elementArrays.Count == 0
+            ? BuildStructArray(elementType, value: null, isEmpty: true)
+            : ArrowArrayConcatenator.Concatenate(elementArrays);
+
+        var offsetsBuilder = new ArrowBuffer.Builder<int>();
+        offsetsBuilder.Append(0);
+        offsetsBuilder.Append(elements.Count);
+        var listData = new ArrayData(listType, length: 1, nullCount: 0, 0, [Apache.Arrow.ArrowBuffer.Empty, offsetsBuilder.Build()], [values.Data]);
+        return new ListArray(listData);
     }
 
     /// <summary>

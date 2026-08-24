@@ -14,6 +14,12 @@ public enum Status
     Closed,
 }
 
+public sealed class PointRecord
+{
+    public double X { get; set; }
+    public double Y { get; set; }
+}
+
 public interface IGreeter
 {
     Task<string> EchoStringAsync(string value);
@@ -33,6 +39,8 @@ public interface IGreeter
     Task<Dictionary<string, long>> EchoMapAsync(Dictionary<string, long> value);
 
     Task<string> EchoWithLogAsync(string value, ICallContext? ctx = null);
+
+    Task<List<PointRecord>> EchoPointsAsync(List<PointRecord> points);
 }
 
 public sealed class Greeter : IGreeter
@@ -58,6 +66,8 @@ public sealed class Greeter : IGreeter
         ctx!.EmitLog(VgiLogLevel.Info, "processing", new Dictionary<string, object?> { ["value"] = value });
         return Task.FromResult(value);
     }
+
+    public Task<List<PointRecord>> EchoPointsAsync(List<PointRecord> points) => Task.FromResult(points);
 }
 
 /// <summary>
@@ -190,6 +200,37 @@ public sealed class RpcServerClientTests
         var result = await client.EchoMapAsync(new Dictionary<string, long> { ["a"] = 1, ["b"] = 2 });
 
         Assert.Equal(new Dictionary<string, long> { ["a"] = 1, ["b"] = 2 }, result);
+        await serveTask;
+    }
+
+    [Fact]
+    public async Task ListOfStruct_RoundTrips()
+    {
+        var (server, client, serverTransport) = Setup();
+        var serveTask = server.ServeOneAsync(serverTransport);
+
+        var result = await client.EchoPointsAsync([
+            new PointRecord { X = 1.0, Y = 2.0 },
+            new PointRecord { X = 3.0, Y = 4.0 },
+        ]);
+
+        Assert.Equal(2, result.Count);
+        Assert.Equal(1.0, result[0].X);
+        Assert.Equal(2.0, result[0].Y);
+        Assert.Equal(3.0, result[1].X);
+        Assert.Equal(4.0, result[1].Y);
+        await serveTask;
+    }
+
+    [Fact]
+    public async Task EmptyListOfStruct_RoundTrips()
+    {
+        var (server, client, serverTransport) = Setup();
+        var serveTask = server.ServeOneAsync(serverTransport);
+
+        var result = await client.EchoPointsAsync([]);
+
+        Assert.Empty(result);
         await serveTask;
     }
 
