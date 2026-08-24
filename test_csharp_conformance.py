@@ -130,3 +130,50 @@ def test_full_suite_status(worker_binary: Path) -> None:
     see docs/roadmap.md for what each remaining milestone unlocks)."""
     report = _run_vgi_rpc_test(str(worker_binary))
     print(f"\nFull conformance suite: {report['passed']} passed, {report['failed']} failed")
+
+
+# A small mixed unary/stream/error subset — enough to exercise every access-log schema branch
+# (request_data on unary, stream_id on stream, error_message on the error path) without paying
+# to re-run the whole IMPLEMENTED_FILTER twice per --access-log posture below.
+_ACCESS_LOG_FILTER = "scalar_echo.*,dataclass.echo_point,producer_stream.*,exchange_stream.echo,errors.*"
+
+
+@pytest.mark.parametrize("debug", [False, True], ids=["info", "debug"])
+def test_access_log_conforms(worker_binary: Path, tmp_path: Path, debug: bool) -> None:
+    """The JSONL the worker writes via --access-log (and --access-log-debug, which additionally
+    requires request_data to round-trip as a self-contained Arrow IPC stream — see
+    docs/access-log-spec.md §4.3) must validate against vgi_rpc/access_log.schema.json. See
+    docs/roadmap.md M5."""
+    from vgi_rpc.access_log_conformance import _filter_access_logs, _parse_json_log_lines, validate_access_logs
+
+    log_path = tmp_path / ("access-debug.jsonl" if debug else "access-info.jsonl")
+    cmd = f"{worker_binary} --access-log {log_path}" + (" --access-log-debug" if debug else "")
+    args = [
+        sys.executable,
+        "-c",
+        "from vgi_rpc.conformance._test_cli import main; main()",
+        "--cmd",
+        cmd,
+        "--access-log",
+        str(log_path),
+        "--format",
+        "json",
+        "--filter",
+        _ACCESS_LOG_FILTER,
+    ]
+    if debug:
+        args.append("--require-request-data")
+
+    result = subprocess.run(args, capture_output=True, text=True, cwd=REPO_ROOT)
+    assert result.returncode == 0, (
+        f"vgi-rpc-test --access-log (debug={debug}) failed:\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert log_path.exists(), f"worker did not write {log_path}"
+
+    entries = _filter_access_logs(_parse_json_log_lines(log_path.read_text().splitlines()))
+    assert entries, "no vgi_rpc.access entries were written"
+    violations = validate_access_logs(entries)
+    assert not violations, "access log violations:\n" + "\n".join(
+        f"  entry {v.entry_index} ({v.method}) {v.path}: {v.message}" for v in violations
+    )

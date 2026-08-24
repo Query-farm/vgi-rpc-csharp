@@ -1,10 +1,10 @@
 // Conformance worker entry point. Registers ConformanceServiceImpl and serves it over stdio
 // (default), --unix PATH, or --tcp [HOST:]PORT — the mandatory CLI contract from
-// docs/porting-guide.md (canonical Python repo). --http/--access-log are accepted (so the
-// worker doesn't reject a caller who always passes them) but not yet implemented — see
-// docs/roadmap.md M5/M6.
+// docs/porting-guide.md (canonical Python repo). --http is accepted (so the worker doesn't
+// reject a caller who always passes it) but not yet implemented — see docs/roadmap.md M6.
 
 using System.Runtime.InteropServices;
+using QueryFarm.VgiRpc.AccessLog;
 using QueryFarm.VgiRpc.Conformance;
 using QueryFarm.VgiRpc.ConformanceWorker;
 using QueryFarm.VgiRpc.Server;
@@ -16,7 +16,8 @@ if (options is null)
     return 1;
 }
 
-var server = new RpcServer(typeof(IConformanceService), new ConformanceServiceImpl());
+using var accessLog = options.AccessLogPath is { } accessLogPath ? new JsonlAccessLogSink(accessLogPath, debug: options.AccessLogDebug) : null;
+var server = new RpcServer(typeof(IConformanceService), new ConformanceServiceImpl(), accessLog: accessLog);
 
 using var cts = new CancellationTokenSource();
 RegisterShutdownHandlers(cts);
@@ -63,16 +64,30 @@ static void RegisterShutdownHandlers(CancellationTokenSource cts)
     Console.CancelKeyPress += (_, e) =>
     {
         e.Cancel = true;
-        cts.Cancel();
+        TryCancel(cts);
     };
-    AppDomain.CurrentDomain.ProcessExit += (_, _) => cts.Cancel();
+    // ProcessExit fires on normal exit too (not just signals) — by then `using var cts` in
+    // Main may already have disposed it on the success path, so Cancel() here is best-effort.
+    AppDomain.CurrentDomain.ProcessExit += (_, _) => TryCancel(cts);
     if (!OperatingSystem.IsWindows())
     {
         PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx =>
         {
             ctx.Cancel = true;
-            cts.Cancel();
+            TryCancel(cts);
         });
+    }
+}
+
+static void TryCancel(CancellationTokenSource cts)
+{
+    try
+    {
+        cts.Cancel();
+    }
+    catch (ObjectDisposedException)
+    {
+        // Main already finished and disposed it — nothing left to cancel.
     }
 }
 
@@ -84,6 +99,7 @@ internal sealed class CliOptions
     public TcpOptions? Tcp { get; private init; }
     public bool Http { get; private init; }
     public string? AccessLogPath { get; private init; }
+    public bool AccessLogDebug { get; private init; }
 
     public static CliOptions? Parse(string[] args)
     {
@@ -93,6 +109,7 @@ internal sealed class CliOptions
         string? host = null;
         int? port = null;
         string? accessLog = null;
+        var accessLogDebug = false;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -115,6 +132,9 @@ internal sealed class CliOptions
                     break;
                 case "--access-log":
                     accessLog = RequireValue(args, ref i, "--access-log");
+                    break;
+                case "--access-log-debug":
+                    accessLogDebug = true;
                     break;
                 default:
                     Console.Error.WriteLine($"Unknown argument: {args[i]}");
@@ -140,6 +160,7 @@ internal sealed class CliOptions
             Tcp = tcp,
             Http = http,
             AccessLogPath = accessLog,
+            AccessLogDebug = accessLogDebug,
         };
     }
 

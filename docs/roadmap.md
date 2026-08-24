@@ -46,7 +46,22 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       socket-file-object handling for the tick/exchange loop that pipe/stdio doesn't exercise.
       Not yet root-caused; flagged for follow-up rather than blocking further progress, since it
       doesn't affect the stdio-based conformance gate this repo's CI runs.
-- [ ] **M5 — Access log.** JSONL sink matching `access_log.schema.json`.
+- [x] **M5 — Access log.** `IAccessLogSink`/`AccessLogRecord`/`JsonlAccessLogSink` wired into
+      both `RpcServer.ServeOneAsync` and `ServeStreamAsync`; the conformance worker's
+      `--access-log PATH`/`--access-log-debug` flags mirror the porting guide's mandatory CLI
+      contract. Validated against the real `vgi_rpc.access_log_conformance.validate_access_logs`
+      schema validator (not just self-consistently) via `test_csharp_conformance.py`'s
+      `test_access_log_conforms[info|debug]`, both postures: at INFO, unary records carry
+      `truncated: "payload_omitted"` + `original_request_bytes` (a pure function of the request
+      batch's serialized length, computed without base64-encoding it); at DEBUG
+      (`--access-log-debug`), unary records instead carry the full `request_data` — a
+      self-contained Arrow IPC stream re-framed from the already-parsed request batch (mirrors
+      Python's `_request_wire_bytes` fallback path) — round-trip-verified via
+      `--require-request-data`, which decodes it with `pyarrow.ipc.open_stream`. Stream calls
+      carry a per-call `stream_id` (`Guid.NewGuid("N")`, matching Python's `uuid.uuid4().hex`)
+      on every exit path, including the pre-dispatch error path. Error records carry
+      `error_message` (`exception.Message`, matching Python's `str(exc)`), satisfying the
+      schema's `status=error requires error_message` rule.
 - [ ] **M6 — Plain HTTP.** Kestrel server + `HttpClient` client; stream state tokens (AES-GCM).
 - [ ] **M7 — Response caps, capability headers, content-encoding negotiation.**
 - [ ] **M8 — Unauthorized-response spec + bearer auth.**

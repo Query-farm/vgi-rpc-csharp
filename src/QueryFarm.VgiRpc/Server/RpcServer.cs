@@ -1,4 +1,7 @@
+using System.Security.Cryptography;
+using System.Text;
 using Apache.Arrow;
+using QueryFarm.VgiRpc.AccessLog;
 using QueryFarm.VgiRpc.Errors;
 using QueryFarm.VgiRpc.Logging;
 using QueryFarm.VgiRpc.Reflection;
@@ -9,22 +12,64 @@ using QueryFarm.VgiRpc.Wire;
 namespace QueryFarm.VgiRpc.Server;
 
 /// <summary>
-/// Dispatches unary RPC calls from a service interface to a plain implementation object. See
-/// docs/roadmap.md — streaming, access logging, auth, and the <c>__describe__</c>/
-/// <c>__transport_options__</c> synthetic methods land in later milestones; this is the
-/// Milestone 1/2 unary-only core.
+/// Dispatches RPC calls (unary and streaming) from a service interface to a plain
+/// implementation object. See docs/roadmap.md — auth and the `__describe__`/
+/// `__transport_options__` synthetic methods land in later milestones.
 /// </summary>
 public sealed class RpcServer
 {
     private readonly IReadOnlyDictionary<string, RpcMethodInfo> _methods;
     private readonly object _implementation;
     private readonly string _serverId;
+    private readonly IAccessLogSink? _accessLog;
 
-    public RpcServer(Type serviceInterface, object implementation, string? serverId = null)
+    /// <summary>The service interface's simple name — the access log's <c>protocol</c> field.</summary>
+    public string ProtocolName { get; }
+
+    /// <summary>
+    /// A SHA-256 hex digest derived from the registered methods' wire names and schemas —
+    /// the access log's <c>protocol_hash</c> field. Unlike the canonical Python implementation's
+    /// hash (computed from its `__describe__` payload, not yet implemented here), this is NOT
+    /// guaranteed byte-identical across ports — per the Python repo's own CLAUDE.md, that was
+    /// never the cross-language contract to begin with (protocol_version is); this hash only
+    /// needs to be a stable, real value for this one server process.
+    /// </summary>
+    public string ProtocolHash { get; }
+
+    public string? ServerVersion { get; init; }
+
+    public RpcServer(Type serviceInterface, object implementation, string? serverId = null, IAccessLogSink? accessLog = null)
     {
         _methods = ServiceRegistry.GetMethods(serviceInterface);
         _implementation = implementation;
         _serverId = serverId ?? Guid.NewGuid().ToString("n");
+        _accessLog = accessLog;
+        ProtocolName = serviceInterface.Name;
+        ProtocolHash = ComputeProtocolHash(_methods);
+    }
+
+    private static string ComputeProtocolHash(IReadOnlyDictionary<string, RpcMethodInfo> methods)
+    {
+        var sb = new StringBuilder();
+        foreach (var name in methods.Keys.OrderBy(k => k, StringComparer.Ordinal))
+        {
+            var info = methods[name];
+            sb.Append(name).Append(':').Append(info.Kind).Append('|');
+            foreach (var field in info.ParamsSchema.FieldsList)
+            {
+                sb.Append(field.Name).Append(':').Append(field.DataType.TypeId).Append(field.IsNullable).Append(',');
+            }
+
+            sb.Append('>');
+            foreach (var field in info.ResultSchema.FieldsList)
+            {
+                sb.Append(field.Name).Append(':').Append(field.DataType.TypeId).Append(field.IsNullable).Append(',');
+            }
+
+            sb.Append(';');
+        }
+
+        return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(sb.ToString())));
     }
 
     /// <summary>Serves requests off <paramref name="transport"/> until the channel closes.</summary>
@@ -114,16 +159,22 @@ public sealed class RpcServer
         catch (Exception exc)
         {
             await WriteErrorStreamAsync(transport.Output, info.ResultSchema, exc, cancellationToken).ConfigureAwait(false);
+            await EmitAccessLogAsync(info.WireName, "unary", "error", exc.GetType().Name, exc.Message, System.Diagnostics.Stopwatch.GetTimestamp(), requestForLog: request, cancellationToken: cancellationToken).ConfigureAwait(false);
             return true;
         }
 
+        var start = System.Diagnostics.Stopwatch.GetTimestamp();
+
         if (info.Kind == RpcMethodKind.Stream)
         {
-            return await ServeStreamAsync(transport, info, args, cancellationToken).ConfigureAwait(false);
+            return await ServeStreamAsync(transport, info, args, start, cancellationToken).ConfigureAwait(false);
         }
 
         await using var writer = new WireWriter(transport.Output, info.ResultSchema);
         var context = info.HasContextParameter ? new BufferedCallContext() : null;
+        var status = "ok";
+        var errorType = "";
+        var errorMessage = "";
         try
         {
             var result = await info.InvokeAsync(_implementation, args, context).ConfigureAwait(false);
@@ -143,8 +194,15 @@ public sealed class RpcServer
         catch (Exception exc)
         {
             var actual = Unwrap(exc);
+            status = "error";
+            errorType = actual.GetType().Name;
+            errorMessage = actual.Message;
             var metadata = LogMessage.FromException(actual).AddToMetadata();
             await writer.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(info.ResultSchema), metadata), cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            await EmitAccessLogAsync(info.WireName, "unary", status, errorType, errorMessage, start, requestForLog: request, cancellationToken: cancellationToken).ConfigureAwait(false);
         }
 
         return true;
@@ -157,8 +215,13 @@ public sealed class RpcServer
     /// <see cref="StreamState"/>/<see cref="ProducerState"/>/<see cref="ExchangeState"/> and
     /// WIRE_PROTOCOL.md's lockstep streaming section (canonical Python repo).
     /// </summary>
-    private async Task<bool> ServeStreamAsync(IRpcTransport transport, RpcMethodInfo info, object?[] args, CancellationToken cancellationToken)
+    private async Task<bool> ServeStreamAsync(IRpcTransport transport, RpcMethodInfo info, object?[] args, long start, CancellationToken cancellationToken)
     {
+        // Required by access_log.schema.json whenever method_type=stream (no exception for the
+        // error paths below) — generated up front so every exit from this method can log it.
+        // Matches Python's uuid.uuid4().hex (32 lowercase hex chars).
+        var streamId = Guid.NewGuid().ToString("N");
+
         var invokeContext = info.HasContextParameter ? new BufferedCallContext() : null;
         IRpcStream stream;
         try
@@ -168,7 +231,9 @@ public sealed class RpcServer
         }
         catch (Exception exc)
         {
-            await WriteErrorStreamAsync(transport.Output, s_emptySchema, Unwrap(exc), cancellationToken).ConfigureAwait(false);
+            var actual = Unwrap(exc);
+            await WriteErrorStreamAsync(transport.Output, s_emptySchema, actual, cancellationToken).ConfigureAwait(false);
+            await EmitAccessLogAsync(info.WireName, "stream", "error", actual.GetType().Name, actual.Message, start, streamId: streamId, cancellationToken: cancellationToken).ConfigureAwait(false);
             return true;
         }
 
@@ -217,9 +282,14 @@ public sealed class RpcServer
         }
         catch (Exception) when (!cancellationToken.IsCancellationRequested)
         {
-            return true; // client never opened the tick/exchange input stream
+            // client never opened the tick/exchange input stream
+            await EmitAccessLogAsync(info.WireName, "stream", "ok", "", "", start, streamId: streamId, cancellationToken: cancellationToken).ConfigureAwait(false);
+            return true;
         }
 
+        var streamStatus = "ok";
+        var streamErrorType = "";
+        var streamErrorMessage = "";
         while (true)
         {
             AnnotatedBatch? inputBatch;
@@ -256,7 +326,11 @@ public sealed class RpcServer
             }
             catch (Exception exc)
             {
-                var metadata = LogMessage.FromException(Unwrap(exc)).AddToMetadata();
+                var actual = Unwrap(exc);
+                streamStatus = "error";
+                streamErrorType = actual.GetType().Name;
+                streamErrorMessage = actual.Message;
+                var metadata = LogMessage.FromException(actual).AddToMetadata();
                 await outputWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), metadata), cancellationToken).ConfigureAwait(false);
                 break;
             }
@@ -277,7 +351,90 @@ public sealed class RpcServer
             }
         }
 
+        await EmitAccessLogAsync(info.WireName, "stream", streamStatus, streamErrorType, streamErrorMessage, start, streamId: streamId, cancellationToken: cancellationToken).ConfigureAwait(false);
         return true;
+    }
+
+    /// <summary>
+    /// Builds and hands an <see cref="AccessLogRecord"/> to <see cref="_accessLog"/>, if one is
+    /// configured. <paramref name="requestForLog"/> (unary calls only) is re-serialized as a
+    /// self-contained Arrow IPC stream to satisfy access_log.schema.json's "unary requires
+    /// request_data unless truncated" rule; <paramref name="streamId"/> (stream calls only)
+    /// satisfies its "stream requires stream_id" rule. See docs/access-log-spec.md.
+    /// </summary>
+    private async Task EmitAccessLogAsync(
+        string method,
+        string methodType,
+        string status,
+        string errorType,
+        string errorMessage,
+        long startTimestamp,
+        AnnotatedBatch? requestForLog = null,
+        string? streamId = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (_accessLog is null)
+        {
+            return;
+        }
+
+        var durationMs = System.Diagnostics.Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
+
+        string? requestData = null;
+        string? truncated = null;
+        long? originalRequestBytes = null;
+        if (requestForLog is not null)
+        {
+            var raw = await SerializeForAccessLogAsync(requestForLog, cancellationToken).ConfigureAwait(false);
+            if (_accessLog.IncludeRequestData)
+            {
+                requestData = Convert.ToBase64String(raw);
+            }
+            else
+            {
+                // base64 length is a pure function of the byte count — matches Python's
+                // `4 * ((len(raw) + 2) // 3)` rather than paying to encode a payload nobody
+                // asked to see at this log level.
+                originalRequestBytes = 4L * ((raw.Length + 2) / 3);
+                truncated = "payload_omitted";
+            }
+        }
+
+        _accessLog.Write(new AccessLogRecord(
+            Timestamp: DateTimeOffset.UtcNow,
+            ServerId: _serverId,
+            Protocol: ProtocolName,
+            ProtocolHash: ProtocolHash,
+            Method: method,
+            MethodType: methodType,
+            Status: status,
+            DurationMs: durationMs,
+            ErrorType: errorType,
+            ErrorMessage: string.IsNullOrEmpty(errorMessage) ? null : errorMessage,
+            ServerVersion: ServerVersion,
+            StreamId: streamId,
+            RequestData: requestData,
+            Truncated: truncated,
+            OriginalRequestBytes: originalRequestBytes));
+    }
+
+    /// <summary>
+    /// Re-frames an already-read request <see cref="AnnotatedBatch"/> as a fresh, self-contained
+    /// Arrow IPC stream (schema message, the one batch with its original custom_metadata, EOS) —
+    /// what <c>pyarrow.ipc.open_stream</c> (and the conformance suite's access-log validator)
+    /// requires. Mirrors Python's <c>_request_wire_bytes</c> fallback path (used there whenever
+    /// the raw wire bytes aren't separately available, which for a shared pipe/socket stream is
+    /// always).
+    /// </summary>
+    private static async Task<byte[]> SerializeForAccessLogAsync(AnnotatedBatch batch, CancellationToken cancellationToken)
+    {
+        var ms = new MemoryStream();
+        await using (var writer = new WireWriter(ms, batch.Batch.Schema))
+        {
+            await writer.WriteBatchAsync(batch, cancellationToken).ConfigureAwait(false);
+        }
+
+        return ms.ToArray();
     }
 
     private static Exception Unwrap(Exception exc) =>
