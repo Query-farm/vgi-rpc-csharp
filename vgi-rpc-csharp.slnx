@@ -17,6 +17,7 @@
     <Project Path="src/QueryFarm.VgiRpc/QueryFarm.VgiRpc.csproj" />
   </Folder>
   <Folder Name="/test/">
+    <Project Path="test/QueryFarm.VgiRpc.Http.OAuth.Tests/QueryFarm.VgiRpc.Http.OAuth.Tests.csproj" />
     <Project Path="test/QueryFarm.VgiRpc.Http.Tests/QueryFarm.VgiRpc.Http.Tests.csproj" />
     <Project Path="test/QueryFarm.VgiRpc.Tests/QueryFarm.VgiRpc.Tests.csproj" />
   </Folder>

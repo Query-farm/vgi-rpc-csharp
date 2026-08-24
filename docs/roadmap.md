@@ -258,7 +258,44 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       sessions' principal binding (M10), proxy proof (M11), token introspection (M12) — this
       milestone was scoped to the shared machinery + the one concrete authenticator, not the
       full auth surface.
-- [ ] **M9 — mTLS + JWT, CORS.**
+- [~] **M9 — mTLS + JWT, CORS (JWT landed).** `QueryFarm.VgiRpc.Http.OAuth.JwtAuth.Create` builds
+      an `AuthenticateDelegate` that validates Bearer JWTs against a JWKS endpoint discovered via
+      OIDC discovery (`{issuer}/.well-known/openid-configuration`), with automatic key-set
+      refresh on an unrecognised `kid` — `Microsoft.IdentityModel.Protocols.ConfigurationManager<T>`
+      handles both natively via `TokenValidationParameters.ConfigurationManager`, which is most of
+      why this is far shorter than Python's hand-rolled thread-safe cache-with-refresh in
+      `_oauth_jwt.py`: the framework already provides it. Built directly on M8's
+      `AuthFailure`/`AuthReason` — exactly the "every later auth feature reuses it" the plan
+      called for. A validation failure's `AuthReason` is classified narrowly
+      (`SecurityTokenExpiredException` → `ExpiredCredential`, everything else → `InvalidCredential`)
+      and its detail is one of a small set of coarse, safe phrases ("JWT signature did not
+      verify", "JWT is expired", etc.) — never the framework's raw exception text, which can name
+      internal state (`docs/unauthorized-spec.md` §2's anti-oracle rule, same as M8).
+      Verified end-to-end against **real** cryptography and a **real** HTTP JWKS/OIDC-discovery
+      round trip, not a mocked key resolver: `JwtAuthTests` spins up an in-process Kestrel host
+      serving both endpoints, mints actual RS256 JWTs against a generated 2048-bit RSA key, and
+      exercises accept / missing-header / wrong-audience / expired / tampered-signature — 6/6,
+      plus a direct assertion that no rejection detail leaks the exception's raw text. Two real
+      framework traps found and worked around, both documented at the call sites: (1)
+      `HttpDocumentRetriever` refuses plain-HTTP discovery URLs by default (correct behavior for
+      production; needed a `configurationManager` testability seam on `JwtAuth.Create` so a
+      plain-HTTP test fixture can inject a relaxed one without weakening the real default); (2)
+      `JsonWebKeySet.ToString()` is *not* a JSON serializer (just the default `object.ToString()`
+      — its real writer is `internal`), so the test JWKS endpoint hand-builds the standard RFC
+      7517 shape instead. Only the OIDC-discovery flow is supported — a caller-supplied raw
+      `jwks_uri` bypassing discovery (Python's `jwt_authenticate(jwks_uri=...)`) isn't wired up.
+      Remaining for M9: mTLS (forwarded-cert authentication — `vgi_rpc/http/_mtls.py`'s ~461
+      lines, not yet started) and CORS. CORS specifically has an architecture wrinkle worth
+      flagging before starting it: `RpcHttpEndpoints.MapVgiRpc` only receives an
+      `IEndpointRouteBuilder`, but ASP.NET Core's CORS needs service registration
+      (`IServiceCollection.AddCors`) and middleware (`IApplicationBuilder.UseCors`) that
+      `MapVgiRpc`'s current signature can't reach — likely resolved via a `corsPolicyName`
+      parameter (`MapVgiRpc` applies `.RequireCors(name)` to its own routes; the caller registers
+      the policy itself), not by changing what `MapVgiRpc` accepts. Also worth noting: CORS has no
+      automated conformance-suite coverage at all (`vgi-rpc-test` is a plain HTTP client, and CORS
+      is a browser-enforced mechanism a non-browser client never triggers), so verifying it will
+      need the same "write real HTTP-level tests directly" approach M8/M9-JWT already used, not a
+      `vgi-rpc-test --filter` run.
 - [ ] **M10 — Sticky sessions.**
 - [ ] **M11 — Proxy proof.**
 - [ ] **M12 — Token introspection.**
