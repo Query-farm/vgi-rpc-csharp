@@ -20,6 +20,7 @@ bootstrapped from is summarized in [`docs/roadmap.md`](docs/roadmap.md) and
 dotnet restore
 dotnet build
 dotnet test
+dotnet format --verify-no-changes --exclude third_party  # third_party/ is vendored, never reformat it
 ```
 
 SDK version is pinned in `global.json`. Package versions are centrally managed in
@@ -57,9 +58,10 @@ The acceptance gate for this port is the same one every other port uses: install
 
 Filled in as each piece lands. Key decisions so far:
 
-- **Wire framing**: hand-rolled outer `Message`/`custom_metadata` layer (`src/QueryFarm.VgiRpc/Wire/`)
-  because `Apache.Arrow`'s stock IPC writer/reader can't express per-batch metadata. See
-  `docs/wire-protocol.md`.
+- **Wire framing**: `src/QueryFarm.VgiRpc/Wire/` is a thin layer over a *vendored, patched*
+  `Apache.Arrow` (`third_party/apache-arrow-dotnet/`) that adds per-batch `custom_metadata`
+  support the stock NuGet package lacks — not a from-scratch FlatBuffers implementation. See
+  `docs/wire-protocol.md` and `third_party/apache-arrow-dotnet/README.md`.
 - **`protocol_version`** (the wire semver constant) is completely independent of this repo's NuGet
   package version (`Directory.Build.props`'s `<Version>`). Never conflate the two.
 - **State-token crypto** (HTTP streaming continuation tokens): AES-256-GCM, not Python's

@@ -1,0 +1,5 @@
+# Vendored third-party source (see apache-arrow-dotnet/README.md) — don't apply this repo's
+# own style rules to code we don't own. `root = true` stops .editorconfig discovery from
+# cascading in from the repo root; intentionally no further rules here, so vendored files keep
+# whatever conventions (encoding, line endings, etc.) they already had upstream.
+root = true

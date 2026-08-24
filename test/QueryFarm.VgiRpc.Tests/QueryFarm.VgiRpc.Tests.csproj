@@ -2,6 +2,10 @@
 
   <PropertyGroup>
     <RootNamespace>QueryFarm.VgiRpc.Tests</RootNamespace>
+    <!-- xUnit1051: prefer TestContext.Current.CancellationToken over `default` — a
+         responsiveness nicety, not a correctness issue; revisit once tests exercise real
+         long-running I/O where prompt cancellation actually matters. -->
+    <NoWarn>$(NoWarn);xUnit1051</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

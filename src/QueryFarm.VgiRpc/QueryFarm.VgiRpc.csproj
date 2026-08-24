@@ -7,8 +7,12 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Apache.Arrow" />
-    <PackageReference Include="Google.FlatBuffers" />
+    <!-- Vendored + patched Apache.Arrow (adds per-batch custom_metadata support, not yet
+         in an official release — see third_party/apache-arrow-dotnet/README.md). -->
+    <ProjectReference Include="..\..\third_party\apache-arrow-dotnet\src\Apache.Arrow\Apache.Arrow.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
     <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
   </ItemGroup>

@@ -1,0 +1,19 @@
+<!--
+  Deliberately does NOT import the repo root's Directory.Build.props: everything under
+  third_party/ is vendored source we don't own, so our own package metadata, analyzers,
+  and code-style enforcement shouldn't apply to it. See third_party/apache-arrow-dotnet/README.md.
+-->
+<Project>
+
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <Nullable>disable</Nullable>
+    <EnableNETAnalyzers>false</EnableNETAnalyzers>
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <RunAnalyzersDuringBuild>false</RunAnalyzersDuringBuild>
+    <NoWarn>$(NoWarn);CS1591;CS1570;CS0618;CS8600;CS8601;CS8602;CS8603;CS8604;CS8618;CS8625;CS8765;CS8767;CS8981;CS0419;CA1000;CA1002;CA1707;CA1720;CA2225;CA5394</NoWarn>
+  </PropertyGroup>
+
+</Project>

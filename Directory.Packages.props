@@ -6,9 +6,9 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Wire / Arrow -->
-    <PackageVersion Include="Apache.Arrow" Version="18.1.0" />
-    <PackageVersion Include="Google.FlatBuffers" Version="24.3.25" />
+    <!-- Apache.Arrow is NOT referenced via NuGet: it's vendored (with a small patch) under
+         third_party/apache-arrow-dotnet/ and consumed via ProjectReference. See
+         third_party/apache-arrow-dotnet/README.md and docs/wire-protocol.md for why. -->
 
     <!-- BCL-adjacent -->
     <PackageVersion Include="System.Text.Json" Version="10.0.0" />

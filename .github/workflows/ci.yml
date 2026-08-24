@@ -34,7 +34,9 @@ jobs:
         with:
           global-json-file: global.json
       - run: dotnet restore
-      - run: dotnet format --verify-no-changes
+      # third_party/ is vendored, unmodified-by-us upstream source (see
+      # third_party/apache-arrow-dotnet/README.md) — never reformat it.
+      - run: dotnet format --verify-no-changes --exclude third_party
 
   # Becomes required once Milestone 2 lands (first full unary conformance pass).
   # The transport/feature matrix here grows as later milestones land — see docs/roadmap.md.

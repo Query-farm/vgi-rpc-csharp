@@ -5,8 +5,9 @@ ports (Go, Rust, TypeScript, Java). Everything below is in scope — this list o
 dependency*, not what eventually ships. See `~/Development/vgi-rpc/docs/porting-guide.md` (in the
 canonical Python repo) for the language-agnostic porting checklist this plan is built on.
 
-- [ ] **M0 — Wire spike.** Hand-rolled Arrow IPC framing with per-batch `custom_metadata`
-      (`Apache.Arrow`'s stock writer/reader can't do this — see `docs/wire-protocol.md`).
+- [ ] **M0 — Wire spike.** A thin `QueryFarm.VgiRpc.Wire` layer over a vendored, patched
+      `Apache.Arrow` (`third_party/apache-arrow-dotnet/`) that adds per-batch `custom_metadata`
+      support the stock NuGet package lacks — see `docs/wire-protocol.md`.
 - [ ] **M1 — `__describe__` round-trip.** Reflection-based schema derivation, `RpcServer`/
       `RpcConnection`/`DispatchProxy` client over the in-process pipe transport.
 - [ ] **M2 — Full unary conformance.** All `IConformanceService` unary methods; `RpcException`

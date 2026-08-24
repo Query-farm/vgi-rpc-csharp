@@ -19,4 +19,10 @@
   <Folder Name="/test/">
     <Project Path="test/QueryFarm.VgiRpc.Tests/QueryFarm.VgiRpc.Tests.csproj" />
   </Folder>
+  <Folder Name="/third_party/" />
+  <Folder Name="/third_party/apache-arrow-dotnet/" />
+  <Folder Name="/third_party/apache-arrow-dotnet/src/">
+    <Project Path="third_party/apache-arrow-dotnet/src/Apache.Arrow.Scalars/Apache.Arrow.Scalars.csproj" />
+    <Project Path="third_party/apache-arrow-dotnet/src/Apache.Arrow/Apache.Arrow.csproj" />
+  </Folder>
 </Solution>

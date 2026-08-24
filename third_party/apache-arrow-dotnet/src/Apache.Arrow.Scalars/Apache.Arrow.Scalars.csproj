@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsAotCompatible>true</IsAotCompatible>
+    <Description>Apache Arrow scalar types, including Parquet-compatible variants. Provides readers, writers, and object model for the Parquet Variant binary format for semi-structured data.</Description>
+  </PropertyGroup>
+
+</Project>

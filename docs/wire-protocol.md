@@ -16,25 +16,22 @@ Every protocol semantic in vgi-rpc (method name, versions, log/error info, strea
 tokens, SHM/external-storage pointers, ...) rides as `vgi_rpc.*` **custom_metadata key/value pairs
 on individual Arrow RecordBatch IPC messages** — not in the payload, not in a bespoke header.
 
-The official .NET Arrow library (`apache/arrow-dotnet`, NuGet `Apache.Arrow`) cannot write or read
-this. Its `RecordBatch` type has no metadata property, `ArrowStreamWriter.WriteRecordBatch` never
-emits a `custom_metadata` field, and its generated FlatBuffers types (`Apache.Arrow.Flatbuf.*`) are
-all `internal` with no `InternalsVisibleTo` — unlike Rust's `arrow-ipc`, which re-exports its
-generated types as `pub` specifically so `vgi-rpc-rust` can hand-assemble `Message` flatbuffers
-with metadata. There is no supported way to reuse Apache.Arrow's internals for this from outside
-its own assembly.
+The official .NET Arrow library (`apache/arrow-dotnet`, NuGet `Apache.Arrow`) can't write or read
+this out of the box: `RecordBatch` has no metadata property, and `ArrowStreamWriter`/
+`ArrowStreamReader` never surface a RecordBatch message's `custom_metadata` field.
 
-**What this repo does about it**: depend on the public `Google.FlatBuffers` NuGet package directly,
-and generate/hand-write a small internal set of wire-level FlatBuffers table types (`Message`,
-`KeyValue`, `Schema`, `Field`, `RecordBatch`, `FieldNode`, `Buffer`) under
-`src/QueryFarm.VgiRpc/Flatbuf/`, sourced from Arrow's own `Schema.fbs`/`Message.fbs`
-(see `scripts/fetch-arrow-format.sh`). Everything *above* the outer `Message` wrapper — column
-buffer layout, validity bitmaps, offsets, dictionary encoding, all concrete array types — still
-uses stock `Apache.Arrow` (`RecordBatch`, `IArrowArray`, `Schema`, `ArrayData`), which is public
-and complete. Only the outer framing is hand-rolled. See `src/QueryFarm.VgiRpc/Wire/` for the
-implementation and `test/QueryFarm.VgiRpc.Tests/Wire/` for the byte-fidelity tests that guard it
-(including a direct byte-for-byte comparison against stock `Apache.Arrow.Ipc.ArrowStreamWriter`
-output for the no-metadata case).
+**What this repo does about it**: rather than hand-rolling FlatBuffers framing ourselves (the
+original plan — reinventing schema/message encoding that Apache.Arrow already implements
+correctly), this repo vendors `Apache.Arrow`/`Apache.Arrow.Scalars` under
+`third_party/apache-arrow-dotnet/` with a small, already-written, already-tested patch applied on
+top of the `v23.0.0` release tag: [apache/arrow-dotnet#283](https://github.com/apache/arrow-dotnet/pull/283),
+which adds exactly `WriteRecordBatch(RecordBatch, IReadOnlyDictionary<string, string>)` and
+`ArrowStreamReader.LastBatchCustomMetadata`. The patch is ~90 net lines across 2 files and reuses
+all of Apache.Arrow's own serialization machinery — see
+`third_party/apache-arrow-dotnet/README.md` for exactly what's patched and how to drop the
+vendoring once the real PR ships in an official release. `src/QueryFarm.VgiRpc/Wire/` is a thin
+layer on top of this patched writer/reader (per-batch metadata dictionaries, EOS handling,
+`AnnotatedBatch`), not a from-scratch IPC implementation.
 
 ## Naming: snake_case wire names vs. PascalCase C#
 

@@ -1,0 +1,51 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <DefineConstants>$(DefineConstants);UNSAFE_BYTEBUFFER;ENABLE_SPAN_T</DefineConstants>
+    <IsAotCompatible>true</IsAotCompatible>
+    <Description>Apache Arrow is a cross-language development platform for in-memory data. It specifies a standardized language-independent columnar memory format for flat and hierarchical data, organized for efficient analytic operations on modern hardware.</Description>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Update="Properties\Resources.Designer.cs">
+      <DesignTime>True</DesignTime>
+      <AutoGen>True</AutoGen>
+      <DependentUpon>Resources.resx</DependentUpon>
+    </Compile>
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Update="Properties\Resources.resx">
+      <Generator>ResXFileCodeGenerator</Generator>
+      <LastGenOutput>Resources.Designer.cs</LastGenOutput>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(TargetFrameworkIdentifier)' == '.NETStandard' or '$(TargetFramework)' == 'net462'">
+    <Compile Remove="Extensions\StreamExtensions.netcoreapp.cs" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFrameworkIdentifier)' == '.NETCoreApp'">
+    <Compile Remove="Extensions\StreamExtensions.netstandard.cs" />
+    <Compile Remove="Extensions\TupleExtensions.netstandard.cs" />
+    <Compile Remove="Memory\AlignedNative.cs" />
+  </ItemGroup>
+  <ItemGroup Condition="!$([MSBuild]::IsTargetFrameworkCompatible($(TargetFramework), 'net5.0'))">
+    <Compile Remove="Arrays\HalfFloatArray.cs" />
+  </ItemGroup>
+  <ItemGroup Condition="$([MSBuild]::IsTargetFrameworkCompatible($(TargetFramework), 'net5.0'))">
+    <!-- Code targeting .NET 5+ should use [UnmanagedCallersOnly]. -->
+    <Compile Remove="C\NativeDelegate.cs" />
+  </ItemGroup>
+  <ItemGroup Condition="$([MSBuild]::IsTargetFrameworkCompatible($(TargetFramework), 'net8.0'))">
+    <Compile Remove="Extensions\ExperimentalAttribute.Polyfill.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Apache.Arrow.Scalars\Apache.Arrow.Scalars.csproj" />
+  </ItemGroup>
+</Project>
