@@ -50,6 +50,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: pip install "vgi-rpc[conformance,http]" pytest
+      # cryptography: not one of vgi-rpc's own extras — test_csharp_conformance.py's TestMtls
+      # class uses it directly to mint real X.509 certs (see docs/roadmap.md M9 mTLS), the same
+      # way the canonical Python repo's own tests/test_mtls.py does.
+      - run: pip install "vgi-rpc[conformance,http]" pytest cryptography
       # test_csharp_conformance.py's worker_binary fixture builds the worker itself.
       - run: python -m pytest test_csharp_conformance.py -v
