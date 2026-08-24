@@ -1,12 +1,18 @@
 // Conformance worker entry point. Registers ConformanceServiceImpl and serves it over stdio
-// (default), --unix PATH, or --tcp [HOST:]PORT — the mandatory CLI contract from
-// docs/porting-guide.md (canonical Python repo). --http is accepted (so the worker doesn't
-// reject a caller who always passes it) but not yet implemented — see docs/roadmap.md M6.
+// (default), --unix PATH, --tcp [HOST:]PORT, or --http [--host HOST] [--port PORT] — the
+// mandatory CLI contract from docs/porting-guide.md (canonical Python repo). --http currently
+// serves unary calls only — streaming (/init, /exchange) is not yet implemented, see
+// docs/roadmap.md M6.
 
 using System.Runtime.InteropServices;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using QueryFarm.VgiRpc.AccessLog;
 using QueryFarm.VgiRpc.Conformance;
 using QueryFarm.VgiRpc.ConformanceWorker;
+using QueryFarm.VgiRpc.Http;
 using QueryFarm.VgiRpc.Server;
 using QueryFarm.VgiRpc.Transport;
 
@@ -50,8 +56,29 @@ if (options.Tcp is { } tcp)
 
 if (options.Http)
 {
-    Console.Error.WriteLine("--http is not yet implemented (see docs/roadmap.md M6).");
-    return 1;
+    var builder = WebApplication.CreateBuilder([]);
+    // The discovery contract is "print exactly PORT:<port>\n on stdout, then flush" — Kestrel's
+    // own startup/request logging defaults to stdout too and would interleave with that line, so
+    // silence everything except what the app itself explicitly writes.
+    builder.Logging.ClearProviders();
+    builder.WebHost.UseUrls($"http://{options.HttpHost}:{options.HttpPort}");
+    var app = builder.Build();
+    app.MapVgiRpc(server);
+    await app.StartAsync(cts.Token);
+    var boundPort = new Uri(app.Urls.First()).Port;
+    Console.WriteLine($"PORT:{boundPort}");
+    Console.Out.Flush();
+    try
+    {
+        await Task.Delay(Timeout.Infinite, cts.Token);
+    }
+    catch (OperationCanceledException)
+    {
+        // Normal shutdown path — see RegisterShutdownHandlers.
+    }
+
+    await app.StopAsync();
+    return 0;
 }
 
 // Default: stdio — a single connection over the process's own stdin/stdout.
@@ -98,6 +125,8 @@ internal sealed class CliOptions
     public string? UnixSocketPath { get; private init; }
     public TcpOptions? Tcp { get; private init; }
     public bool Http { get; private init; }
+    public string HttpHost { get; private init; } = "127.0.0.1";
+    public int HttpPort { get; private init; }
     public string? AccessLogPath { get; private init; }
     public bool AccessLogDebug { get; private init; }
 
@@ -151,14 +180,13 @@ internal sealed class CliOptions
                 : new TcpOptions("127.0.0.1", int.Parse(parts[0]));
         }
 
-        _ = host; // reserved for --http (see docs/roadmap.md M6); not used by --unix/--tcp
-        _ = port;
-
         return new CliOptions
         {
             UnixSocketPath = unixPath,
             Tcp = tcp,
             Http = http,
+            HttpHost = host ?? "127.0.0.1",
+            HttpPort = port ?? 0,
             AccessLogPath = accessLog,
             AccessLogDebug = accessLogDebug,
         };

@@ -38,6 +38,24 @@ public sealed class RpcServer
 
     public string? ServerVersion { get; init; }
 
+    /// <summary>
+    /// The registered methods, keyed by wire name — exposed for transports (see
+    /// <c>QueryFarm.VgiRpc.Http</c>) that dispatch outside <see cref="ServeAsync"/>'s own loop
+    /// and need to resolve a method themselves. Mirrors Python's public <c>RpcServer.methods</c>.
+    /// </summary>
+    public IReadOnlyDictionary<string, RpcMethodInfo> Methods => _methods;
+
+    /// <summary>The service implementation instance, for transports that invoke methods directly
+    /// rather than through <see cref="ServeOneAsync"/>.</summary>
+    internal object Implementation => _implementation;
+
+    /// <summary>This server instance's id — see <see cref="AccessLogRecord.ServerId"/>.</summary>
+    internal string ServerId => _serverId;
+
+    /// <summary>The configured access-log sink, or <see langword="null"/> if none — for
+    /// transports that emit their own <see cref="AccessLogRecord"/>s outside this dispatch loop.</summary>
+    internal IAccessLogSink? AccessLog => _accessLog;
+
     public RpcServer(Type serviceInterface, object implementation, string? serverId = null, IAccessLogSink? accessLog = null)
     {
         _methods = ServiceRegistry.GetMethods(serviceInterface);

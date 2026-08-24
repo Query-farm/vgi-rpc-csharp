@@ -84,7 +84,40 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       on every exit path, including the pre-dispatch error path. Error records carry
       `error_message` (`exception.Message`, matching Python's `str(exc)`), satisfying the
       schema's `status=error requires error_message` rule.
-- [ ] **M6 — Plain HTTP.** Kestrel server + `HttpClient` client; stream state tokens (AES-GCM).
+- [~] **M6 — Plain HTTP (unary landed; streaming + client + tokens remain).**
+      `QueryFarm.VgiRpc.Http` (`RpcHttpEndpoints.MapVgiRpc`) maps an `RpcServer` onto ASP.NET
+      Core minimal-API routes matching the canonical Python repo's Falcon resources exactly:
+      `POST {prefix}/{method}` for unary calls (`__describe__` included, since it dispatches
+      through the same registered-method path once implemented), `GET`/`HEAD {prefix}/health`.
+      `POST {prefix}/{method}/init`/`/exchange` are registered (so the routing contract is
+      structurally complete) but answer 501 — streaming over HTTP is real future work, not a
+      stub to forget about. Dispatch here is a genuinely separate code path from
+      `RpcServer.ServeOneAsync` (a few `internal` accessors — `Methods`, `Implementation`,
+      `ServerId`, `AccessLog` — added to `RpcServer` via `InternalsVisibleTo`), matching why
+      Python's own `_app_unary.py` doesn't call into `_server.py`'s `serve_one` either: an HTTP
+      request/response body has no persistent connection to drive a serve loop over. The
+      conformance worker's `--http [--host HOST] [--port PORT]` now actually binds Kestrel
+      (`WebApplication`, `builder.Logging.ClearProviders()` so Kestrel's own logging doesn't
+      interleave with the mandatory `PORT:<port>` discovery line) instead of the earlier stub.
+      **Real, non-obvious finding**: the reference Python HTTP client compresses every request
+      body with zstd *by default* (`compression_level: 1`, not opt-in) — so request
+      decompression (zstd via `ZstdSharp.Port`, gzip via `System.IO.Compression`, based on
+      `Content-Encoding`) turned out to be a hard prerequisite for M6's *unary* slice, not an M7
+      refinement as originally scoped; discovered by capturing the raw request bytes against a
+      throwaway Python `http.server` and finding a zstd magic number where an Arrow IPC schema
+      message was expected. Response compression (server → client) is not yet implemented — the
+      client tolerates a plain, uncompressed body when `Content-Encoding` is absent. Verified
+      against the real Python reference client and `vgi-rpc-test` (driven via `--url`, not
+      `--cmd` — HTTP tests an already-running server, unlike pipe/unix/tcp's spawn-and-drive
+      model; see `test_csharp_conformance.py`'s `http_worker` fixture and
+      `test_http_unary_subset_conformant`): 60/60 unary tests green over real HTTP, and a full
+      unfiltered run confirms the *only* failures are the expected streaming categories (already
+      known to be unimplemented) plus the two pre-existing gaps (`dataclass.nested_container_types`,
+      `large_payload.*`) — no new failures, no hangs, no cascades (each HTTP request is
+      independent, unlike the shared-connection desync class of bug documented under M3).
+      Remaining for M6: `/init`/`/exchange` streaming dispatch, the state-token codec (AES-GCM,
+      per the plan's substitution for Python's XChaCha20-Poly1305 — see the plan doc), and an
+      HTTP-based C# client (`HttpClient`).
 - [ ] **M7 — Response caps, capability headers, content-encoding negotiation.**
 - [ ] **M8 — Unauthorized-response spec + bearer auth.**
 - [ ] **M9 — mTLS + JWT, CORS.**

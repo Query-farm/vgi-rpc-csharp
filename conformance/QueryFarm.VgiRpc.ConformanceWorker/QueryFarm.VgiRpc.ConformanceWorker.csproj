@@ -7,7 +7,9 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <ProjectReference Include="..\QueryFarm.VgiRpc.Conformance\QueryFarm.VgiRpc.Conformance.csproj" />
+    <ProjectReference Include="..\..\src\QueryFarm.VgiRpc.Http\QueryFarm.VgiRpc.Http.csproj" />
   </ItemGroup>
 
 </Project>

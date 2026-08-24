@@ -17,4 +17,12 @@
     <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- QueryFarm.VgiRpc.Http dispatches HTTP requests outside RpcServer.ServeAsync's own loop
+         (a request/response body has no persistent connection to drive a serve loop over — see
+         docs/roadmap.md M6) and needs a few implementation-detail accessors
+         (RpcServer.Implementation/ServerId/AccessLog) that aren't part of the public API. -->
+    <InternalsVisibleTo Include="QueryFarm.VgiRpc.Http" />
+  </ItemGroup>
+
 </Project>
