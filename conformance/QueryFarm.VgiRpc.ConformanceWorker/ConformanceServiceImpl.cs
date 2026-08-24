@@ -56,6 +56,30 @@ public sealed class ConformanceServiceImpl : IConformanceService
 
     public Task<float> EchoFloat32Async(float value) => Task.FromResult(value);
 
+    public Task<sbyte> EchoInt8Async(sbyte value) => Task.FromResult(value);
+
+    public Task<short> EchoInt16Async(short value) => Task.FromResult(value);
+
+    public Task<byte> EchoUint8Async(byte value) => Task.FromResult(value);
+
+    public Task<ushort> EchoUint16Async(ushort value) => Task.FromResult(value);
+
+    public Task<uint> EchoUint32Async(uint value) => Task.FromResult(value);
+
+    public Task<ulong> EchoUint64Async(ulong value) => Task.FromResult(value);
+
+    public Task<DateOnly> EchoDateAsync(DateOnly value) => Task.FromResult(value);
+
+    public Task<DateTime> EchoTimestampAsync(DateTime value) => Task.FromResult(value);
+
+    public Task<DateTimeOffset> EchoTimestampUtcAsync(DateTimeOffset value) => Task.FromResult(value);
+
+    public Task<TimeOnly> EchoTimeAsync(TimeOnly value) => Task.FromResult(value);
+
+    public Task<TimeSpan> EchoDurationAsync(TimeSpan value) => Task.FromResult(value);
+
+    public Task<decimal> EchoDecimalAsync(decimal value) => Task.FromResult(value);
+
     public Task<double> AddFloatsAsync(double a, double b) => Task.FromResult(a + b);
 
     public Task<string> ConcatenateAsync(string prefix, string suffix, string separator) =>

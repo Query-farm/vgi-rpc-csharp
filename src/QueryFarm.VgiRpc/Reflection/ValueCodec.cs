@@ -155,6 +155,16 @@ public static class ValueCodec
             UInt64Type => new UInt64Array.Builder().Append((ulong)value).Build(),
             FloatType => new FloatArray.Builder().Append((float)value).Build(),
             DoubleType => new DoubleArray.Builder().Append((double)value).Build(),
+            Date32Type => new Date32Array.Builder().Append((DateOnly)value).Build(),
+            // A naive DateTime carries no offset on the wire (tz=null) — re-tag as Kind=Utc
+            // (relabels, does not convert) so the ticks-since-epoch calculation preserves the
+            // literal wall-clock value instead of applying a timezone shift. See SchemaDerivation's
+            // DateTime/DateTimeOffset split for why these are two distinct wire shapes.
+            TimestampType timestampType when value is DateTime dt => new TimestampArray.Builder(timestampType).Append(new DateTimeOffset(DateTime.SpecifyKind(dt, DateTimeKind.Utc))).Build(),
+            TimestampType timestampType => new TimestampArray.Builder(timestampType).Append((DateTimeOffset)value).Build(),
+            Time64Type time64Type => new Time64Array.Builder(time64Type).Append((TimeOnly)value).Build(),
+            DurationType durationType => new DurationArray.Builder(durationType).Append((TimeSpan)value).Build(),
+            Decimal128Type decimal128Type => new Decimal128Array.Builder(decimal128Type).Append((decimal)value).Build(),
             ListType listType => BuildListArray(listType, (System.Collections.IEnumerable)value),
             StructType structType => BuildStructArray(structType, value, isEmpty: false),
             DictionaryType dictType => BuildEnumArray(dictType, value),
@@ -181,6 +191,11 @@ public static class ValueCodec
             UInt64Type => nullRow ? new UInt64Array.Builder().AppendNull().Build() : new UInt64Array.Builder().Build(),
             FloatType => nullRow ? new FloatArray.Builder().AppendNull().Build() : new FloatArray.Builder().Build(),
             DoubleType => nullRow ? new DoubleArray.Builder().AppendNull().Build() : new DoubleArray.Builder().Build(),
+            Date32Type => nullRow ? new Date32Array.Builder().AppendNull().Build() : new Date32Array.Builder().Build(),
+            TimestampType timestampType => nullRow ? new TimestampArray.Builder(timestampType).AppendNull().Build() : new TimestampArray.Builder(timestampType).Build(),
+            Time64Type time64Type => nullRow ? new Time64Array.Builder(time64Type).AppendNull().Build() : new Time64Array.Builder(time64Type).Build(),
+            DurationType durationType => nullRow ? new DurationArray.Builder(durationType).AppendNull().Build() : new DurationArray.Builder(durationType).Build(),
+            Decimal128Type decimal128Type => nullRow ? new Decimal128Array.Builder(decimal128Type).AppendNull().Build() : new Decimal128Array.Builder(decimal128Type).Build(),
             ListType listType => nullRow ? BuildListArray(listType, null) : BuildListArray(listType, System.Array.Empty<object>()),
             StructType structType => nullRow ? BuildStructArray(structType, value: null, isEmpty: false) : BuildStructArray(structType, value: null, isEmpty: true),
             DictionaryType dictType => nullRow
@@ -546,6 +561,17 @@ public static class ValueCodec
             UInt64Array a => a.Values[index],
             FloatArray a => a.Values[index],
             DoubleArray a => a.Values[index],
+            Date32Array a => a.GetDateOnly(index)!.Value,
+            // GetTimestamp always returns a DateTimeOffset with the schema's declared offset
+            // baked in (Offset=0 for both our naive and UTC-tagged shapes — see
+            // SchemaDerivation) — .DateTime relabels that as Kind=Unspecified for the naive
+            // (DateTime) case without changing the value; the UTC-tagged case keeps the
+            // DateTimeOffset as-is.
+            TimestampArray a when effectiveType == typeof(DateTime) => a.GetTimestamp(index)!.Value.DateTime,
+            TimestampArray a => a.GetTimestamp(index)!.Value,
+            Time64Array a => a.GetTime(index)!.Value,
+            DurationArray a => a.GetTimeSpan(index)!.Value,
+            Decimal128Array a => a.GetValue(index)!.Value,
             MapArray a => ExtractMap(a, index, effectiveType),
             ListArray a => ExtractList(a, index, effectiveType),
             StructArray a => ExtractStruct(a, index, effectiveType),

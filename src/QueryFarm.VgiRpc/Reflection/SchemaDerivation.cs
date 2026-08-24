@@ -145,7 +145,16 @@ public static class SchemaDerivation
             return DoubleType.Default;
         }
 
-        if (type == typeof(DateTime) || type == typeof(DateTimeOffset))
+        // A naive DateTime carries no offset — mirrors Python's naive datetime.datetime, which
+        // vgi-rpc's conformance protocol maps to pa.timestamp("us") with no tz. A DateTimeOffset
+        // always has one, matching the UTC-tagged pa.timestamp("us", tz="UTC") case. Two distinct
+        // CLR types for two distinct wire shapes, rather than one type doing double duty.
+        if (type == typeof(DateTime))
+        {
+            return new TimestampType(TimeUnit.Microsecond, (string?)null);
+        }
+
+        if (type == typeof(DateTimeOffset))
         {
             return new TimestampType(TimeUnit.Microsecond, "UTC");
         }
@@ -155,6 +164,11 @@ public static class SchemaDerivation
             return Date32Type.Default;
         }
 
+        if (type == typeof(TimeOnly))
+        {
+            return new Time64Type(TimeUnit.Microsecond);
+        }
+
         if (type == typeof(TimeSpan))
         {
             return DurationType.Microsecond;
@@ -162,7 +176,11 @@ public static class SchemaDerivation
 
         if (type == typeof(decimal))
         {
-            return new Decimal128Type(38, 18);
+            // (20, 4) matches the one wire shape the conformance protocol's echo_decimal
+            // currently exercises (pa.decimal128(20, 4)) — not yet configurable per-field (that
+            // needs an attribute-based override mechanism, deferred; see IConformanceService's
+            // wide-Arrow-types TODO). Revisit if/when a second decimal shape is needed.
+            return new Decimal128Type(20, 4);
         }
 
         if (type.IsEnum)

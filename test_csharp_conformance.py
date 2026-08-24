@@ -243,6 +243,57 @@ def test_access_log_conforms(worker_binary: Path, tmp_path: Path, debug: bool) -
     )
 
 
+def test_wide_arrow_types_round_trip(worker_binary: Path) -> None:
+    """The wide-Arrow-type echo methods (int8/16/uint8/16/32/64, date, timestamp[_utc], time,
+    duration, decimal — see docs/roadmap.md "M2, continued") round-trip correctly.
+
+    Not (yet) exercised by vgi-rpc-test's own --filter categories: these methods currently exist
+    only in the __describe__ conformance test's _EXPECTED_METHODS set and the not-yet-tested
+    echo_wide_types composite, so there's no `category.name` to select via IMPLEMENTED_FILTER.
+    Verified directly against the real Python reference client instead, via the same
+    SubprocessTransport the framework itself uses (a hand-rolled `subprocess.Popen` without its
+    BufferedReader wrapping looks like a server-side short-read bug that isn't one — POSIX pipes
+    may return fewer bytes than requested, which SubprocessTransport already accounts for).
+    """
+    import datetime
+    import decimal
+
+    from vgi_rpc.conformance._protocol import ConformanceService
+    from vgi_rpc.rpc import RpcConnection
+    from vgi_rpc.rpc._transport import SubprocessTransport
+
+    transport = SubprocessTransport([str(worker_binary)])
+    with RpcConnection(ConformanceService, transport) as svc:
+        checks = [
+            ("echo_int8", -100, svc.echo_int8(value=-100)),
+            ("echo_int16", -30000, svc.echo_int16(value=-30000)),
+            ("echo_uint8", 250, svc.echo_uint8(value=250)),
+            ("echo_uint16", 60000, svc.echo_uint16(value=60000)),
+            ("echo_uint32", 4_000_000_000, svc.echo_uint32(value=4_000_000_000)),
+            ("echo_uint64", 18_000_000_000_000_000_000, svc.echo_uint64(value=18_000_000_000_000_000_000)),
+            ("echo_date", datetime.date(2026, 8, 24), svc.echo_date(value=datetime.date(2026, 8, 24))),
+            (
+                "echo_timestamp",
+                datetime.datetime(2026, 8, 24, 12, 30, 45, 123456),
+                svc.echo_timestamp(value=datetime.datetime(2026, 8, 24, 12, 30, 45, 123456)),
+            ),
+            (
+                "echo_timestamp_utc",
+                datetime.datetime(2026, 8, 24, 12, 30, 45, 123456, tzinfo=datetime.timezone.utc),
+                svc.echo_timestamp_utc(value=datetime.datetime(2026, 8, 24, 12, 30, 45, 123456, tzinfo=datetime.timezone.utc)),
+            ),
+            ("echo_time", datetime.time(13, 45, 30, 123456), svc.echo_time(value=datetime.time(13, 45, 30, 123456))),
+            (
+                "echo_duration",
+                datetime.timedelta(hours=3, minutes=15, microseconds=500),
+                svc.echo_duration(value=datetime.timedelta(hours=3, minutes=15, microseconds=500)),
+            ),
+            ("echo_decimal", decimal.Decimal("12345.6789"), svc.echo_decimal(value=decimal.Decimal("12345.6789"))),
+        ]
+    failed = [f"  {name}: expected {expected!r}, got {actual!r}" for name, expected, actual in checks if expected != actual]
+    assert not failed, "Wide-Arrow-type round-trip failures:\n" + "\n".join(failed)
+
+
 def test_http_unary_subset_conformant(http_worker: str) -> None:
     """The HTTP transport's unary subset (see docs/roadmap.md M6 — streaming isn't implemented
     over HTTP yet) must pass 100% against the real Python reference client, driven via `--url`

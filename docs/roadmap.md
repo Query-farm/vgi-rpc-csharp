@@ -17,6 +17,31 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       errors/logging/boundary_values/protocol_version/annotated, `dataclass.*` (including
       `echo_all_types(_with_nulls)`, unblocked by M3's list-of-struct work). `__describe__` is
       still a stub (not yet needed by conformance — deferred).
+- [x] **M2, continued — wide Arrow types.** `echo_int8/int16/uint8/uint16/uint32/uint64` (already
+      natively CLR-type-mapped in `SchemaDerivation` — `sbyte`/`short`/`byte`/`ushort`/`uint`/
+      `ulong`, no new work needed there), `echo_date` (`DateOnly`), `echo_timestamp` (naive
+      `DateTime`, `pa.timestamp("us")`, no tz) / `echo_timestamp_utc` (`DateTimeOffset`,
+      `pa.timestamp("us", tz="UTC")` — two distinct CLR types for two distinct wire shapes, fixing
+      a prior bug where both mapped to the UTC-tagged form), `echo_time` (new: `TimeOnly` →
+      `Time64Type`, not previously mapped), `echo_duration` (`TimeSpan`), `echo_decimal`
+      (`decimal` → `Decimal128Type(20, 4)`, hardcoded to the one shape the conformance protocol
+      currently exercises — a real per-field precision/scale override needs an attribute
+      mechanism, deferred). **Not yet exercised by any `vgi-rpc-test --filter` category** — these
+      methods exist only in the `__describe__` test's expected-methods set and the
+      not-yet-conformance-tested `echo_wide_types` composite upstream — so verified directly
+      instead: `test_csharp_conformance.py::test_wide_arrow_types_round_trip` drives all twelve
+      through the real Python client via `SubprocessTransport` (not a hand-rolled `Popen` — an
+      unbuffered raw pipe read can come up short of what Arrow's schema-length prefix promised,
+      which looks exactly like a server-side framing bug until you notice the client didn't wrap
+      it in a `BufferedReader`; cost real debugging time to rule out). Still deferred:
+      `echo_large_string`/`echo_large_binary`/`echo_fixed_binary`/`echo_dict_encoded_string`
+      (need an attribute-based Arrow-type-override mechanism — `string`/`byte[]` already mean the
+      default-width shape, so there's no distinct CLR type to hang large/fixed/dict-encoded
+      variants off the way there was for the integer widths), `pack_nested_containers`/
+      `echo_status_list` (need a `frozenset`→Arrow-list-or-set mapping and, for
+      `NestedContainers.tagged_batch`, an embedded-`RecordBatch`-as-field mechanism distinct from
+      the existing embedded-dataclass one), `echo_embedded_arrow`/`echo_deep_nested`/
+      `echo_container_wide_types`.
 - [x] **M3 — Streaming.** 94/105 tests pass in the gated conformance subset
       (`test_csharp_conformance.py`) — every category except `large_payload.*` (2, a known
       2GiB+ transport-level gap, documented below) and `http_response_cap.*` (4, needs HTTP —
