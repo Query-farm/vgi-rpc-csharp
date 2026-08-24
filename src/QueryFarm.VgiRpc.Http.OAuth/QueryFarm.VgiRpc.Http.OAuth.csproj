@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>JWT/JWKS validation and OAuth2/PKCE browser flow for vgi-rpc's HTTP transport. (Scaffold only — see Milestone 9/15 in docs/roadmap.md.)</Description>
+    <RootNamespace>QueryFarm.VgiRpc.Http.OAuth</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.IdentityModel.JsonWebTokens" />
+    <PackageReference Include="Microsoft.IdentityModel.Protocols.OpenIdConnect" />
+    <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
+    <ProjectReference Include="..\QueryFarm.VgiRpc.Http\QueryFarm.VgiRpc.Http.csproj" />
+  </ItemGroup>
+
+</Project>

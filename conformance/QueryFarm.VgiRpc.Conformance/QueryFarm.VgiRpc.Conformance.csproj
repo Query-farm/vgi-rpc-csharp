@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Shared IConformanceService interface and types — a method-for-method port of vgi_rpc.conformance._protocol. Not published.</Description>
+    <RootNamespace>QueryFarm.VgiRpc.Conformance</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\QueryFarm.VgiRpc\QueryFarm.VgiRpc.csproj" />
+  </ItemGroup>
+
+</Project>

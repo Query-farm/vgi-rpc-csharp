@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Core wire protocol, reflection-based RPC engine, and pipe/stdio/Unix/TCP/SHM transports for vgi-rpc.</Description>
+    <RootNamespace>QueryFarm.VgiRpc</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Apache.Arrow" />
+    <PackageReference Include="Google.FlatBuffers" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+    <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
+  </ItemGroup>
+
+</Project>

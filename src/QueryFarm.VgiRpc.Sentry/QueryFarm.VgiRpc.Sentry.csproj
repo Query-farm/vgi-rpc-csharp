@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Sentry error-capture instrumentation for vgi-rpc. (Scaffold only — see Milestone 16 in docs/roadmap.md.)</Description>
+    <RootNamespace>QueryFarm.VgiRpc.Sentry</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Sentry" />
+    <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
+    <ProjectReference Include="..\QueryFarm.VgiRpc\QueryFarm.VgiRpc.csproj" />
+  </ItemGroup>
+
+</Project>

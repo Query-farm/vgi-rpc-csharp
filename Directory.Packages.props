@@ -1,0 +1,45 @@
+<Project>
+
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Wire / Arrow -->
+    <PackageVersion Include="Apache.Arrow" Version="18.1.0" />
+    <PackageVersion Include="Google.FlatBuffers" Version="24.3.25" />
+
+    <!-- BCL-adjacent -->
+    <PackageVersion Include="System.Text.Json" Version="10.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.0" />
+    <PackageVersion Include="Microsoft.Bcl.AsyncInterfaces" Version="10.0.0" />
+
+    <!-- Compression -->
+    <PackageVersion Include="ZstdSharp.Port" Version="0.8.5" />
+
+    <!-- HTTP / auth (used starting at Milestone 6+) -->
+    <PackageVersion Include="Microsoft.IdentityModel.JsonWebTokens" Version="8.4.0" />
+    <PackageVersion Include="Microsoft.IdentityModel.Protocols.OpenIdConnect" Version="8.4.0" />
+
+    <!-- External storage -->
+    <PackageVersion Include="AWSSDK.S3" Version="3.7.416" />
+    <PackageVersion Include="Google.Cloud.Storage.V1" Version="4.11.0" />
+
+    <!-- Observability -->
+    <PackageVersion Include="OpenTelemetry" Version="1.15.3" />
+    <PackageVersion Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.15.3" />
+    <PackageVersion Include="Sentry" Version="5.7.0" />
+
+    <!-- Testing -->
+    <PackageVersion Include="xunit.v3" Version="1.1.0" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="3.0.2" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageVersion Include="coverlet.collector" Version="6.0.4" />
+
+    <!-- Source link -->
+    <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="8.0.0" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>GCS-backed IExternalStorage implementation for vgi-rpc large-payload externalization. (Scaffold only — see Milestone 13 in docs/roadmap.md.)</Description>
+    <RootNamespace>QueryFarm.VgiRpc.Gcs</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Google.Cloud.Storage.V1" />
+    <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
+    <ProjectReference Include="..\QueryFarm.VgiRpc\QueryFarm.VgiRpc.csproj" />
+  </ItemGroup>
+
+</Project>

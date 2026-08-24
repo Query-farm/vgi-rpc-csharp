@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>OpenTelemetry tracing/metrics instrumentation for vgi-rpc via ActivitySource/Meter. (Scaffold only — see Milestone 16 in docs/roadmap.md.)</Description>
+    <RootNamespace>QueryFarm.VgiRpc.OpenTelemetry</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="OpenTelemetry" />
+    <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
+    <ProjectReference Include="..\QueryFarm.VgiRpc\QueryFarm.VgiRpc.csproj" />
+  </ItemGroup>
+
+</Project>

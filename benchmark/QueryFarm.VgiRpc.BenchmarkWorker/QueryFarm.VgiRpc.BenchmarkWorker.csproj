@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <Description>Runnable benchmark worker, mirroring ConformanceWorker's CLI shape. Not published.</Description>
+    <RootNamespace>QueryFarm.VgiRpc.BenchmarkWorker</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\QueryFarm.VgiRpc.Benchmark\QueryFarm.VgiRpc.Benchmark.csproj" />
+  </ItemGroup>
+
+</Project>

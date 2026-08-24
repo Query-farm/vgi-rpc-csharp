@@ -1,0 +1,22 @@
+<Solution>
+  <Folder Name="/benchmark/">
+    <Project Path="benchmark/QueryFarm.VgiRpc.Benchmark/QueryFarm.VgiRpc.Benchmark.csproj" />
+    <Project Path="benchmark/QueryFarm.VgiRpc.BenchmarkWorker/QueryFarm.VgiRpc.BenchmarkWorker.csproj" />
+  </Folder>
+  <Folder Name="/conformance/">
+    <Project Path="conformance/QueryFarm.VgiRpc.Conformance/QueryFarm.VgiRpc.Conformance.csproj" />
+    <Project Path="conformance/QueryFarm.VgiRpc.ConformanceWorker/QueryFarm.VgiRpc.ConformanceWorker.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/QueryFarm.VgiRpc.Gcs/QueryFarm.VgiRpc.Gcs.csproj" />
+    <Project Path="src/QueryFarm.VgiRpc.Http.OAuth/QueryFarm.VgiRpc.Http.OAuth.csproj" />
+    <Project Path="src/QueryFarm.VgiRpc.Http/QueryFarm.VgiRpc.Http.csproj" />
+    <Project Path="src/QueryFarm.VgiRpc.OpenTelemetry/QueryFarm.VgiRpc.OpenTelemetry.csproj" />
+    <Project Path="src/QueryFarm.VgiRpc.S3/QueryFarm.VgiRpc.S3.csproj" />
+    <Project Path="src/QueryFarm.VgiRpc.Sentry/QueryFarm.VgiRpc.Sentry.csproj" />
+    <Project Path="src/QueryFarm.VgiRpc/QueryFarm.VgiRpc.csproj" />
+  </Folder>
+  <Folder Name="/test/">
+    <Project Path="test/QueryFarm.VgiRpc.Tests/QueryFarm.VgiRpc.Tests.csproj" />
+  </Folder>
+</Solution>

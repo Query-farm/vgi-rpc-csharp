@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <Description>Runnable conformance worker: registers IConformanceService and speaks vgi-rpc's wire protocol over stdio/--unix/--tcp/--http. Driven by test_csharp_conformance.py. Not published.</Description>
+    <RootNamespace>QueryFarm.VgiRpc.ConformanceWorker</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\QueryFarm.VgiRpc.Conformance\QueryFarm.VgiRpc.Conformance.csproj" />
+  </ItemGroup>
+
+</Project>

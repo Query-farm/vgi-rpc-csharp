@@ -1,0 +1,40 @@
+# .NET
+bin/
+obj/
+out/
+artifacts/
+*.user
+*.suo
+.vs/
+.vscode/*
+!.vscode/extensions.json
+
+# Test results / coverage
+test-results/
+TestResults/
+*.trx
+coverage/
+*.coverage
+*.coveragexml
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+
+# Conformance / Python tooling (a Python pytest driver lives in this repo)
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.hypothesis/
+
+# Vendored Arrow format files fetched by scripts/fetch-arrow-format.sh
+tools/arrow-format/*.fbs
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Rider
+.idea/
