@@ -49,10 +49,16 @@ public sealed class RpcServer
     /// </summary>
     public async Task<bool> ServeOneAsync(IRpcTransport transport, CancellationToken cancellationToken = default)
     {
-        using var reader = new WireReader(transport.Input);
         AnnotatedBatch? request;
         try
         {
+            // Deliberately NOT `using var` held for the rest of this method: a stream method
+            // opens a second WireReader over the same transport.Input for its tick/exchange
+            // loop, and some Stream implementations (observed with NetworkStream — Unix/TCP
+            // sockets) read ahead into an internal buffer, silently stealing bytes that belong
+            // to that second reader if the first one is still alive when it's constructed.
+            // Disposing this one immediately after the request is fully read avoids that.
+            using var reader = new WireReader(transport.Input);
             _ = await reader.ReadSchemaAsync(cancellationToken).ConfigureAwait(false);
             request = await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false);
         }

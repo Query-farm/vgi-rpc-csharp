@@ -32,7 +32,20 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       (`RpcConnection`/`RpcClientProxy` — not needed for conformance, since `vgi-rpc-test` drives
       our server with its own Python client, but needed before any C#-to-C# streaming test can
       be written).
-- [ ] **M4 — Non-HTTP transports + CLI.** stdio (default), `--unix`, `--tcp`; graceful shutdown.
+- [~] **M4 — Non-HTTP transports + CLI (in progress).** `SocketTransport` (Unix domain socket +
+      TCP, both server accept-loop and client dial) plus the conformance worker's `--unix`/
+      `--tcp [host:]port` CLI flags (printing the `UNIX:<path>`/`PORT:<port>` discovery lines
+      the porting guide's contract expects) and SIGTERM/SIGINT graceful shutdown. Unary calls
+      are confirmed working over both transports against the real `vgi-rpc-test` tool (verified
+      manually — not yet in the automated gate, which still targets stdio only) and covered by
+      `SocketTransportTests`. **Known gap**: a *streaming* call over `--unix`/`--tcp`, driven by
+      the real Python client specifically, hangs — a from-scratch minimal C# reproduction (server
+      + client both in-process, same `RpcServer`/`WireWriter`/`WireReader` code, same message
+      sequence) completes correctly over the same transport, which rules out the server-side
+      dispatch/wire-framing logic and points at something specific to the Python client's
+      socket-file-object handling for the tick/exchange loop that pipe/stdio doesn't exercise.
+      Not yet root-caused; flagged for follow-up rather than blocking further progress, since it
+      doesn't affect the stdio-based conformance gate this repo's CI runs.
 - [ ] **M5 — Access log.** JSONL sink matching `access_log.schema.json`.
 - [ ] **M6 — Plain HTTP.** Kestrel server + `HttpClient` client; stream state tokens (AES-GCM).
 - [ ] **M7 — Response caps, capability headers, content-encoding negotiation.**
