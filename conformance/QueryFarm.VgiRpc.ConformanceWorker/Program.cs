@@ -83,8 +83,10 @@ if (options.Http)
     //    X-Conformance-Auth-Reason — a conformance-fixture affordance per
     //    docs/unauthorized-spec.md §7.1, never something a production server would honour from a
     //    request. Mirrors the reference repo's tests/serve_conformance_http_auth.py.
-    RpcHttpEndpoints.AuthenticateDelegate? authenticate = options.ConformanceAuthReason
-        ? context =>
+    RpcHttpEndpoints.AuthenticateDelegate? authenticate;
+    if (options.ConformanceAuthReason)
+    {
+        authenticate = context =>
         {
             var requested = context.Request.Headers["X-Conformance-Auth-Reason"].ToString();
             var reason = requested switch
@@ -105,8 +107,18 @@ if (options.Http)
             }
 
             throw new InvalidOperationException("conformance fixture: no matching X-Conformance-Auth-Reason");
-        }
-    : null;
+        };
+    }
+    else if (options.ConformanceMtlsSubject)
+    {
+        // MtlsAuth.FromSubject() reads X-SSL-Client-Cert (URL-encoded PEM) and accepts any
+        // certificate, using its Subject CN as principal — see docs/roadmap.md M9 mTLS.
+        authenticate = MtlsAuth.FromSubject();
+    }
+    else
+    {
+        authenticate = null;
+    }
     app.MapVgiRpc(server, maxResponseBytes: 65536, authenticate: authenticate, proxyHint: options.ConformanceProxyHint, corsPolicyName: corsEnabled ? CorsPolicyName : null);
     await app.StartAsync(cts.Token);
     var boundPort = new Uri(app.Urls.First()).Port;
@@ -176,6 +188,7 @@ internal sealed class CliOptions
     public bool ConformanceAuthReason { get; private init; }
     public string? ConformanceProxyHint { get; private init; }
     public IReadOnlyList<string> ConformanceCorsOrigins { get; private init; } = [];
+    public bool ConformanceMtlsSubject { get; private init; }
 
     public static CliOptions? Parse(string[] args)
     {
@@ -189,6 +202,7 @@ internal sealed class CliOptions
         var conformanceAuthReason = false;
         string? conformanceProxyHint = null;
         var conformanceCorsOrigins = new List<string>();
+        var conformanceMtlsSubject = false;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -227,6 +241,13 @@ internal sealed class CliOptions
                     // (see docs/roadmap.md M9 CORS): a production server picks its own origin list.
                     conformanceCorsOrigins.Add(RequireValue(args, ref i, "--conformance-cors-origin"));
                     break;
+                case "--conformance-mtls-subject":
+                    // Installs MtlsAuth.FromSubject() (PEM-in-header, X-SSL-Client-Cert) as the
+                    // authenticate delegate — a conformance-fixture affordance for verifying mTLS
+                    // end-to-end (see docs/roadmap.md M9 mTLS), not something a production server
+                    // hardcodes this way.
+                    conformanceMtlsSubject = true;
+                    break;
                 default:
                     Console.Error.WriteLine($"Unknown argument: {args[i]}");
                     return null;
@@ -254,6 +275,7 @@ internal sealed class CliOptions
             ConformanceAuthReason = conformanceAuthReason,
             ConformanceProxyHint = conformanceProxyHint,
             ConformanceCorsOrigins = conformanceCorsOrigins,
+            ConformanceMtlsSubject = conformanceMtlsSubject,
         };
     }
 

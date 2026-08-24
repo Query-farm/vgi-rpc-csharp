@@ -174,6 +174,45 @@ def cors_worker(worker_binary: Path) -> Iterator[str]:
     yield from _spawn_http_worker(worker_binary, "--conformance-cors-origin", _CORS_ALLOWED_ORIGIN)
 
 
+@pytest.fixture
+def mtls_worker(worker_binary: Path) -> Iterator[str]:
+    """A --http worker with MtlsAuth.FromSubject() installed as the authenticate delegate — see
+    docs/roadmap.md M9 mTLS and Mtls.cs's --conformance-mtls-subject flag."""
+    yield from _spawn_http_worker(worker_binary, "--conformance-mtls-subject")
+
+
+def _make_test_cert(cn: str = "test-client", *, days_valid: int = 365, not_before_offset=None) -> str:
+    """Generates a self-signed certificate and returns it URL-encoded PEM, ready to drop straight
+    into an X-SSL-Client-Cert header — mirrors the canonical Python repo's
+    tests/test_mtls.py::_make_test_cert + _cert_to_header exactly (same shape, so the two repos'
+    mTLS coverage stays comparable)."""
+    import datetime
+    from urllib.parse import quote
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    now = datetime.datetime.now(datetime.UTC)
+    not_before = now + not_before_offset if not_before_offset else now - datetime.timedelta(hours=1)
+    not_after = not_before + datetime.timedelta(days=days_valid)
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(not_before)
+        .not_valid_after(not_after)
+        .sign(key, hashes.SHA256())
+    )
+    pem = cert.public_bytes(serialization.Encoding.PEM).decode()
+    return quote(pem)
+
+
 def _run_vgi_rpc_test(cmd: str | None = None, *, url: str | None = None, filter_pattern: str | None = None) -> dict:
     assert (cmd is None) != (url is None), "pass exactly one of cmd or url"
     args = [
@@ -550,4 +589,72 @@ class TestCors:
         resp = httpx2.get(f"{http_worker}/health", headers={"Origin": _CORS_ALLOWED_ORIGIN})
         assert "Access-Control-Allow-Origin" not in resp.headers
         assert "Cross-Origin-Resource-Policy" not in resp.headers
+
+
+# M9 (see docs/roadmap.md): mTLS, like CORS, has no vgi-rpc-test coverage — it depends on a
+# reverse-proxy-injected header the CLI never sends. Verified directly against real certificates
+# generated with `cryptography` (the same library the canonical Python repo's own
+# tests/test_mtls.py uses), driving Mtls.cs's real PEM parsing / X509Certificate2 code path.
+class TestMtls:
+    """Verifies Mtls.cs's MtlsAuth.FromSubject() against a worker started with
+    --conformance-mtls-subject (see the mtls_worker fixture)."""
+
+    def test_valid_cert_is_accepted(self, mtls_worker: str) -> None:
+        import httpx2
+
+        resp = httpx2.post(
+            f"{mtls_worker}/echo_string",
+            content=_arrow_request_body("echo_string"),
+            headers={
+                "Content-Type": "application/vnd.apache.arrow.stream",
+                "X-SSL-Client-Cert": _make_test_cert("rpc-client"),
+            },
+        )
+        assert resp.status_code == 200
+
+    def test_missing_header_is_proxy_required(self, mtls_worker: str) -> None:
+        import httpx2
+
+        resp = httpx2.post(
+            f"{mtls_worker}/echo_string",
+            content=_arrow_request_body("echo_string"),
+            headers={"Content-Type": "application/vnd.apache.arrow.stream"},
+        )
+        assert resp.status_code == 401
+        assert resp.headers["VGI-Auth-Reason"] == "proxy_required"
+
+    def test_malformed_header_is_invalid_credential(self, mtls_worker: str) -> None:
+        import httpx2
+        from urllib.parse import quote
+
+        resp = httpx2.post(
+            f"{mtls_worker}/echo_string",
+            content=_arrow_request_body("echo_string"),
+            headers={
+                "Content-Type": "application/vnd.apache.arrow.stream",
+                "X-SSL-Client-Cert": quote("not a certificate"),
+            },
+        )
+        assert resp.status_code == 401
+        assert resp.headers["VGI-Auth-Reason"] == "invalid_credential"
+
+    def test_expired_cert_is_still_accepted_without_check_expiry(self, mtls_worker: str) -> None:
+        """MtlsAuth.FromSubject() defaults checkExpiry=false (matching Python's default) — an
+        expired-but-otherwise-well-formed certificate is still accepted unless the operator opts
+        into expiry checking."""
+        import datetime
+
+        import httpx2
+
+        resp = httpx2.post(
+            f"{mtls_worker}/echo_string",
+            content=_arrow_request_body("echo_string"),
+            headers={
+                "Content-Type": "application/vnd.apache.arrow.stream",
+                "X-SSL-Client-Cert": _make_test_cert(
+                    "expired-client", days_valid=0, not_before_offset=datetime.timedelta(days=-2)
+                ),
+            },
+        )
+        assert resp.status_code == 200
         assert "VGI-Auth-Proxy-Required" not in resp.headers

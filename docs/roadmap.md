@@ -258,7 +258,7 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       sessions' principal binding (M10), proxy proof (M11), token introspection (M12) — this
       milestone was scoped to the shared machinery + the one concrete authenticator, not the
       full auth surface.
-- [~] **M9 — mTLS + JWT, CORS (JWT + CORS landed).** `QueryFarm.VgiRpc.Http.OAuth.JwtAuth.Create` builds
+- [x] **M9 — mTLS + JWT + CORS (all landed).** `QueryFarm.VgiRpc.Http.OAuth.JwtAuth.Create` builds
       an `AuthenticateDelegate` that validates Bearer JWTs against a JWKS endpoint discovered via
       OIDC discovery (`{issuer}/.well-known/openid-configuration`), with automatic key-set
       refresh on an unrecognised `kid` — `Microsoft.IdentityModel.Protocols.ConfigurationManager<T>`
@@ -317,8 +317,44 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       CORS headers at all (opt-in verified both ways). All 25 Python conformance tests and 70
       xunit tests (18+46+6 core/Http/OAuth) pass; manually curl-verified against a running worker
       before writing the automated tests, matching the established habit.
-      Remaining for M9: mTLS (forwarded-cert authentication — `vgi_rpc/http/_mtls.py`'s ~461
-      lines, not yet started).
+      mTLS landed as `QueryFarm.VgiRpc.Http.MtlsAuth`, a full port of `vgi_rpc/http/_mtls.py`'s
+      two header conventions: PEM-in-header (`FromHeader`/`FromFingerprint`/`FromSubject`, parsing
+      URL-encoded PEM from `X-SSL-Client-Cert`/`X-Amzn-Mtls-Clientcert`-style headers) and XFCC
+      (`Xfcc`, parsing Envoy's `x-forwarded-client-cert` structured header — comma-separated
+      elements respecting quoted values, semicolon-separated key=value pairs, URL-decoded
+      `Cert`/`URI`/`By` fields). One real simplification over Python: Python gates the PEM path
+      behind an optional `cryptography` dependency (`pip install vgi-rpc[mtls]`) because it has no
+      certificate parser in its standard library; .NET's `X509Certificate2.CreateFromPem` ships in
+      the base class library, so this port needed no extra package at all. Absent header → always
+      `AuthReason.ProxyRequired` (never `MissingCredential` — the header is the proxy's to inject,
+      so its absence points at the deployment, not the caller, matching Python's documented
+      rationale exactly), matching Python's anti-oracle posture but going one step further at the
+      PEM-parse-failure site: Python's own example interpolates the raw parse exception into the
+      rejection detail; this port deliberately doesn't (`docs/unauthorized-spec.md` §2, same
+      posture already established for JWT). One real architecture divergence, documented at the
+      top of `Mtls.cs`: Python's authenticate callbacks return an `AuthContext` that flows into RPC
+      dispatch (so a method body can read `ctx.auth.principal`); this port's
+      `AuthenticateDelegate` is (per M8/M9's established shape) a pure accept/reject gate with no
+      context-propagation mechanism yet, so the extracted `MtlsIdentity` is stashed on
+      `HttpContext.Items` instead — reachable by application code sharing the same
+      `HttpContext`, but not yet wired into `RpcServer` dispatch itself (a gap to close if/when
+      M10's sticky-session principal-binding needs real propagation). Verified with 33 new
+      `MtlsTests` xunit tests (a direct, near-1:1 port of `tests/test_mtls.py`'s coverage: valid
+      cert acceptance, missing/malformed header, custom header name, validate-callback rejection,
+      `checkExpiry` in both directions, fingerprint lookup incl. unsupported-algorithm-at-
+      construction-time, subject-CN extraction with an allow-list, and the full `_parse_xfcc`
+      table — quoted commas/semicolons, multi-value `DNS`, URL-decoded `URI`/`By`/`Cert`, empty
+      header, `select_element` first-vs-last), plus 4 new `TestMtls` httpx2 tests in
+      `test_csharp_conformance.py` against a real worker started with a new
+      `--conformance-mtls-subject` flag, using real certificates generated with the `cryptography`
+      library (the same one Python's own test suite uses) — accepted valid cert, `proxy_required`
+      on a missing header, `invalid_credential` on a malformed one, and (since `FromSubject`
+      defaults `checkExpiry=false`, matching Python) an expired-but-otherwise-well-formed
+      certificate still accepted unless the operator opts in. Manually curl-verified against a
+      running worker (both `echo_string` accepted-with-cert and rejected-without) before writing
+      the automated tests. All 29 Python conformance tests and 103 xunit tests (18+79+6
+      core/Http/OAuth) pass, both locally and in a linux/amd64 Docker container matching CI's
+      ubuntu-latest path. M9 is now fully complete.
 - [ ] **M10 — Sticky sessions.**
 - [ ] **M11 — Proxy proof.**
 - [ ] **M12 — Token introspection.**
