@@ -61,24 +61,34 @@ public sealed class MethodNotImplementedException : RpcException
     }
 }
 
-/// <summary>A sticky-session call referenced a session that no longer exists (evicted/expired).</summary>
+/// <summary>A sticky-session call referenced a session that no longer exists (evicted/expired).
+/// Named "...Exception" per C# convention (see this file's own class doc comment), but its wire
+/// <see cref="RpcException.ErrorType"/> is the literal string <c>"SessionLostError"</c> — unlike
+/// <see cref="ProtocolVersionException"/>/<see cref="MethodNotImplementedException"/> above (whose
+/// wire type is this port's own class name), this one is part of the closed cross-language error
+/// vocabulary every port's sticky-session implementation is expected to spell identically on the
+/// wire (mirrors Python's own <c>SessionLostError</c> class name — confirmed against the Rust
+/// port, which hardcodes the same literal string despite its own internal type being named
+/// differently). See <c>docs/sticky-sessions-spec.md</c> §6 and docs/roadmap.md M10.</summary>
 public sealed class SessionLostException : RpcException
 {
     public const string ErrorKindConst = Wire.MetadataKeys.ErrorKinds.SessionLost;
 
     public SessionLostException(string message)
-        : base(nameof(SessionLostException), message, errorKind: ErrorKindConst)
+        : base("SessionLostError", message, errorKind: ErrorKindConst)
     {
     }
 }
 
-/// <summary>The server is shutting down and is no longer accepting new sticky sessions/calls.</summary>
+/// <summary>The server is shutting down and is no longer accepting new sticky sessions/calls. See
+/// <see cref="SessionLostException"/>'s doc comment — same "wire type is a fixed cross-language
+/// string, not this class's own C# name" reasoning applies here (Python: <c>ServerDrainingError</c>).</summary>
 public sealed class ServerDrainingException : RpcException
 {
     public const string ErrorKindConst = Wire.MetadataKeys.ErrorKinds.ServerDraining;
 
     public ServerDrainingException(string message)
-        : base(nameof(ServerDrainingException), message, errorKind: ErrorKindConst)
+        : base("ServerDrainingError", message, errorKind: ErrorKindConst)
     {
     }
 }

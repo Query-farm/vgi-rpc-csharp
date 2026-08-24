@@ -45,11 +45,22 @@ public sealed class LogMessage
             formattedTrace = formattedTrace[..MaxTracebackChars] + "\n… <traceback truncated>";
         }
 
-        var summary = $"{exception.GetType().Name}: {exception.Message}";
+        // Prefer RpcException.ErrorType over the raw CLR type name when the exception carries
+        // one explicitly. Python has no equivalent override — it always uses type(exc).__name__ —
+        // because its exception classes are named to already match the cross-language wire
+        // vocabulary (SessionLostError, ServerDrainingError, ...). C# convention names the same
+        // classes "...Exception" (SessionLostException, ServerDrainingException), so those two
+        // spellings diverge unless RpcException-derived types can state their wire name
+        // explicitly — which is exactly what the ErrorType constructor parameter is for (see
+        // SessionLostException/ServerDrainingException in QueryFarm.VgiRpc.Errors). Plain
+        // Exception subclasses (e.g. the conformance worker's ValueError/RuntimeError/TypeError)
+        // are unaffected — GetType().Name already matches Python's built-in name for those.
+        var wireTypeName = exception is RpcException { ErrorType.Length: > 0 } rpcException ? rpcException.ErrorType : exception.GetType().Name;
+        var summary = $"{wireTypeName}: {exception.Message}";
 
         var extra = new Dictionary<string, object?>
         {
-            ["exception_type"] = exception.GetType().Name,
+            ["exception_type"] = wireTypeName,
             ["exception_message"] = exception.Message,
             ["traceback"] = formattedTrace,
         };

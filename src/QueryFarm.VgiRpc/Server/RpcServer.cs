@@ -332,7 +332,13 @@ public sealed class RpcServer
             }
 
             var collector = new OutputCollector(outputSchema);
-            var turnContext = info.HasContextParameter ? new StreamCallContext(collector) : null;
+            // Always construct a per-turn context — unlike invokeContext above (which mirrors
+            // whether the RPC method that RETURNED the stream declared a ctx parameter, since
+            // that gates a reflection-invoke arg count), StreamState.ProcessAsync's own signature
+            // always accepts an ICallContext?, independent of the constructor method's shape. A
+            // StreamState reading ctx.Session (sticky sessions, docs/roadmap.md M10) needs a real
+            // object here even when the constructor method itself took no ctx param.
+            var turnContext = new StreamCallContext(collector);
             try
             {
                 if (stream.InputSchema is { FieldsList.Count: > 0 } declaredInputSchema)

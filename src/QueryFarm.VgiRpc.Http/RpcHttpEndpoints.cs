@@ -109,15 +109,22 @@ public static class RpcHttpEndpoints
     /// three-piece wiring (service registration + <c>app.UseCors()</c>/
     /// <see cref="Cors.UseVgiRpcCorsExtras"/> + this parameter) and why it can't collapse into
     /// one call here.</param>
-    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null, long? maxResponseBytes = null, AuthenticateDelegate? authenticate = null, string? proxyHint = null, string? corsPolicyName = null)
+    /// <param name="sticky">Enables sticky sessions when non-null (see
+    /// <see cref="StickySessionRegistry"/> and <c>docs/sticky-sessions-spec.md</c>) — construct
+    /// one, keep the reference for <see cref="StickySessionRegistry.Drain"/>/
+    /// <see cref="StickySessionRegistry.Shutdown"/>, and pass it here. <see langword="null"/>
+    /// (the default) leaves the wire byte-identical to the non-sticky framework, matching
+    /// Python's opt-in default. Session tokens are sealed with the same <paramref name="tokenKey"/>
+    /// stream call-id tokens use, matching Python's single shared <c>token_key</c>.</param>
+    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null, long? maxResponseBytes = null, AuthenticateDelegate? authenticate = null, string? proxyHint = null, string? corsPolicyName = null, StickySessionRegistry? sticky = null)
     {
         tokenKey ??= RandomNumberGenerator.GetBytes(32);
         var registry = new StreamCallRegistry();
         var health = endpoints.MapMethods($"{prefix}/health", ["GET", "HEAD"], (HttpContext context) => HandleHealthAsync(server, context));
-        var capabilities = endpoints.MapMethods($"{prefix}/health", ["OPTIONS"], (HttpContext context) => HandleCapabilitiesAsync(context, maxResponseBytes));
-        var unary = endpoints.MapPost($"{prefix}/{{method}}", (string method, HttpContext context) => HandleUnaryAsync(server, method, context, compressionLevel, maxResponseBytes, authenticate, proxyHint));
-        var init = endpoints.MapPost($"{prefix}/{{method}}/init", (string method, HttpContext context) => HandleStreamInitAsync(server, method, context, compressionLevel, tokenKey, registry, authenticate, proxyHint));
-        var exchange = endpoints.MapPost($"{prefix}/{{method}}/exchange", (string method, HttpContext context) => HandleStreamExchangeAsync(server, method, context, compressionLevel, tokenKey, registry, maxResponseBytes, authenticate, proxyHint));
+        var capabilities = endpoints.MapMethods($"{prefix}/health", ["OPTIONS"], (HttpContext context) => HandleCapabilitiesAsync(context, maxResponseBytes, sticky));
+        var unary = endpoints.MapPost($"{prefix}/{{method}}", (string method, HttpContext context) => HandleUnaryAsync(server, method, context, compressionLevel, maxResponseBytes, authenticate, proxyHint, sticky, tokenKey));
+        var init = endpoints.MapPost($"{prefix}/{{method}}/init", (string method, HttpContext context) => HandleStreamInitAsync(server, method, context, compressionLevel, tokenKey, registry, authenticate, proxyHint, sticky));
+        var exchange = endpoints.MapPost($"{prefix}/{{method}}/exchange", (string method, HttpContext context) => HandleStreamExchangeAsync(server, method, context, compressionLevel, tokenKey, registry, maxResponseBytes, authenticate, proxyHint, sticky));
         if (corsPolicyName is not null)
         {
             health.RequireCors(corsPolicyName);
@@ -127,7 +134,75 @@ public static class RpcHttpEndpoints
             exchange.RequireCors(corsPolicyName);
         }
 
+        if (sticky is not null)
+        {
+            var session = endpoints.MapDelete($"{prefix}/{StickySessions.SessionEndpoint}", (HttpContext context) => HandleSessionDeleteAsync(server, sticky, tokenKey, context));
+            if (corsPolicyName is not null)
+            {
+                session.RequireCors(corsPolicyName);
+            }
+        }
+
         return endpoints;
+    }
+
+    /// <summary>
+    /// <c>DELETE {prefix}/__session__</c> — idempotent best-effort session teardown (spec §2.5).
+    /// A valid token whose entry is found returns 204 after closing it; everything else (missing
+    /// header, malformed token, AAD mismatch, server_id mismatch, registry miss) returns 200 —
+    /// so a stale or stolen token cannot be used to probe whether a session exists.
+    /// </summary>
+    private static async Task HandleSessionDeleteAsync(RpcServer server, StickySessionRegistry sticky, byte[] tokenKey, HttpContext context)
+    {
+        var tokenHeader = context.Request.Headers[StickySessions.SessionHeader].ToString();
+        if (string.IsNullOrEmpty(tokenHeader))
+        {
+            context.Response.StatusCode = StatusCodes.Status200OK;
+            return;
+        }
+
+        var identity = AuthIdentity.GetFrom(context);
+        string tokenServerId;
+        byte[] sessionId;
+        try
+        {
+            var aad = StickySessions.ComputeAad(identity);
+            (tokenServerId, sessionId, _) = StickySessions.OpenToken(tokenHeader.Trim(), tokenKey, aad);
+        }
+        catch (SessionLostException)
+        {
+            context.Response.StatusCode = StatusCodes.Status200OK;
+            return;
+        }
+
+        if (tokenServerId != server.ServerId)
+        {
+            context.Response.StatusCode = StatusCodes.Status200OK;
+            return;
+        }
+
+        var principalKey = StickySessions.PrincipalKey(identity);
+        var entry = sticky.TryGet(sessionId, principalKey);
+        if (entry is null)
+        {
+            context.Response.StatusCode = StatusCodes.Status200OK;
+            return;
+        }
+
+        // Serialize with any in-flight call on this session — matches the concurrency contract
+        // documented for dispatch (spec §5).
+        await entry.Lock.WaitAsync(context.RequestAborted).ConfigureAwait(false);
+        try
+        {
+            sticky.Close(sessionId);
+        }
+        finally
+        {
+            entry.Lock.Release();
+        }
+
+        context.Response.Headers[StickySessions.SessionCloseHeader] = "true";
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
     }
 
     /// <summary>Rejects a request by throwing <see cref="AuthFailure"/> (any other exception is
@@ -164,6 +239,81 @@ public static class RpcHttpEndpoints
         }
     }
 
+    /// <summary>Outcome of resolving any presented <c>VGI-Session</c> token before dispatch.
+    /// <see cref="Entry"/>/<see cref="SessionIdHex"/> are non-null only when a token was
+    /// presented and resolved successfully (a "resume"); both are null on a fresh request with no
+    /// token, whether or not the method goes on to open one.</summary>
+    private readonly record struct StickyResolution(StickySessionEntry? Entry, string? SessionIdHex, bool AcceptOpens, string PrincipalKey, AuthIdentity? Identity);
+
+    /// <summary>
+    /// Resolves any presented <see cref="StickySessions.SessionHeader"/> token against
+    /// <paramref name="sticky"/>'s registry — the HTTP-dispatch-time half of the sticky wire
+    /// contract shared by unary calls and every stream turn (spec §2.1, §3). On resolution
+    /// failure, writes the §6-shaped <see cref="SessionLostException"/> response itself and
+    /// returns <see langword="null"/> — callers must return immediately in that case, exactly
+    /// like every other <c>ErrorResultAsync</c> short-circuit in this class.
+    /// </summary>
+    private static async Task<StickyResolution?> TryResolveStickyAsync(StickySessionRegistry? sticky, RpcServer server, string method, HttpContext context, Schema errorSchema, ContentEncoding? encoding, bool useCustomHeader, int? compressionLevel, byte[] tokenKey, string methodType)
+    {
+        var identity = AuthIdentity.GetFrom(context);
+        var principalKey = StickySessions.PrincipalKey(identity);
+        var acceptOpens = string.Equals(context.Request.Headers[StickySessions.SessionAcceptHeader].ToString().Trim(), "true", StringComparison.OrdinalIgnoreCase);
+
+        if (sticky is null)
+        {
+            return new StickyResolution(null, null, acceptOpens, principalKey, identity);
+        }
+
+        var tokenHeader = context.Request.Headers[StickySessions.SessionHeader].ToString();
+        if (string.IsNullOrEmpty(tokenHeader))
+        {
+            return new StickyResolution(null, null, acceptOpens, principalKey, identity);
+        }
+
+        try
+        {
+            var aad = StickySessions.ComputeAad(identity);
+            var (tokenServerId, sessionId, _) = StickySessions.OpenToken(tokenHeader.Trim(), tokenKey, aad);
+            if (tokenServerId != server.ServerId)
+            {
+                // Wrong worker — without a cross-worker replay mechanism (out of scope, spec §3),
+                // the only honest answer is "this session is gone", even though the token might
+                // be perfectly valid on its owning worker.
+                throw new SessionLostException("session token was issued by a different worker (server_id mismatch)");
+            }
+
+            var entry = sticky.TryGet(sessionId, principalKey) ?? throw new SessionLostException("session not found, expired, or principal mismatch");
+            return new StickyResolution(entry, Convert.ToHexStringLower(sessionId), acceptOpens, principalKey, identity);
+        }
+        catch (SessionLostException exc)
+        {
+            await ErrorResultAsync(server, method, exc, StatusCodes.Status500InternalServerError, errorSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: methodType).ConfigureAwait(false);
+            return null;
+        }
+    }
+
+    /// <summary>Writes the sticky response headers a completed dispatch produced (spec §2.2) and
+    /// releases the per-session lock if <paramref name="state"/> held one. Call this exactly once
+    /// after dispatch, in a <c>finally</c>-equivalent position, regardless of whether dispatch
+    /// threw — <see cref="StickyCallState.ReleaseLockIfHeld"/> is idempotent.</summary>
+    private static void FinishSticky(HttpContext context, StickySessionRegistry sticky, StickyCallState state)
+    {
+        state.ReleaseLockIfHeld();
+        if (state.MintedToken is not null)
+        {
+            context.Response.Headers[StickySessions.SessionHeader] = state.MintedToken;
+            foreach (var (name, value) in sticky.EchoHeaders)
+            {
+                context.Response.Headers[$"{StickySessions.EchoHeaderPrefix}{name}"] = value;
+            }
+        }
+
+        if (state.Closed)
+        {
+            context.Response.Headers[StickySessions.SessionCloseHeader] = "true";
+        }
+    }
+
     /// <summary>
     /// <c>OPTIONS {prefix}/health</c> — capability discovery, matching
     /// <c>vgi_rpc.http._client.http_capabilities</c>'s contract exactly: <c>VGI-Max-Response-Bytes</c>
@@ -172,7 +322,7 @@ public static class RpcHttpEndpoints
     /// and <c>VGI-Supported-Encodings</c> naming the codecs this server can actually produce for
     /// responses (see <see cref="s_producibleEncodings"/> — gzip only, for now).
     /// </summary>
-    private static Task HandleCapabilitiesAsync(HttpContext context, long? maxResponseBytes)
+    private static Task HandleCapabilitiesAsync(HttpContext context, long? maxResponseBytes, StickySessionRegistry? sticky)
     {
         var headers = context.Response.Headers;
         if (maxResponseBytes is { } cap)
@@ -183,6 +333,18 @@ public static class RpcHttpEndpoints
         headers["VGI-Externalization-Enabled"] = "false";
         headers["VGI-Upload-URL-Support"] = "false";
         headers["VGI-Supported-Encodings"] = "gzip";
+        if (sticky is not null)
+        {
+            // Spec §2.3 — advertised on every response when sticky is enabled; OPTIONS /health is
+            // the cheapest discovery point (http_capabilities() reads exactly this endpoint).
+            headers[StickySessions.StickyEnabledHeader] = "true";
+            headers[StickySessions.StickyDefaultTtlHeader] = ((long)sticky.DefaultTtl.TotalSeconds).ToString();
+            if (sticky.EchoHeaders.Count > 0)
+            {
+                headers[StickySessions.StickyEchoHeadersHeader] = string.Join(",", sticky.EchoHeaders.Keys);
+            }
+        }
+
         context.Response.StatusCode = StatusCodes.Status200OK;
         return Task.CompletedTask;
     }
@@ -208,7 +370,7 @@ public static class RpcHttpEndpoints
         return context.Response.Body.WriteAsync(body, context.RequestAborted).AsTask();
     }
 
-    private static async Task HandleUnaryAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint)
+    private static async Task HandleUnaryAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky, byte[] tokenKey)
     {
         if (await TryRejectUnauthenticatedAsync(context, authenticate, proxyHint).ConfigureAwait(false))
         {
@@ -318,40 +480,64 @@ public static class RpcHttpEndpoints
             return;
         }
 
+        var stickyResolution = await TryResolveStickyAsync(sticky, server, method, context, info.ResultSchema, encoding, useCustomHeader, compressionLevel, tokenKey, "unary").ConfigureAwait(false);
+        if (stickyResolution is null)
+        {
+            return; // error response already written
+        }
+
+        var stickyState = sticky is not null
+            ? new StickyCallState(sticky, stickyResolution.Value.Entry, stickyResolution.Value.SessionIdHex, stickyResolution.Value.AcceptOpens, stickyResolution.Value.PrincipalKey, stickyResolution.Value.Identity, server.ServerId, tokenKey)
+            : null;
+        if (stickyResolution.Value.Entry is not null)
+        {
+            await stickyResolution.Value.Entry.Lock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+
         var start = Stopwatch.GetTimestamp();
         var status = "ok";
         var errorType = "";
         var errorMessage = "";
-        var callContext = info.HasContextParameter ? new BufferedHttpCallContext() : null;
+        var callContext = info.HasContextParameter ? new BufferedHttpCallContext(stickyState) : null;
 
         var responseBuffer = new MemoryStream();
-        await using (var writer = new WireWriter(responseBuffer, info.ResultSchema))
+        try
         {
-            try
+            await using (var writer = new WireWriter(responseBuffer, info.ResultSchema))
             {
-                var result = await info.InvokeAsync(server.Implementation, args, callContext).ConfigureAwait(false);
-                if (callContext is not null)
+                try
                 {
-                    foreach (var logMessage in callContext.Buffered)
+                    var result = await info.InvokeAsync(server.Implementation, args, callContext).ConfigureAwait(false);
+                    if (callContext is not null)
                     {
-                        await writer.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(info.ResultSchema), logMessage.AddToMetadata()), cancellationToken).ConfigureAwait(false);
+                        foreach (var logMessage in callContext.Buffered)
+                        {
+                            await writer.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(info.ResultSchema), logMessage.AddToMetadata()), cancellationToken).ConfigureAwait(false);
+                        }
                     }
-                }
 
-                var resultBatch = info.ResultSchema.FieldsList.Count == 0
-                    ? ValueCodec.EmptyRow(info.ResultSchema)
-                    : ValueCodec.BuildRow(info.ResultSchema, [result]);
-                await writer.WriteBatchAsync(new AnnotatedBatch(resultBatch, null), cancellationToken).ConfigureAwait(false);
+                    var resultBatch = info.ResultSchema.FieldsList.Count == 0
+                        ? ValueCodec.EmptyRow(info.ResultSchema)
+                        : ValueCodec.BuildRow(info.ResultSchema, [result]);
+                    await writer.WriteBatchAsync(new AnnotatedBatch(resultBatch, null), cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception exc)
+                {
+                    var actual = Unwrap(exc);
+                    status = "error";
+                    errorType = actual.GetType().Name;
+                    errorMessage = actual.Message;
+                    var metadata = LogMessage.FromException(actual).AddToMetadata();
+                    await writer.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(info.ResultSchema), metadata), cancellationToken).ConfigureAwait(false);
+                }
             }
-            catch (Exception exc)
-            {
-                var actual = Unwrap(exc);
-                status = "error";
-                errorType = actual.GetType().Name;
-                errorMessage = actual.Message;
-                var metadata = LogMessage.FromException(actual).AddToMetadata();
-                await writer.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(info.ResultSchema), metadata), cancellationToken).ConfigureAwait(false);
-            }
+        }
+        finally
+        {
+            // Release regardless of outcome — a method that raises inside a sticky session must
+            // not wedge the per-session lock for subsequent calls (spec §5, and the conformance
+            // group's own test_session_survives_method_exception).
+            stickyState?.ReleaseLockIfHeld();
         }
 
         // Hard wire-body cap — checked post-flush since building the buffer is free. On overshoot,
@@ -379,6 +565,11 @@ public static class RpcHttpEndpoints
             context.Response.Headers[RpcErrorHeader] = "true";
         }
 
+        if (stickyState is not null)
+        {
+            FinishSticky(context, sticky!, stickyState);
+        }
+
         await WriteBytesAsync(context, StatusCodes.Status200OK, responseBuffer.ToArray(), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
     }
 
@@ -394,7 +585,7 @@ public static class RpcHttpEndpoints
     /// happens via <see cref="HandleStreamExchangeAsync"/> — which the client's generic init-response
     /// reader handles correctly regardless (it just sees zero data batches this turn).
     /// </summary>
-    private static async Task HandleStreamInitAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry, AuthenticateDelegate? authenticate, string? proxyHint)
+    private static async Task HandleStreamInitAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky)
     {
         if (await TryRejectUnauthenticatedAsync(context, authenticate, proxyHint).ConfigureAwait(false))
         {
@@ -480,8 +671,22 @@ public static class RpcHttpEndpoints
             return;
         }
 
+        var stickyResolution = await TryResolveStickyAsync(sticky, server, method, context, s_emptySchema, encoding, useCustomHeader, compressionLevel, tokenKey, "stream").ConfigureAwait(false);
+        if (stickyResolution is null)
+        {
+            return; // error response already written
+        }
+
+        var stickyState = sticky is not null
+            ? new StickyCallState(sticky, stickyResolution.Value.Entry, stickyResolution.Value.SessionIdHex, stickyResolution.Value.AcceptOpens, stickyResolution.Value.PrincipalKey, stickyResolution.Value.Identity, server.ServerId, tokenKey)
+            : null;
+        if (stickyResolution.Value.Entry is not null)
+        {
+            await stickyResolution.Value.Entry.Lock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+
         var start = Stopwatch.GetTimestamp();
-        var invokeContext = info.HasContextParameter ? new BufferedHttpCallContext() : null;
+        var invokeContext = info.HasContextParameter ? new BufferedHttpCallContext(stickyState) : null;
 
         IRpcStream stream;
         try
@@ -491,6 +696,7 @@ public static class RpcHttpEndpoints
         }
         catch (Exception exc)
         {
+            stickyState?.ReleaseLockIfHeld();
             var actual = Unwrap(exc);
             await ErrorResultAsync(server, method, actual, StatusCodes.Status500InternalServerError, s_emptySchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
@@ -549,6 +755,11 @@ public static class RpcHttpEndpoints
         }
 
         EmitAccessLog(server, info.WireName, "stream", "ok", "", "", start, StatusCodes.Status200OK, callKey);
+        if (stickyState is not null)
+        {
+            FinishSticky(context, sticky!, stickyState);
+        }
+
         await WriteBytesAsync(context, StatusCodes.Status200OK, responseBuffer.ToArray(), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
     }
 
@@ -575,7 +786,7 @@ public static class RpcHttpEndpoints
     /// (unlike accumulate-until-cap) trivially supporting mid-stream cancel — see
     /// <see cref="StreamCallRegistry"/>'s doc comment for the same simplification's rationale.
     /// </summary>
-    private static async Task HandleStreamExchangeAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint)
+    private static async Task HandleStreamExchangeAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky)
     {
         if (await TryRejectUnauthenticatedAsync(context, authenticate, proxyHint).ConfigureAwait(false))
         {
@@ -697,8 +908,34 @@ public static class RpcHttpEndpoints
             }
         }
 
+        // Sticky is re-resolved fresh on every turn, exactly like Python's middleware — each
+        // /exchange call is its own HTTP request, so the token (if any) is re-validated from
+        // scratch and the per-session lock is acquired and released within this one turn only,
+        // never held across turns (spec §5's "same-session calls serialize" is about concurrent
+        // requests, not about a producer/exchange stream's own successive turns).
+        var stickyResolution = await TryResolveStickyAsync(sticky, server, method, context, outputSchema, encoding, useCustomHeader, compressionLevel, tokenKey, "stream").ConfigureAwait(false);
+        if (stickyResolution is null)
+        {
+            return; // error response already written
+        }
+
+        var stickyState = sticky is not null
+            ? new StickyCallState(sticky, stickyResolution.Value.Entry, stickyResolution.Value.SessionIdHex, stickyResolution.Value.AcceptOpens, stickyResolution.Value.PrincipalKey, stickyResolution.Value.Identity, server.ServerId, tokenKey)
+            : null;
+        if (stickyResolution.Value.Entry is not null)
+        {
+            await stickyResolution.Value.Entry.Lock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+
         var collector = new OutputCollector(outputSchema);
-        var turnContext = info.HasContextParameter ? new StreamHttpCallContext(collector) : null;
+        // Always construct a per-turn context, not gated on info.HasContextParameter (that flag
+        // reflects whether the RPC method that RETURNED the stream declared a ctx parameter —
+        // relevant only to that method's own reflection-invoke arg count, in HandleStreamInitAsync
+        // above). StreamState.ProcessAsync's own signature always accepts an ICallContext?, so a
+        // StreamState reading ctx.Session (sticky sessions) needs a real object here regardless of
+        // whether the constructor method itself took a ctx param — mirrors the same fix in
+        // RpcServer.ServeStreamAsync's own turnContext construction.
+        var turnContext = new StreamHttpCallContext(collector, stickyState);
         Exception? turnException = null;
         try
         {
@@ -709,9 +946,23 @@ public static class RpcHttpEndpoints
             turnException = Unwrap(exc);
         }
 
+        // Release regardless of outcome — a turn that raises must not wedge the per-session lock
+        // for the next turn or a concurrent call on the same session (spec §5, and the
+        // conformance group's test_session_survives_method_exception).
+        stickyState?.ReleaseLockIfHeld();
+
         if (turnException is not null)
         {
             registry.Remove(callKey);
+            // A session opened earlier in this same turn stays open even though the turn itself
+            // failed afterward — the registry entry is real regardless — so the minted-token /
+            // closed headers still apply, matching Python's process_response (which emits them
+            // unconditionally on req_succeeded=False too).
+            if (stickyState is not null)
+            {
+                FinishSticky(context, sticky!, stickyState);
+            }
+
             await ErrorResultAsync(server, method, turnException, StatusCodes.Status500InternalServerError, outputSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
             return;
         }
@@ -787,11 +1038,21 @@ public static class RpcHttpEndpoints
             }
 
             EmitAccessLog(server, info.WireName, "stream", "error", "RuntimeError", overshoot.Message, start, StatusCodes.Status200OK, callKey);
+            if (stickyState is not null)
+            {
+                FinishSticky(context, sticky!, stickyState);
+            }
+
             await WriteBytesAsync(context, StatusCodes.Status200OK, responseBuffer.ToArray(), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
             return;
         }
 
         EmitAccessLog(server, info.WireName, "stream", "ok", "", "", start, StatusCodes.Status200OK, callKey);
+        if (stickyState is not null)
+        {
+            FinishSticky(context, sticky!, stickyState);
+        }
+
         await WriteBytesAsync(context, StatusCodes.Status200OK, responseBuffer.ToArray(), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
     }
 
@@ -937,20 +1198,163 @@ public static class RpcHttpEndpoints
     /// shape (duplicated rather than shared since that one isn't part of the core assembly's
     /// public/internal surface).
     /// </summary>
-    private sealed class BufferedHttpCallContext : Server.ICallContext
+    private sealed class BufferedHttpCallContext(StickyCallState? sticky = null) : Server.ICallContext
     {
         public List<LogMessage> Buffered { get; } = [];
 
         public void EmitLog(VgiLogLevel level, string message, IReadOnlyDictionary<string, object?>? extra = null) =>
             Buffered.Add(new LogMessage(level, message, extra));
+
+        public object? Session => sticky?.CurrentState;
+
+        public string? SessionId => sticky?.SessionIdHex;
+
+        public void OpenSession(object state, TimeSpan? ttl = null) => RequireSticky().Open(state, ttl);
+
+        public void CloseSession() => RequireSticky().Close();
+
+        private StickyCallState RequireSticky() => sticky ?? throw new RpcException("RuntimeError", "sticky sessions not available on this transport");
     }
 
     /// <summary>Forwards a stream turn's <see cref="Server.ICallContext.EmitLog"/> calls into
     /// that turn's <see cref="OutputCollector"/> — the HTTP-transport analog of
     /// <see cref="RpcServer"/>'s private nested type of the same shape.</summary>
-    private sealed class StreamHttpCallContext(OutputCollector collector) : Server.ICallContext
+    private sealed class StreamHttpCallContext(OutputCollector collector, StickyCallState? sticky = null) : Server.ICallContext
     {
         public void EmitLog(VgiLogLevel level, string message, IReadOnlyDictionary<string, object?>? extra = null) =>
             collector.ClientLog(level, message, extra);
+
+        public object? Session => sticky?.CurrentState;
+
+        public string? SessionId => sticky?.SessionIdHex;
+
+        public void OpenSession(object state, TimeSpan? ttl = null) => RequireSticky().Open(state, ttl);
+
+        public void CloseSession() => RequireSticky().Close();
+
+        private StickyCallState RequireSticky() => sticky ?? throw new RpcException("RuntimeError", "sticky sessions not available on this transport");
+    }
+
+    /// <summary>
+    /// Bridges <see cref="Server.ICallContext.OpenSession"/>/<see cref="Server.ICallContext.CloseSession"/>
+    /// to <see cref="StickySessionRegistry"/> for one HTTP request — constructed once per
+    /// dispatch (unary, stream init, or one exchange/producer turn) by
+    /// <see cref="TryResolveStickyAsync"/>'s caller, read back afterward by
+    /// <see cref="FinishSticky"/>. The C#-explicit-object analog of Python's contextvar-driven
+    /// <c>_StickySink</c> — see <see cref="StickySessions"/>'s class doc comment.
+    /// </summary>
+    private sealed class StickyCallState
+    {
+        private readonly StickySessionRegistry _registry;
+        private readonly StickySessionEntry? _resumedEntry;
+        private readonly bool _acceptOpens;
+        private readonly string _principalKey;
+        private readonly AuthIdentity? _identity;
+        private readonly string _serverId;
+        private readonly byte[] _tokenKey;
+        private bool _lockReleased;
+        private bool _sessionActive;
+
+        public StickyCallState(StickySessionRegistry registry, StickySessionEntry? resumedEntry, string? resumedSessionIdHex, bool acceptOpens, string principalKey, AuthIdentity? identity, string serverId, byte[] tokenKey)
+        {
+            _registry = registry;
+            _resumedEntry = resumedEntry;
+            _acceptOpens = acceptOpens;
+            _principalKey = principalKey;
+            _identity = identity;
+            _serverId = serverId;
+            _tokenKey = tokenKey;
+            if (resumedEntry is not null)
+            {
+                CurrentState = resumedEntry.State;
+                SessionIdHex = resumedSessionIdHex;
+                _sessionActive = true;
+            }
+        }
+
+        /// <summary>The session state visible to <see cref="Server.ICallContext.Session"/> —
+        /// either the resumed entry's state, the just-opened state, or <see langword="null"/>
+        /// after <see cref="Close"/> or when no session is bound.</summary>
+        public object? CurrentState { get; private set; }
+
+        public string? SessionIdHex { get; private set; }
+
+        /// <summary>Non-null once <see cref="Open"/> has minted a token this request — the
+        /// caller writes it onto the <see cref="StickySessions.SessionHeader"/> response header.</summary>
+        public string? MintedToken { get; private set; }
+
+        /// <summary>Set once <see cref="Close"/> has run — the caller emits
+        /// <see cref="StickySessions.SessionCloseHeader"/>.</summary>
+        public bool Closed { get; private set; }
+
+        public void Open(object state, TimeSpan? ttl)
+        {
+            if (!_acceptOpens)
+            {
+                // Wire type "RuntimeError" — matches Python, which raises its own built-in
+                // RuntimeError here (see ICallContext.OpenSession's doc comment).
+                throw new RpcException(
+                    "RuntimeError",
+                    $"client did not opt in to sticky sessions (missing {StickySessions.SessionAcceptHeader}: true header)");
+            }
+
+            if (_sessionActive)
+            {
+                throw new RpcException("RuntimeError", "a sticky session is already active for this request");
+            }
+
+            var (sessionId, expiresAt) = _registry.Open(state, ttl, _principalKey); // may throw ServerDrainingException
+            var aad = StickySessions.ComputeAad(_identity);
+            MintedToken = StickySessions.SealToken(_serverId, sessionId, expiresAt.ToUnixTimeSeconds(), _tokenKey, aad);
+            SessionIdHex = Convert.ToHexStringLower(sessionId);
+            CurrentState = state;
+            _sessionActive = true;
+        }
+
+        public void Close()
+        {
+            if (SessionIdHex is null)
+            {
+                return; // idempotent no-op — matches Python (no bound session ⇒ close is a no-op)
+            }
+
+            var idHex = SessionIdHex;
+            // Release the per-session lock now (if this call resumed via a presented token) so a
+            // caller that immediately re-presents the same session_id — impossible today since
+            // the token is stale after this — never double-waits behind FinishSticky's own
+            // idempotent release.
+            ReleaseLockIfHeld();
+            _registry.Close(Convert.FromHexString(idHex));
+            Closed = true;
+            CurrentState = null;
+            _sessionActive = false;
+            SessionIdHex = null;
+        }
+
+        /// <summary>Releases the resumed entry's per-session lock exactly once, whether called
+        /// from <see cref="Close"/> (early release, mid-dispatch) or from
+        /// <see cref="FinishSticky"/> (the normal end-of-dispatch release) — idempotent so calling
+        /// both is always safe.</summary>
+        public void ReleaseLockIfHeld()
+        {
+            if (_resumedEntry is null || _lockReleased)
+            {
+                return;
+            }
+
+            _lockReleased = true;
+            try
+            {
+                _resumedEntry.Lock.Release();
+            }
+            catch (SemaphoreFullException)
+            {
+                // Already released — shouldn't happen given the guard above, but matches Python's
+                // own contextlib.suppress(RuntimeError) belt-and-braces.
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
     }
 }

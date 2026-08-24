@@ -355,7 +355,108 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       the automated tests. All 29 Python conformance tests and 103 xunit tests (18+79+6
       core/Http/OAuth) pass, both locally and in a linux/amd64 Docker container matching CI's
       ubuntu-latest path. M9 is now fully complete.
-- [ ] **M10 — Sticky sessions.**
+- [x] **M10 — Sticky sessions.** Full port of `vgi_rpc/http/server/_sticky.py` (873 lines) —
+      `QueryFarm.VgiRpc.Http.StickySessions`/`StickySessionRegistry`/`StickySessionEntry`, plus new
+      HTTP-only members on `ICallContext` (`Session`, `SessionId`, `OpenSession`, `CloseSession`).
+      Flagged in the original plan as "the single largest implementation surface" — it was, by a
+      wide margin, of everything landed so far.
+      **Architecture note (the one genuine simplification over Python):** Python threads sticky
+      state through `contextvars` because its WSGI middleware has no explicit per-call context
+      object to carry it on — `CallContext` reads ambient state a Falcon middleware installed
+      before dispatch. This port's `ICallContext` is already an explicit object threaded through
+      every `InvokeAsync` call (unary and per stream turn, since M2/M3), so `RpcHttpEndpoints`
+      just resolves the session, builds a concrete `StickyCallState`-backed call context carrying
+      it directly, and reads back what the method did (minted token / closed flag) after the call
+      returns — no contextvar equivalent needed at all. Every other piece is a faithful, no-shortcuts
+      port: the AEAD session-token envelope (same plaintext frame layout as Python's — `created_at |
+      server_id_len | server_id | session_id(12) | expires_at` — sealed via the existing AES-GCM
+      `Crypto.Seal`/`Open` from M6, with the exact same AAD prefix `vgi_rpc.state.v4\0` +
+      principal-binding tail spec §3.1 requires: `\x01 domain \0 principal` for authenticated
+      requests, the literal `\0anonymous` tail otherwise — cross-principal replay fails at the AEAD
+      layer, not via a post-decrypt comparison); the per-session `SemaphoreSlim`-based lock
+      (spec §5's "same-session calls serialize, different-session calls run in parallel" — `SemaphoreSlim`
+      rather than a reentrant `lock`/`Monitor` because dispatch is `await`-based and holding a `lock`
+      across an `await` is unsafe); the reaper (`System.Threading.Timer` ticking every 1s, evicting
+      + disposing past-TTL entries); drain (`StickySessionRegistry.Drain()`/`Shutdown()` — exposed
+      directly on the registry the caller already constructs and holds, which is simpler than
+      Python's `drain_handle(app)` indirection — Python needs to *find* the middleware instance
+      post-hoc by walking Falcon's middleware list because Falcon's app construction doesn't hand
+      back named component references; this port's caller already has the registry, no lookup
+      needed); echo headers (`VGI-Echo-<name>`, emitted once on the session-opening response only);
+      the `DELETE {prefix}/__session__` idempotent-teardown endpoint (200 on every failure mode —
+      missing header, malformed/tampered/wrong-principal/wrong-worker token, registry miss — so a
+      stolen token can't be used to probe session existence); and capability advertisement
+      (`VGI-Sticky-Enabled`/`VGI-Sticky-Default-TTL`/`VGI-Sticky-Echo-Headers` on `OPTIONS /health`).
+      **Two real bugs found and fixed along the way, both pre-existing (not introduced by this
+      milestone) and both now covered by regression tests:**
+      1. `RpcServer.ServeStreamAsync` (pipe/unix/tcp) and `RpcHttpEndpoints.HandleStreamExchangeAsync`
+         (HTTP) both gated per-turn `ICallContext` construction (`turnContext`) on
+         `info.HasContextParameter` — the *outer* RPC method's own signature flag (correctly used to
+         decide whether to append `ctx` to that method's own reflection-invoke args). But
+         `StreamState.ProduceAsync`/`ExchangeAsync`/`ProcessAsync` always accept an `ICallContext?`
+         as part of their own fixed abstract contract, independent of whether the constructor method
+         itself declared a `ctx` parameter — so a producer/exchange method with no `ctx` parameter of
+         its own (like `stream_session_counter(long count)`) silently got a `null` turn context,
+         and any `StreamState` reading `ctx.Session` inside `ProduceAsync`/`ExchangeAsync` saw nothing
+         bound even with a live, correctly-resolved session. Latent until now because no existing
+         `StreamState` implementation ever read `ctx` at all (the logging ones call
+         `output.ClientLog(...)` directly instead) — `SessionCounterProducerState`/
+         `SessionCounterExchangeState` are the first to actually need it. Fixed by always
+         constructing the per-turn context in both places.
+      2. `error_type` on the wire silently diverged from Python for any `RpcException`-derived type
+         whose C# class name doesn't literally match Python's class name — which is *every* one,
+         since C# convention names them `...Exception` (`SessionLostException`) while Python
+         names them `...Error` (`SessionLostError`), and `LogMessage.FromException` (both this
+         milestone's addition and — it turns out — every prior exception-serialization path) used
+         `exception.GetType().Name` unconditionally, never consulting the already-existing
+         `RpcException.ErrorType` property at all. Confirmed against the Rust port, which
+         hardcodes the literal wire string `"SessionLostError"` for exactly this reason despite its
+         own internal type being named differently — this is a real, intentional part of the
+         cross-language error vocabulary, not a Python-ism this port can ignore. Fixed by having
+         `LogMessage.FromException` prefer `RpcException.ErrorType` when set (plain `Exception`
+         subclasses — e.g. the conformance worker's `ValueError`/`RuntimeError`/`TypeError`,
+         already correctly named to match Python's builtins — are unaffected), and by giving
+         `SessionLostException`/`ServerDrainingException` (plus the three framework-level
+         `RuntimeError`-on-the-wire cases sticky sessions itself introduces — no
+         `VGI-Session-Accept: true`, "session already active", "not available on this transport",
+         all raised by `ICallContext`/`StickyCallState` as `RpcException("RuntimeError", ...)`
+         rather than a CLR `InvalidOperationException`, since Python raises its own built-in
+         `RuntimeError` for exactly these three cases) their correct wire type strings explicitly.
+      Conformance methods added: `open_counter`/`increment_counter`/`close_counter` (unary
+      lifecycle) and `stream_session_counter`/`exchange_session_counter` (producer/exchange streams
+      sharing the session across the multi-request shape of streaming RPCs) — a faithful port of
+      Python's own `_StickyCounter`/`SessionCounterProducerState`/`SessionCounterExchangeState`.
+      Wired into the conformance worker via `--conformance-sticky` (enables sticky, default 300s
+      TTL, the fixed `x-vgi-conformance-echo: conformance-fixed-marker` echo header), `--sticky-ttl
+      <seconds>` (overrides TTL, implies sticky), `--sticky-auth` (installs an `X-Conformance-Principal`
+      → `AuthIdentity` authenticate delegate — absent header stays anonymous, never rejected — and
+      implies sticky), `--token-key <hex>` (fixed AEAD key, shared by stream-call and session
+      tokens), and a test-only `/__test_drain__` admin endpoint (`POST` sets the drain flag,
+      `DELETE` clears it — not part of the real wire surface, mirrors the reference repo's own
+      `_TestDrainResource`).
+      Verified by directly collecting the canonical Python repo's own `TestSticky` conformance
+      group (`from vgi_rpc.conformance._pytest_suite import TestSticky`) into
+      `test_csharp_conformance.py` — all 19 tests, unmodified, including the three failure-path
+      fixtures spec §9.1 requires a sticky-claiming port to supply (`conformance_http_sticky_short_ttl_port`,
+      `conformance_http_sticky_peer_ports` — two workers sharing one AEAD key with distinct
+      `server_id`s, `conformance_http_sticky_auth_port`) — rather than hand-written httpx2 tests
+      like M8/M9's CORS/mTLS groups, since (unlike those) a complete canonical suite already existed
+      to import. This is a different, higher-fidelity verification pattern than every other HTTP
+      milestone so far and worth preferring whenever `vgi_rpc.conformance._pytest_suite` has a
+      matching group. Plus 20 new `StickySessionsTests` xunit tests covering the registry lifecycle
+      (open/resume/close/expire/drain/shutdown, wrong-principal and unknown-session misses,
+      suppressed-dispose-exception) and token codec (round-trip, malformed/wrong-key/wrong-AAD
+      rejection, AAD determinism) directly. All 48 Python conformance tests and 123 xunit tests
+      (18+99+6 core/Http/OAuth) pass, both locally and in linux/amd64 Docker containers matching
+      CI's ubuntu-latest + Python 3.13 + pip install "vgi-rpc[conformance,http]" pytest cryptography
+      path exactly. Manually verified end-to-end against the real Python client
+      (`http_connect`/`with_session_token()`) before writing the automated tests, per the
+      established habit — this is also how the two bugs above were actually found.
+      Not implemented: cookie emission and a pluggable session store (both explicitly out of scope
+      per spec §10); client-side sticky-session support in this port's own `RpcClientProxy` (not
+      needed for conformance — every sticky test drives this port's HTTP *server* from the real
+      Python client, never the reverse — but a future C#-to-C# deployment wanting sticky sessions
+      would need it added).
 - [ ] **M11 — Proxy proof.**
 - [ ] **M12 — Token introspection.**
 - [ ] **M13 — External storage (S3/GCS).**

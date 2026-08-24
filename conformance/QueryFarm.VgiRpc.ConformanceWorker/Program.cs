@@ -7,6 +7,7 @@
 using System.Runtime.InteropServices;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using QueryFarm.VgiRpc.AccessLog;
@@ -115,11 +116,62 @@ if (options.Http)
         // certificate, using its Subject CN as principal — see docs/roadmap.md M9 mTLS.
         authenticate = MtlsAuth.FromSubject();
     }
+    else if (options.StickyAuth)
+    {
+        // Maps X-Conformance-Principal to an AuthIdentity — absent header stays anonymous (never
+        // rejected, so unauthenticated probes like GET /health keep working), matching the
+        // canonical Python repo's tests/serve_conformance_http.py::_principal_from_header
+        // exactly. Backs TestSticky::test_cross_principal_replay_rejected (spec §9.1).
+        authenticate = context =>
+        {
+            var principal = context.Request.Headers["X-Conformance-Principal"].ToString();
+            if (!string.IsNullOrEmpty(principal))
+            {
+                AuthIdentity.SetOn(context, "conformance", principal);
+            }
+
+            return Task.CompletedTask;
+        };
+    }
     else
     {
         authenticate = null;
     }
-    app.MapVgiRpc(server, maxResponseBytes: 65536, authenticate: authenticate, proxyHint: options.ConformanceProxyHint, corsPolicyName: corsEnabled ? CorsPolicyName : null);
+
+    var tokenKey = options.TokenKeyHex is { } hex ? Convert.FromHexString(hex) : null;
+    StickySessionRegistry? sticky = null;
+    if (options.ConformanceSticky)
+    {
+        // Fixed marker the canonical TestSticky::test_echo_header_round_trip conformance test
+        // asserts on — real deployments substitute their own (e.g. Fly.io's fly-force-instance-id
+        // via vgi_rpc.http.fly.fly_sticky_echo_headers() or their own mapping).
+        var echoHeaders = new Dictionary<string, string> { ["x-vgi-conformance-echo"] = "conformance-fixed-marker" };
+        sticky = new StickySessionRegistry(
+            defaultTtl: options.StickyTtlSeconds is { } ttl ? TimeSpan.FromSeconds(ttl) : null,
+            echoHeaders: echoHeaders);
+    }
+
+    app.MapVgiRpc(server, maxResponseBytes: 65536, authenticate: authenticate, proxyHint: options.ConformanceProxyHint, corsPolicyName: corsEnabled ? CorsPolicyName : null, tokenKey: tokenKey, sticky: sticky);
+
+    // Test-only admin endpoint — NOT part of MapVgiRpc's real surface. Lets
+    // TestSticky::test_drain_rejects_new_opens flip the drain flag over the wire instead of
+    // sending SIGTERM (which would kill this subprocess fixture mid-test). Mirrors the canonical
+    // Python repo's tests/serve_conformance_http.py::_TestDrainResource. 404s (the route simply
+    // isn't registered) when sticky isn't enabled, which the conformance test treats as "skip".
+    if (sticky is { } stickyRegistry)
+    {
+        app.MapPost("/__test_drain__", () =>
+        {
+            stickyRegistry.Drain();
+            return Results.StatusCode(StatusCodes.Status204NoContent);
+        });
+        app.MapDelete("/__test_drain__", () =>
+        {
+            stickyRegistry.ClearDrain();
+            return Results.StatusCode(StatusCodes.Status204NoContent);
+        });
+    }
+
     await app.StartAsync(cts.Token);
     var boundPort = new Uri(app.Urls.First()).Port;
     Console.WriteLine($"PORT:{boundPort}");
@@ -189,6 +241,10 @@ internal sealed class CliOptions
     public string? ConformanceProxyHint { get; private init; }
     public IReadOnlyList<string> ConformanceCorsOrigins { get; private init; } = [];
     public bool ConformanceMtlsSubject { get; private init; }
+    public bool ConformanceSticky { get; private init; }
+    public double? StickyTtlSeconds { get; private init; }
+    public bool StickyAuth { get; private init; }
+    public string? TokenKeyHex { get; private init; }
 
     public static CliOptions? Parse(string[] args)
     {
@@ -203,6 +259,10 @@ internal sealed class CliOptions
         string? conformanceProxyHint = null;
         var conformanceCorsOrigins = new List<string>();
         var conformanceMtlsSubject = false;
+        var conformanceSticky = false;
+        double? stickyTtlSeconds = null;
+        var stickyAuth = false;
+        string? tokenKeyHex = null;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -248,6 +308,36 @@ internal sealed class CliOptions
                     // hardcodes this way.
                     conformanceMtlsSubject = true;
                     break;
+                case "--conformance-sticky":
+                    // Enables sticky sessions with the registry's default TTL (300s) — a
+                    // conformance-fixture affordance (see docs/roadmap.md M10 sticky sessions).
+                    conformanceSticky = true;
+                    break;
+                case "--sticky-ttl":
+                    // Overrides the default TTL and implies sticky is enabled — backs
+                    // TestSticky::test_expired_session_surfaces_session_lost's short-TTL fixture
+                    // (spec §9.1: conformance_http_sticky_short_ttl_port).
+                    stickyTtlSeconds = double.Parse(RequireValue(args, ref i, "--sticky-ttl"));
+                    conformanceSticky = true;
+                    break;
+                case "--sticky-auth":
+                    // Installs an authenticate delegate that maps X-Conformance-Principal to an
+                    // AuthIdentity (absent header ⇒ anonymous, never rejected) and implies sticky
+                    // is enabled — backs TestSticky::test_cross_principal_replay_rejected (spec
+                    // §9.1: conformance_http_sticky_auth_port).
+                    stickyAuth = true;
+                    conformanceSticky = true;
+                    break;
+                case "--token-key":
+                    // Hex-encoded AEAD token key shared by stream call-id tokens and sticky
+                    // session tokens (see RpcHttpEndpoints.MapVgiRpc's tokenKey parameter). Two
+                    // workers booted with the same key back
+                    // TestSticky::test_token_from_other_worker_rejected (spec §9.1:
+                    // conformance_http_sticky_peer_ports) — the two workers still mint distinct
+                    // server_id values (RpcServer.ServerId defaults to a random GUID per process),
+                    // which is what makes the rejection meaningful rather than a decrypt failure.
+                    tokenKeyHex = RequireValue(args, ref i, "--token-key");
+                    break;
                 default:
                     Console.Error.WriteLine($"Unknown argument: {args[i]}");
                     return null;
@@ -276,6 +366,10 @@ internal sealed class CliOptions
             ConformanceProxyHint = conformanceProxyHint,
             ConformanceCorsOrigins = conformanceCorsOrigins,
             ConformanceMtlsSubject = conformanceMtlsSubject,
+            ConformanceSticky = conformanceSticky,
+            StickyTtlSeconds = stickyTtlSeconds,
+            StickyAuth = stickyAuth,
+            TokenKeyHex = tokenKeyHex,
         };
     }
 

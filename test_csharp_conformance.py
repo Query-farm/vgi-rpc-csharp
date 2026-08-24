@@ -164,6 +164,65 @@ def http_auth_proxy_worker(worker_binary: Path) -> Iterator[str]:
     )
 
 
+def _spawn_http_worker_port(worker_binary: Path, *extra_args: str) -> Iterator[int]:
+    """Like _spawn_http_worker, but yields the bound port as an int — the shape the canonical
+    vgi_rpc.conformance._pytest_suite.TestSticky group's fixtures expect (it does its own
+    http://127.0.0.1:{port} URL-building internally)."""
+    gen = _spawn_http_worker(worker_binary, *extra_args)
+    url = next(gen)
+    try:
+        yield int(url.rsplit(":", 1)[1])
+    finally:
+        next(gen, None)
+
+
+# M10 (see docs/roadmap.md): sticky sessions. Unlike CORS/mTLS (no canonical pytest counterpart),
+# the reference repo ships a full TestSticky group in vgi_rpc.conformance._pytest_suite — imported
+# directly below (mirroring vgi-rpc-java/tests/test_java_conformance.py's own
+# `from vgi_rpc.conformance._pytest_suite import *` pattern, narrowed to just this one class since
+# this port doesn't implement the suite's other groups yet). Its fixtures are named
+# conformance_http_port / conformance_http_sticky_short_ttl_port / _peer_ports / _auth_port,
+# defined here rather than in the imported module (spec §9.1: a port claiming sticky support must
+# supply all three failure-path fixtures).
+@pytest.fixture
+def conformance_http_port(worker_binary: Path) -> Iterator[int]:
+    """A sticky-enabled --http worker — the TestSticky group's main fixture."""
+    yield from _spawn_http_worker_port(worker_binary, "--conformance-sticky")
+
+
+@pytest.fixture
+def conformance_http_sticky_short_ttl_port(worker_binary: Path) -> Iterator[int]:
+    """A sticky worker whose default TTL (1s) is short enough for
+    test_expired_session_surfaces_session_lost to outwait."""
+    yield from _spawn_http_worker_port(worker_binary, "--sticky-ttl", "1")
+
+
+@pytest.fixture
+def conformance_http_sticky_peer_ports(worker_binary: Path) -> Iterator[tuple[int, int]]:
+    """Two sticky workers sharing one AEAD token key, for the wrong-worker check
+    (test_token_from_other_worker_rejected). RpcServer mints a random server_id per process, so
+    the two peers differ without any extra flag — see Program.cs's --token-key comment."""
+    shared_key = "5f" * 32
+    gen_a = _spawn_http_worker_port(worker_binary, "--conformance-sticky", "--token-key", shared_key)
+    gen_b = _spawn_http_worker_port(worker_binary, "--conformance-sticky", "--token-key", shared_key)
+    port_a = next(gen_a)
+    try:
+        port_b = next(gen_b)
+        try:
+            yield port_a, port_b
+        finally:
+            next(gen_b, None)
+    finally:
+        next(gen_a, None)
+
+
+@pytest.fixture
+def conformance_http_sticky_auth_port(worker_binary: Path) -> Iterator[int]:
+    """A sticky worker that authenticates the X-Conformance-Principal header — for
+    test_cross_principal_replay_rejected."""
+    yield from _spawn_http_worker_port(worker_binary, "--sticky-auth")
+
+
 _CORS_ALLOWED_ORIGIN = "https://allowed.example.com"
 
 
@@ -658,3 +717,9 @@ class TestMtls:
         )
         assert resp.status_code == 200
         assert "VGI-Auth-Proxy-Required" not in resp.headers
+
+
+# M10: the canonical TestSticky group, collected directly against the fixtures defined above
+# (conformance_http_port et al.) — see the comment above those fixtures for why this is imported
+# rather than hand-written like TestUnauthorized/TestCors/TestMtls.
+from vgi_rpc.conformance._pytest_suite import TestSticky  # noqa: E402,F401

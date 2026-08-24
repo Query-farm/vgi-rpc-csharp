@@ -200,6 +200,43 @@ public interface IConformanceService
 
     Task<RpcStream<StreamState>> ProduceDynamicSchemaAsync(long seed, long count, bool includeStrings, bool includeFloats);
 
+    // -- Sticky Sessions (HTTP-only; capability-gated tests — see docs/roadmap.md M10) ---------
+    //
+    // Wire-protocol exercise for the sticky-session feature. The three unary methods together
+    // prove the open / resume / close lifecycle: open_counter registers a server-side counter via
+    // ctx.OpenSession, increment_counter mutates it through the session token, close_counter
+    // tears it down. Servers without sticky support throw InvalidOperationException when
+    // ctx.OpenSession is invoked (ICallContext's default implementation — see
+    // src/QueryFarm.VgiRpc/Server/ICallContext.cs), and the capability-gated TestSticky
+    // conformance group skips them entirely.
+
+    /// <summary>Opens a sticky session holding a counter; returns its initial value.</summary>
+    Task<long> OpenCounterAsync(long initial, ICallContext? ctx = null);
+
+    /// <summary>Increments the sticky session's counter; returns the post-increment value.
+    /// Requires a session opened by <see cref="OpenCounterAsync"/>; raises a plain
+    /// <c>RuntimeError</c> if no session is bound.</summary>
+    Task<long> IncrementCounterAsync(long by, ICallContext? ctx = null);
+
+    /// <summary>Closes the sticky session; returns the counter's final value before close.</summary>
+    Task<long> CloseCounterAsync(ICallContext? ctx = null);
+
+    // -- Sticky Sessions — Streaming (HTTP-only; capability-gated tests) -----------------------
+    //
+    // Producer + exchange streams that resume the sticky-session counter opened by
+    // OpenCounterAsync. Each iteration is its own HTTP request, so these exercise the sticky
+    // middleware on every turn — proving the session contract holds across the multi-request
+    // shape of streaming RPCs, not just unary calls.
+
+    /// <summary>Emits <paramref name="count"/> increments of the sticky session counter via a
+    /// producer stream. Each emitted batch carries the post-increment value of the counter bound
+    /// via <see cref="ICallContext.Session"/>.</summary>
+    Task<RpcStream<StreamState>> StreamSessionCounterAsync(long count);
+
+    /// <summary>Exchange stream adding each input <c>by</c> column to the sticky session counter.
+    /// Each turn emits a single one-row batch with the post-update counter value.</summary>
+    Task<RpcStream<StreamState>> ExchangeSessionCounterAsync();
+
     // TODO (later milestones — see docs/roadmap.md):
     //   - oversized_unary / produce_oversized_batch (HTTP response-cap conformance, M7)
     //   - echo_wide_types / echo_container_wide_types / echo_embedded_arrow / echo_deep_nested /

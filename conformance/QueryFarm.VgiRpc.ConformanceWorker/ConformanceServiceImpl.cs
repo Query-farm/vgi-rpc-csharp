@@ -218,4 +218,39 @@ public sealed class ConformanceServiceImpl : IConformanceService
         var state = new DynamicProducerState(schema, count, includeStrings, includeFloats);
         return Task.FromResult(new RpcStream<StreamState>(schema, state, Header: RichHeaderBuilder.Build(seed)));
     }
+
+    public Task<long> OpenCounterAsync(long initial, ICallContext? ctx = null)
+    {
+        ctx!.OpenSession(new StickyCounter(initial));
+        return Task.FromResult(initial);
+    }
+
+    public Task<long> IncrementCounterAsync(long by, ICallContext? ctx = null)
+    {
+        if (ctx?.Session is not StickyCounter counter)
+        {
+            throw new RuntimeError("no sticky counter bound to this request");
+        }
+
+        counter.Value += by;
+        return Task.FromResult(counter.Value);
+    }
+
+    public Task<long> CloseCounterAsync(ICallContext? ctx = null)
+    {
+        if (ctx?.Session is not StickyCounter counter)
+        {
+            throw new RuntimeError("no sticky counter bound to this request");
+        }
+
+        var final = counter.Value;
+        ctx.CloseSession();
+        return Task.FromResult(final);
+    }
+
+    public Task<RpcStream<StreamState>> StreamSessionCounterAsync(long count) =>
+        Task.FromResult(new RpcStream<StreamState>(SessionCounterSchemas.Output, new SessionCounterProducerState(count)));
+
+    public Task<RpcStream<StreamState>> ExchangeSessionCounterAsync() =>
+        Task.FromResult(new RpcStream<StreamState>(SessionCounterSchemas.Output, new SessionCounterExchangeState(), InputSchema: SessionCounterSchemas.ExchangeInput));
 }
