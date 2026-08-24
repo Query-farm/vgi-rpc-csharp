@@ -227,7 +227,37 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       `vgi_rpc/http/server/_middleware.py` before assuming more scope than that), and
       `max_request_bytes` enforcement (413 for oversized inline request bodies) if a conformance
       test ever needs it.
-- [ ] **M8 — Unauthorized-response spec + bearer auth.**
+- [x] **M8 — Unauthorized-response spec + bearer auth.** `QueryFarm.VgiRpc.Http.Unauthorized.cs`
+      implements the full cross-language contract in
+      `~/Development/vgi-rpc/docs/unauthorized-spec.md` — the generic reason-code/JSON-envelope
+      machinery every later auth feature (M9 mTLS/JWT, M11 proxy proof) reuses, built once as the
+      plan called for. `AuthReason` (the closed 6-code set), `AuthFailure` (thrown by an
+      authenticator to reject with a specific reason), `UnauthorizedResponseWriter` (headers +
+      §4.2 content negotiation — `Accept: text/html` → styled page, everything else including
+      absent/`*/*` → the §4.3 JSON envelope — + `Cache-Control: no-store` + the
+      `VGI-Auth-Proxy-Required`/`proxy_hint` pair per §5), and `BearerAuth` (the first concrete
+      authenticator: `Authorization: Bearer <token>`, `MissingCredential`/`InvalidCredential` per
+      §3). `RpcHttpEndpoints.MapVgiRpc` gained an `authenticate`/`proxyHint` seam invoked before
+      every unary/init/exchange dispatch (never `/health` — mandatory and auth-exempt per the
+      porting guide); any exception an authenticate delegate throws becomes a 401 (`AuthFailure`
+      classified by its `Reason`, anything else falls to `Unauthorized` with an empty detail —
+      never leaking the exception's own message, per §2's anti-oracle rule).
+      Verified against the real spec, not self-consistently: `~/Development/vgi-rpc/docs/unauthorized-spec.md`
+      §7's own `TestUnauthorized` table has its own pytest-fixture wiring this repo doesn't hook
+      into, so `test_csharp_conformance.py`'s `TestUnauthorized` class checks the same 12
+      properties directly against real HTTP responses (`httpx2`) from a worker started with the
+      new `--conformance-auth-reason` flag (every RPC call 401s, reason driven by the
+      conformance-only `X-Conformance-Auth-Reason` request header — mirrors the reference repo's
+      `tests/serve_conformance_http_auth.py`) and `--conformance-proxy-hint TEXT` (for the proxy-
+      note tests) — 20/20 in both the local run and the Linux x86_64 + Python 3.13 container.
+      Confirmed the two deliberately-non-requestable reasons hold: `proxy_required` never comes
+      from the request (only from `--conformance-proxy-hint` being configured at all), and an
+      unrecognised requested reason correctly falls through to `unauthorized` rather than being
+      silently accepted. 17 new `UnauthorizedTests`/`BearerAuth` xunit tests cover the response
+      writer and bearer extraction directly. Remaining for auth generally: mTLS/JWT (M9), sticky
+      sessions' principal binding (M10), proxy proof (M11), token introspection (M12) — this
+      milestone was scoped to the shared machinery + the one concrete authenticator, not the
+      full auth surface.
 - [ ] **M9 — mTLS + JWT, CORS.**
 - [ ] **M10 — Sticky sessions.**
 - [ ] **M11 — Proxy proof.**

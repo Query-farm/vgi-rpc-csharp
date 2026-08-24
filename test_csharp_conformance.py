@@ -101,16 +101,15 @@ def worker_binary() -> Path:
     return exe
 
 
-@pytest.fixture
-def http_worker(worker_binary: Path) -> Iterator[str]:
-    """Spawns the worker in --http mode and yields its base URL.
+def _spawn_http_worker(worker_binary: Path, *extra_args: str) -> Iterator[str]:
+    """Spawns the worker in --http mode (plus any extra flags) and yields its base URL.
 
     vgi-rpc-test drives HTTP over an already-running server (`--url`), unlike pipe/unix/tcp's
     spawn-and-drive `--cmd` — see `docs/porting-guide.md`'s `--http` contract: the worker prints
     exactly `PORT:<port>\\n` on stdout, then flushes, once bound.
     """
     proc = subprocess.Popen(  # noqa: S603
-        [str(worker_binary), "--http"],
+        [str(worker_binary), "--http", *extra_args],
         cwd=REPO_ROOT,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -136,6 +135,33 @@ def http_worker(worker_binary: Path) -> Iterator[str]:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+@pytest.fixture
+def http_worker(worker_binary: Path) -> Iterator[str]:
+    """A plain --http worker, no auth."""
+    yield from _spawn_http_worker(worker_binary)
+
+
+@pytest.fixture
+def http_auth_worker(worker_binary: Path) -> Iterator[str]:
+    """A --http worker whose RPC endpoints all 401, reason driven by the
+    X-Conformance-Auth-Reason request header — see docs/unauthorized-spec.md §7.1 and
+    Program.cs's --conformance-auth-reason flag."""
+    yield from _spawn_http_worker(worker_binary, "--conformance-auth-reason")
+
+
+@pytest.fixture
+def http_auth_proxy_worker(worker_binary: Path) -> Iterator[str]:
+    """Same as http_auth_worker, plus a static proxy hint — for the docs/unauthorized-spec.md §5
+    proxy-note tests."""
+    yield from _spawn_http_worker(
+        worker_binary,
+        "--conformance-auth-reason",
+        "--conformance-proxy-hint",
+        "This service only accepts requests through its configured reverse proxy, which must "
+        "set the X-Forwarded-Client-Cert header.",
+    )
 
 
 def _run_vgi_rpc_test(cmd: str | None = None, *, url: str | None = None, filter_pattern: str | None = None) -> dict:
@@ -286,3 +312,166 @@ def test_http_subset_conformant(http_worker: str) -> None:
     failed = [t for t in report["results"] if not t["passed"] and not t["skipped"]]
     assert not failed, "HTTP conformance failures:\n" + "\n".join(f"  {t['name']}: {t.get('error', '')}" for t in failed)
     assert report["passed"] > 0, "Expected at least one HTTP test to run."
+
+
+def _arrow_request_body(method: str) -> bytes:
+    """Builds a minimal valid Arrow IPC request body for `method` — enough to reach the
+    authenticate hook (which runs before method dispatch, so the body's actual content never
+    matters for these tests)."""
+    import pyarrow as pa
+    from vgi_rpc.utils import new_ipc_stream
+
+    buf = __import__("io").BytesIO()
+    schema = pa.schema([pa.field("value", pa.utf8())])
+    with new_ipc_stream(buf, schema) as writer:
+        writer.write_batch(
+            pa.RecordBatch.from_pydict({"value": ["x"]}, schema=schema),
+            custom_metadata={b"vgi_rpc.method": method.encode(), b"vgi_rpc.request_version": b"1"},
+        )
+    return buf.getvalue()
+
+
+# M8 (see docs/roadmap.md): the normative cross-language contract is
+# ~/Development/vgi-rpc/docs/unauthorized-spec.md §7's TestUnauthorized table. Its own pytest
+# fixtures (conformance_http_auth_port, etc.) are wired through that repo's own conftest
+# machinery that this repo doesn't hook into, so these check the same properties directly against
+# the real HTTP responses instead — reading straight off the spec doc rather than guessing.
+class TestUnauthorized:
+    """Mirrors docs/unauthorized-spec.md §7's TestUnauthorized table."""
+
+    def test_reason_header_present(self, http_auth_worker: str) -> None:
+        import httpx2
+
+        resp = httpx2.post(
+            f"{http_auth_worker}/echo_string",
+            content=_arrow_request_body("echo_string"),
+            headers={"Content-Type": "application/vnd.apache.arrow.stream"},
+        )
+        assert resp.status_code == 401
+        assert "VGI-Auth-Reason" in resp.headers
+
+    def test_reason_in_closed_set(self, http_auth_worker: str) -> None:
+        import httpx2
+
+        resp = httpx2.post(
+            f"{http_auth_worker}/echo_string",
+            content=_arrow_request_body("echo_string"),
+            headers={"Content-Type": "application/vnd.apache.arrow.stream"},
+        )
+        closed_set = {
+            "missing_credential",
+            "invalid_credential",
+            "expired_credential",
+            "insufficient_scope",
+            "proxy_required",
+            "unauthorized",
+        }
+        assert resp.headers["VGI-Auth-Reason"] in closed_set
+
+    def test_json_envelope_for_machine_clients(self, http_auth_worker: str) -> None:
+        import httpx2
+
+        resp = httpx2.post(
+            f"{http_auth_worker}/echo_string",
+            content=_arrow_request_body("echo_string"),
+            headers={"Content-Type": "application/vnd.apache.arrow.stream", "Accept": "*/*"},
+        )
+        assert resp.headers["content-type"].startswith("application/json")
+        body = resp.json()
+        assert body["error"] == "unauthorized"
+        assert body["reason"] == resp.headers["VGI-Auth-Reason"]
+        assert "detail" in body
+
+    def test_html_page_for_browsers(self, http_auth_worker: str) -> None:
+        import httpx2
+
+        resp = httpx2.post(
+            f"{http_auth_worker}/echo_string",
+            content=_arrow_request_body("echo_string"),
+            headers={"Content-Type": "application/vnd.apache.arrow.stream", "Accept": "text/html"},
+        )
+        assert resp.headers["content-type"].startswith("text/html")
+        assert "VGI-Auth-Reason" in resp.headers
+
+    def test_not_cached(self, http_auth_worker: str) -> None:
+        import httpx2
+
+        resp = httpx2.post(
+            f"{http_auth_worker}/echo_string",
+            content=_arrow_request_body("echo_string"),
+            headers={"Content-Type": "application/vnd.apache.arrow.stream"},
+        )
+        assert "no-store" in resp.headers.get("Cache-Control", "")
+
+    def test_no_proxy_note_without_proxy_auth(self, http_auth_worker: str) -> None:
+        import httpx2
+
+        resp = httpx2.post(
+            f"{http_auth_worker}/echo_string",
+            content=_arrow_request_body("echo_string"),
+            headers={"Content-Type": "application/vnd.apache.arrow.stream"},
+        )
+        assert "VGI-Auth-Proxy-Required" not in resp.headers
+        assert "proxy_hint" not in resp.json()
+
+    def test_proxy_note_when_proxy_required(self, http_auth_proxy_worker: str) -> None:
+        import httpx2
+
+        resp = httpx2.post(
+            f"{http_auth_proxy_worker}/echo_string",
+            content=_arrow_request_body("echo_string"),
+            headers={"Content-Type": "application/vnd.apache.arrow.stream"},
+        )
+        assert resp.headers.get("VGI-Auth-Proxy-Required") == "true"
+        assert resp.json().get("proxy_hint")
+
+    @pytest.mark.parametrize(
+        "reason", ["missing_credential", "invalid_credential", "expired_credential", "insufficient_scope"]
+    )
+    def test_requested_reason_is_honoured(self, http_auth_worker: str, reason: str) -> None:
+        import httpx2
+
+        resp = httpx2.post(
+            f"{http_auth_worker}/echo_string",
+            content=_arrow_request_body("echo_string"),
+            headers={"Content-Type": "application/vnd.apache.arrow.stream", "X-Conformance-Auth-Reason": reason},
+        )
+        assert resp.headers["VGI-Auth-Reason"] == reason
+        assert resp.json()["reason"] == reason
+
+    def test_unclassified_failure_is_unauthorized(self, http_auth_worker: str) -> None:
+        import httpx2
+
+        resp = httpx2.post(
+            f"{http_auth_worker}/echo_string",
+            content=_arrow_request_body("echo_string"),
+            headers={"Content-Type": "application/vnd.apache.arrow.stream", "X-Conformance-Auth-Reason": "no-such-reason"},
+        )
+        assert resp.headers["VGI-Auth-Reason"] == "unauthorized"
+
+    def test_reason_codes_are_distinct(self, http_auth_worker: str) -> None:
+        import httpx2
+
+        reasons = ["missing_credential", "invalid_credential", "expired_credential", "insufficient_scope"]
+        seen = set()
+        for reason in reasons:
+            resp = httpx2.post(
+                f"{http_auth_worker}/echo_string",
+                content=_arrow_request_body("echo_string"),
+                headers={"Content-Type": "application/vnd.apache.arrow.stream", "X-Conformance-Auth-Reason": reason},
+            )
+            seen.add(resp.headers["VGI-Auth-Reason"])
+        assert len(seen) == len(reasons)
+
+    def test_proxy_required_is_not_request_driven(self, http_auth_worker: str) -> None:
+        """A worker with no proxy dependency configured must never emit proxy_required, even
+        when a request explicitly asks for it — docs/unauthorized-spec.md §5/§7.1."""
+        import httpx2
+
+        resp = httpx2.post(
+            f"{http_auth_worker}/echo_string",
+            content=_arrow_request_body("echo_string"),
+            headers={"Content-Type": "application/vnd.apache.arrow.stream", "X-Conformance-Auth-Reason": "proxy_required"},
+        )
+        assert resp.headers["VGI-Auth-Reason"] != "proxy_required"
+        assert "VGI-Auth-Proxy-Required" not in resp.headers

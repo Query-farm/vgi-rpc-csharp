@@ -88,16 +88,64 @@ public static class RpcHttpEndpoints
     /// docs/roadmap.md M7). Advertised via <c>VGI-Max-Response-Bytes</c> on
     /// <c>OPTIONS {prefix}/health</c>, matching <c>vgi_rpc.http._client.http_capabilities</c>'s
     /// discovery contract.</param>
-    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null, long? maxResponseBytes = null)
+    /// <param name="authenticate">Run before every unary/init/exchange dispatch (never for
+    /// <c>/health</c> — that endpoint is mandatory and auth-exempt, matching the porting guide).
+    /// <see langword="null"/> (the default) means no authentication at all. Throw
+    /// <see cref="AuthFailure"/> to reject a request with a specific <see cref="AuthReason"/> —
+    /// see <see cref="BearerAuth"/> for a ready-made bearer-token implementation. Any other
+    /// exception is treated as <see cref="AuthReason.Unauthorized"/> with no detail (never
+    /// leaking the exception's own message to the caller).</param>
+    /// <param name="proxyHint">Non-null only on a service whose authentication depends on a
+    /// reverse proxy (<c>docs/unauthorized-spec.md</c> §5) — added to every 401 this server
+    /// produces, both as the body's <c>proxy_hint</c> field and via
+    /// <c>VGI-Auth-Proxy-Required: true</c>. There is no automatic discovery from installed
+    /// authenticators yet (Python's mTLS/proxy-proof authenticators self-declare which header
+    /// they read; this port doesn't have those yet — see docs/roadmap.md M9/M11), so this is
+    /// the spec's "direct way for an operator to state header names" fallback, always.</param>
+    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null, long? maxResponseBytes = null, AuthenticateDelegate? authenticate = null, string? proxyHint = null)
     {
         tokenKey ??= RandomNumberGenerator.GetBytes(32);
         var registry = new StreamCallRegistry();
         endpoints.MapMethods($"{prefix}/health", ["GET", "HEAD"], (HttpContext context) => HandleHealthAsync(server, context));
         endpoints.MapMethods($"{prefix}/health", ["OPTIONS"], (HttpContext context) => HandleCapabilitiesAsync(context, maxResponseBytes));
-        endpoints.MapPost($"{prefix}/{{method}}", (string method, HttpContext context) => HandleUnaryAsync(server, method, context, compressionLevel, maxResponseBytes));
-        endpoints.MapPost($"{prefix}/{{method}}/init", (string method, HttpContext context) => HandleStreamInitAsync(server, method, context, compressionLevel, tokenKey, registry));
-        endpoints.MapPost($"{prefix}/{{method}}/exchange", (string method, HttpContext context) => HandleStreamExchangeAsync(server, method, context, compressionLevel, tokenKey, registry, maxResponseBytes));
+        endpoints.MapPost($"{prefix}/{{method}}", (string method, HttpContext context) => HandleUnaryAsync(server, method, context, compressionLevel, maxResponseBytes, authenticate, proxyHint));
+        endpoints.MapPost($"{prefix}/{{method}}/init", (string method, HttpContext context) => HandleStreamInitAsync(server, method, context, compressionLevel, tokenKey, registry, authenticate, proxyHint));
+        endpoints.MapPost($"{prefix}/{{method}}/exchange", (string method, HttpContext context) => HandleStreamExchangeAsync(server, method, context, compressionLevel, tokenKey, registry, maxResponseBytes, authenticate, proxyHint));
         return endpoints;
+    }
+
+    /// <summary>Rejects a request by throwing <see cref="AuthFailure"/> (any other exception is
+    /// treated as <see cref="AuthReason.Unauthorized"/>), or returns normally to let dispatch
+    /// proceed. Mirrors Python's <c>authenticate</c> callback contract.</summary>
+    public delegate Task AuthenticateDelegate(HttpContext context);
+
+    /// <summary>Runs <paramref name="authenticate"/> if one is configured, writing a
+    /// §4-shaped 401 (see <see cref="UnauthorizedResponseWriter"/>) and returning
+    /// <see langword="true"/> on rejection — callers should return immediately when this returns
+    /// <see langword="true"/>. Returns <see langword="false"/> (nothing written) when
+    /// <paramref name="authenticate"/> is <see langword="null"/> or accepts the request.</summary>
+    private static async Task<bool> TryRejectUnauthenticatedAsync(HttpContext context, AuthenticateDelegate? authenticate, string? proxyHint)
+    {
+        if (authenticate is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            await authenticate(context).ConfigureAwait(false);
+            return false;
+        }
+        catch (AuthFailure failure)
+        {
+            await UnauthorizedResponseWriter.WriteAsync(context, failure.Reason, failure.Detail, proxyHint, context.RequestAborted).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception)
+        {
+            await UnauthorizedResponseWriter.WriteAsync(context, AuthReason.Unauthorized, "", proxyHint, context.RequestAborted).ConfigureAwait(false);
+            return true;
+        }
     }
 
     /// <summary>
@@ -144,8 +192,13 @@ public static class RpcHttpEndpoints
         return context.Response.Body.WriteAsync(body, context.RequestAborted).AsTask();
     }
 
-    private static async Task HandleUnaryAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, long? maxResponseBytes)
+    private static async Task HandleUnaryAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint)
     {
+        if (await TryRejectUnauthenticatedAsync(context, authenticate, proxyHint).ConfigureAwait(false))
+        {
+            return;
+        }
+
         var request = context.Request;
         var cancellationToken = context.RequestAborted;
         var (encoding, useCustomHeader) = ContentEncodingNegotiation.PickResponseEncoding(
@@ -325,8 +378,13 @@ public static class RpcHttpEndpoints
     /// happens via <see cref="HandleStreamExchangeAsync"/> — which the client's generic init-response
     /// reader handles correctly regardless (it just sees zero data batches this turn).
     /// </summary>
-    private static async Task HandleStreamInitAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry)
+    private static async Task HandleStreamInitAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry, AuthenticateDelegate? authenticate, string? proxyHint)
     {
+        if (await TryRejectUnauthenticatedAsync(context, authenticate, proxyHint).ConfigureAwait(false))
+        {
+            return;
+        }
+
         var request = context.Request;
         var cancellationToken = context.RequestAborted;
         var (encoding, useCustomHeader) = ContentEncodingNegotiation.PickResponseEncoding(
@@ -501,8 +559,13 @@ public static class RpcHttpEndpoints
     /// (unlike accumulate-until-cap) trivially supporting mid-stream cancel — see
     /// <see cref="StreamCallRegistry"/>'s doc comment for the same simplification's rationale.
     /// </summary>
-    private static async Task HandleStreamExchangeAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry, long? maxResponseBytes = null)
+    private static async Task HandleStreamExchangeAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint)
     {
+        if (await TryRejectUnauthenticatedAsync(context, authenticate, proxyHint).ConfigureAwait(false))
+        {
+            return;
+        }
+
         var request = context.Request;
         var cancellationToken = context.RequestAborted;
         var (encoding, useCustomHeader) = ContentEncodingNegotiation.PickResponseEncoding(
