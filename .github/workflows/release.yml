@@ -8,6 +8,9 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     environment: nuget
+    permissions:
+      id-token: write # required for NuGet Trusted Publishing's OIDC token exchange
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -26,9 +29,28 @@ jobs:
       - run: dotnet restore
       - run: dotnet build -c Release --no-restore
       - run: dotnet test -c Release --no-build
-      - run: dotnet pack -c Release --no-build -o ./artifacts/nupkg $(find src -name "*.csproj")
-      - run: >
+      # No project/solution argument: dotnet pack only accepts ONE project|solution path, so
+      # passing every src/*.csproj as separate arguments (the previous form of this line) fails
+      # with MSB1008 "Only one project can be specified" — packing the whole repo instead relies
+      # on IsPackable (false for test/conformance/benchmark, true for src/, see the per-folder
+      # Directory.Build.props files) to select exactly the 7 publishable packages.
+      - run: dotnet pack -c Release --no-build -o ./artifacts/nupkg
+
+      # Trusted Publishing (https://learn.microsoft.com/nuget/nuget-org/trusted-publishing):
+      # exchanges this job's short-lived GitHub OIDC token (id-token: write above) for a NuGet API
+      # key that's valid for 1 hour and single-use — nothing long-lived to store or rotate.
+      # Requires a Trusted Publishing policy configured on nuget.org for this exact repo owner
+      # (Query-farm) + repository (vgi-rpc-csharp) + workflow file (release.yml) + environment
+      # (nuget, matching this job's `environment:` above).
+      - name: NuGet login (OIDC → temp API key)
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
+      - name: NuGet push
+        run: >
           dotnet nuget push ./artifacts/nupkg/*.nupkg
-          --api-key ${{ secrets.NUGET_API_KEY }}
+          --api-key ${{ steps.login.outputs.NUGET_API_KEY }}
           --source https://api.nuget.org/v3/index.json
           --skip-duplicate
