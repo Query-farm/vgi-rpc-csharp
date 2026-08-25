@@ -5,6 +5,7 @@ using QueryFarm.VgiRpc.AccessLog;
 using QueryFarm.VgiRpc.Errors;
 using QueryFarm.VgiRpc.Logging;
 using QueryFarm.VgiRpc.Reflection;
+using QueryFarm.VgiRpc.Shm;
 using QueryFarm.VgiRpc.Streaming;
 using QueryFarm.VgiRpc.Transport;
 using QueryFarm.VgiRpc.Wire;
@@ -13,8 +14,8 @@ namespace QueryFarm.VgiRpc.Server;
 
 /// <summary>
 /// Dispatches RPC calls (unary and streaming) from a service interface to a plain
-/// implementation object. See docs/roadmap.md — auth and the `__describe__`/
-/// `__transport_options__` synthetic methods land in later milestones.
+/// implementation object. See docs/roadmap.md — auth and the `__describe__` synthetic method
+/// land in a later milestone; `__transport_options__` (M14) is implemented here.
 /// </summary>
 public sealed class RpcServer
 {
@@ -158,6 +159,27 @@ public sealed class RpcServer
             return true;
         }
 
+        // __transport_options__ (M14, WIRE_PROTOCOL.md §15): a built-in synthetic method,
+        // parallel to __describe__, through which client and server negotiate transport
+        // capabilities — chiefly SHM. Handled here rather than via _methods (it's not a real
+        // service method) and answered unconditionally: this port always supports the SHM side
+        // channel on every non-HTTP transport ServeAsync itself is ever invoked from (HTTP has
+        // its own, entirely separate dispatch path in QueryFarm.VgiRpc.Http that never calls
+        // this method at all — the same "exemption needs zero extra code" structural argument
+        // M11's proxy-proof note made for its own HTTP-only exemptions).
+        if (methodName == TransportOptionsMethodName)
+        {
+            var responseMetadata = new Dictionary<string, string>
+            {
+                [MetadataKeys.TransportShm] = "true",
+                [MetadataKeys.ServerId] = _serverId,
+                [MetadataKeys.RequestVersion] = MetadataKeys.CurrentRequestVersion,
+            };
+            await using var transportWriter = new WireWriter(transport.Output, s_emptySchema);
+            await transportWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(s_emptySchema), responseMetadata), cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+
         if (!_methods.TryGetValue(methodName, out var info))
         {
             var available = string.Join(", ", _methods.Keys.OrderBy(k => k, StringComparer.Ordinal));
@@ -169,6 +191,32 @@ public sealed class RpcServer
             return true;
         }
 
+        // Dynamic SHM attach (M14): a client that has negotiated SHM support advertises its
+        // segment in the request batch's own metadata (WIRE_PROTOCOL.md §11) — on every unary/
+        // stream-init request, but NOT on later stream turns (see ServeStreamAsync's own SHM
+        // handling for why that matters: the segment attached here must be threaded through and
+        // reused for a stream's whole lifetime, not re-derived per turn). Malformed metadata or a
+        // segment that fails to attach (wrong size, doesn't exist) is treated as "no SHM for this
+        // request" rather than a hard error — matches Python's _maybe_attach_shm posture exactly:
+        // a dynamically-attached segment is the caller's optimization, not a contract the server
+        // must enforce.
+        var shm = TryAttachShm(request);
+        if (shm is not null)
+        {
+            try
+            {
+                var (resolvedBatch, resolvedMetadata, release) = await ShmPointerBatch.ResolveAsync(request.Batch, request.Metadata, shm, cancellationToken).ConfigureAwait(false);
+                request = request with { Batch = resolvedBatch, Metadata = resolvedMetadata };
+                release?.Invoke();
+            }
+            catch (Exception exc)
+            {
+                shm.Dispose();
+                await WriteErrorStreamAsync(transport.Output, s_emptySchema, exc, cancellationToken).ConfigureAwait(false);
+                return true;
+            }
+        }
+
         object?[] args;
         try
         {
@@ -176,6 +224,7 @@ public sealed class RpcServer
         }
         catch (Exception exc)
         {
+            shm?.Dispose();
             await WriteErrorStreamAsync(transport.Output, info.ResultSchema, exc, cancellationToken).ConfigureAwait(false);
             await EmitAccessLogAsync(info.WireName, "unary", "error", exc.GetType().Name, exc.Message, System.Diagnostics.Stopwatch.GetTimestamp(), requestForLog: request, cancellationToken: cancellationToken).ConfigureAwait(false);
             return true;
@@ -185,9 +234,12 @@ public sealed class RpcServer
 
         if (info.Kind == RpcMethodKind.Stream)
         {
-            return await ServeStreamAsync(transport, info, args, start, cancellationToken).ConfigureAwait(false);
+            // ServeStreamAsync owns shm from here on (a stream's whole lifetime, across every
+            // turn) — it disposes it, ServeOneAsync must not.
+            return await ServeStreamAsync(transport, info, args, start, shm, cancellationToken).ConfigureAwait(false);
         }
 
+        using var shmForUnary = shm;
         await using var writer = new WireWriter(transport.Output, info.ResultSchema);
         var context = info.HasContextParameter ? new BufferedCallContext() : null;
         var status = "ok";
@@ -207,7 +259,13 @@ public sealed class RpcServer
             var resultBatch = info.ResultSchema.FieldsList.Count == 0
                 ? ValueCodec.EmptyRow(info.ResultSchema)
                 : ValueCodec.BuildRow(info.ResultSchema, [result]);
-            await writer.WriteBatchAsync(new AnnotatedBatch(resultBatch, null), cancellationToken).ConfigureAwait(false);
+            IReadOnlyDictionary<string, string>? resultMetadata = null;
+            if (shmForUnary is not null)
+            {
+                (resultBatch, resultMetadata) = await ShmPointerBatch.MaybeWriteAsync(resultBatch, null, shmForUnary, cancellationToken).ConfigureAwait(false);
+            }
+
+            await writer.WriteBatchAsync(new AnnotatedBatch(resultBatch, resultMetadata), cancellationToken).ConfigureAwait(false);
         }
         catch (Exception exc)
         {
@@ -233,8 +291,24 @@ public sealed class RpcServer
     /// <see cref="StreamState"/>/<see cref="ProducerState"/>/<see cref="ExchangeState"/> and
     /// WIRE_PROTOCOL.md's lockstep streaming section (canonical Python repo).
     /// </summary>
-    private async Task<bool> ServeStreamAsync(IRpcTransport transport, RpcMethodInfo info, object?[] args, long start, CancellationToken cancellationToken)
+    /// <param name="transport">The transport this stream's turns are read from/written to.</param>
+    /// <param name="info">Reflection info for the RPC method that constructs this stream.</param>
+    /// <param name="args">Already-extracted/resolved constructor arguments.</param>
+    /// <param name="start">Timestamp (from <see cref="System.Diagnostics.Stopwatch.GetTimestamp"/>)
+    /// the whole call began, for access-log duration.</param>
+    /// <param name="shm">The SHM segment attached from the stream-init request's own metadata
+    /// (if any), owned by this method for the stream's whole lifetime and disposed on every exit
+    /// path. Unlike unary calls, a stream's later turns never re-advertise the segment identity
+    /// (WIRE_PROTOCOL.md §11 documents the pointer keys `SHM_OFFSET_KEY`/`SHM_LENGTH_KEY` a turn
+    /// may carry, but the *segment identity* — `SHM_SEGMENT_NAME_KEY`/`SHM_SEGMENT_SIZE_KEY` — is
+    /// only ever sent once, on the request that establishes the call; confirmed against the
+    /// canonical Python client's own `_write_request`/`_write_batch` split), so this one
+    /// attachment must be reused across every subsequent turn, never re-derived per turn.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    private async Task<bool> ServeStreamAsync(IRpcTransport transport, RpcMethodInfo info, object?[] args, long start, ShmSegment? shm, CancellationToken cancellationToken)
     {
+        using var ownedShm = shm;
+
         // Required by access_log.schema.json whenever method_type=stream (no exception for the
         // error paths below) — generated up front so every exit from this method can log it.
         // Matches Python's uuid.uuid4().hex (32 lowercase hex chars).
@@ -341,6 +415,16 @@ public sealed class RpcServer
             var turnContext = new StreamCallContext(collector);
             try
             {
+                // Per-turn SHM pointer resolution (M14) — reuses the ONE segment attached at
+                // stream-init (ownedShm), never re-derived: see this method's doc comment on
+                // `shm` for why later turns don't re-advertise the segment identity.
+                if (ownedShm is not null)
+                {
+                    var (resolvedBatch, resolvedMetadata, release) = await ShmPointerBatch.ResolveAsync(inputBatch.Batch, inputBatch.Metadata, ownedShm, cancellationToken).ConfigureAwait(false);
+                    inputBatch = inputBatch with { Batch = resolvedBatch, Metadata = resolvedMetadata };
+                    release?.Invoke();
+                }
+
                 if (stream.InputSchema is { FieldsList.Count: > 0 } declaredInputSchema)
                 {
                     inputBatch = inputBatch with { Batch = ValueCodec.CoerceBatch(inputBatch.Batch, declaredInputSchema) };
@@ -366,7 +450,14 @@ public sealed class RpcServer
 
             if (collector.EmittedBatch is not null)
             {
-                await outputWriter.WriteBatchAsync(new AnnotatedBatch(collector.EmittedBatch, null), cancellationToken).ConfigureAwait(false);
+                var emitted = collector.EmittedBatch;
+                IReadOnlyDictionary<string, string>? emittedMetadata = null;
+                if (ownedShm is not null)
+                {
+                    (emitted, emittedMetadata) = await ShmPointerBatch.MaybeWriteAsync(emitted, null, ownedShm, cancellationToken).ConfigureAwait(false);
+                }
+
+                await outputWriter.WriteBatchAsync(new AnnotatedBatch(emitted, emittedMetadata), cancellationToken).ConfigureAwait(false);
             }
 
             if (collector.Finished)
@@ -488,6 +579,38 @@ public sealed class RpcServer
     }
 
     private static readonly Schema s_emptySchema = new([], metadata: null);
+
+    private const string TransportOptionsMethodName = "__transport_options__";
+
+    /// <summary>Attaches to a client-advertised SHM segment named in <paramref name="request"/>'s
+    /// own metadata (WIRE_PROTOCOL.md §11 "SHM segment identity in request metadata"), or returns
+    /// <see langword="null"/> if none was advertised or the metadata is malformed/the segment
+    /// can't be attached. Never throws — matches Python's <c>_maybe_attach_shm</c>: a caller that
+    /// advertises a bad segment just gets treated as if it advertised none at all, since SHM is
+    /// purely the caller's own optimization, never a contract this port enforces.</summary>
+    private static ShmSegment? TryAttachShm(AnnotatedBatch request)
+    {
+        var name = request.GetMetadata(MetadataKeys.ShmSegmentName);
+        if (name is null)
+        {
+            return null;
+        }
+
+        var sizeText = request.GetMetadata(MetadataKeys.ShmSegmentSize);
+        if (sizeText is null || !long.TryParse(sizeText, out var size))
+        {
+            return null;
+        }
+
+        try
+        {
+            return ShmSegment.Attach(name, size);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
 
     private static async Task WriteErrorStreamAsync(Stream output, Schema schema, Exception exception, CancellationToken cancellationToken)
     {

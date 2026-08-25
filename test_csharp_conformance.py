@@ -403,8 +403,11 @@ def _make_test_cert(cn: str = "test-client", *, days_valid: int = 365, not_befor
     return quote(pem)
 
 
-def _run_vgi_rpc_test(cmd: str | None = None, *, url: str | None = None, filter_pattern: str | None = None) -> dict:
+def _run_vgi_rpc_test(
+    cmd: str | None = None, *, url: str | None = None, filter_pattern: str | None = None, shm_size: int | None = None
+) -> dict:
     assert (cmd is None) != (url is None), "pass exactly one of cmd or url"
+    assert shm_size is None or cmd is not None, "--shm only applies to --cmd (pipe transport)"
     args = [
         sys.executable,
         "-c",
@@ -415,6 +418,8 @@ def _run_vgi_rpc_test(cmd: str | None = None, *, url: str | None = None, filter_
     ]
     if filter_pattern:
         args += ["--filter", filter_pattern]
+    if shm_size is not None:
+        args += ["--shm", str(shm_size)]
 
     result = subprocess.run(args, capture_output=True, text=True, cwd=REPO_ROOT)
     assert result.stdout, f"vgi-rpc-test produced no output.\nstderr:\n{result.stderr}"
@@ -426,6 +431,35 @@ def test_implemented_subset_fully_conformant(worker_binary: Path) -> None:
     report = _run_vgi_rpc_test(str(worker_binary), filter_pattern=IMPLEMENTED_FILTER)
     failed = [t for t in report["results"] if not t["passed"] and not t["skipped"]]
     assert not failed, "Conformance failures in the implemented subset:\n" + "\n".join(
+        f"  {t['name']}: {t.get('error', '')}" for t in failed
+    )
+    assert report["passed"] > 0, "Expected at least one test to run."
+
+
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason=(
+        "macOS's multiprocessing.shared_memory backs segments via true POSIX shm_open, not a "
+        "discoverable file path the way Linux places them at exactly /dev/shm/<name> — this "
+        "port's ShmSegment (see docs/roadmap.md M14) only implements the Linux/Windows split "
+        "CLAUDE.md actually targets, with a plain-temp-file macOS fallback that only "
+        "self-interoperates within this port, not with the reference Python client. Verified "
+        "working end-to-end against the real Python client in a linux/amd64 Docker container "
+        "before this test was added; CI's own conformance job runs on ubuntu-latest only, so "
+        "this still gates every real push."
+    ),
+)
+def test_shm_transport_implemented_subset_fully_conformant(worker_binary: Path) -> None:
+    """The same implemented subset, driven over the SHM side channel (M14, docs/roadmap.md) —
+    the client owns an 8 MiB segment and both directions (request params, unary/stream results)
+    transparently offload batches large enough to cross the offload threshold, falling back to
+    inline pipe transmission for everything smaller. Mirrors the pattern vgi-rpc-go's own
+    conformance suite established for its "shm" transport variant — the closest existing
+    precedent for exercising this over the *whole* implemented filter rather than a hand-picked
+    smoke subset."""
+    report = _run_vgi_rpc_test(str(worker_binary), filter_pattern=IMPLEMENTED_FILTER, shm_size=8 * 1024 * 1024)
+    failed = [t for t in report["results"] if not t["passed"] and not t["skipped"]]
+    assert not failed, "SHM-transport conformance failures in the implemented subset:\n" + "\n".join(
         f"  {t['name']}: {t.get('error', '')}" for t in failed
     )
     assert report["passed"] > 0, "Expected at least one test to run."

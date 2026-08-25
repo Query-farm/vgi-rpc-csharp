@@ -25,6 +25,7 @@ public static class MetadataKeys
     public const string LocationSource = "vgi_rpc.location.source";
     public const string ShmOffset = "vgi_rpc.shm_offset";
     public const string ShmLength = "vgi_rpc.shm_length";
+    public const string ShmSource = "vgi_rpc.shm_source";
     public const string ShmSegmentName = "vgi_rpc.shm_segment_name";
     public const string ShmSegmentSize = "vgi_rpc.shm_segment_size";
     public const string TransportShm = "vgi_rpc.transport.shm";

@@ -4,6 +4,7 @@ using Apache.Arrow.Types;
 using Microsoft.AspNetCore.Http;
 using QueryFarm.VgiRpc.Errors;
 using QueryFarm.VgiRpc.Http;
+using QueryFarm.VgiRpc.Wire;
 using Xunit;
 
 namespace QueryFarm.VgiRpc.Http.Tests;

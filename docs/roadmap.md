@@ -714,7 +714,111 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       and backend-agnostic; wiring an actual AWS/GCS SDK behind `IExternalStorage` is separable,
       lower-risk work with no conformance dependency, since the suite only requires *an*
       HTTP-addressable backend, not a specific one).
-- [ ] **M14 — SHM transport.**
+- [x] **M14 — SHM transport.** Full port of `vgi_rpc/shm.py` — `QueryFarm.VgiRpc.Shm.ShmAllocator`/
+      `ShmSegment`/`ShmPointerBatch`, plus `__transport_options__` negotiation and dynamic
+      per-request attach wired into `RpcServer.ServeOneAsync`/`ServeStreamAsync`. A zero-copy
+      side channel for large batches on pipe/subprocess/unix/tcp transports (never HTTP — see
+      below): a client-owned shared memory segment carries batch data directly, with only a
+      zero-row pointer batch (`vgi_rpc.shm_offset`/`vgi_rpc.shm_length`) crossing the pipe.
+      **Platform-primitive spike resolved the plan's open question, empirically, before writing
+      any allocator code**: named, backing-file-less `MemoryMappedFile.CreateOrOpen`/
+      `OpenExisting` throws `PlatformNotSupportedException` ("Named maps are not supported") on
+      Linux — confirmed with a real linux/amd64 Docker container, not inferred from docs. Verified
+      the documented fallback (`/dev/shm/<name>`-backed `MemoryMappedFile.CreateFromFile`)
+      round-trips cross-process correctly, also in Docker — this port's `ShmSegment` uses that
+      path on Linux, native `CreateOrOpen`/`OpenExisting` on Windows, and (only for this port's
+      own dev loop — not a supported target) a plain temp-file fallback elsewhere. Cross-checked
+      against a real Python `multiprocessing.shared_memory.SharedMemory` segment on Linux by
+      direct inspection: it places its own segment at exactly `/dev/shm/<name>` too (no extra
+      prefix), confirming the two languages' segments are mutually attachable, not just
+      self-consistent within this port.
+      Header format (magic/version/`data_size`/`num_allocs`/sorted `(offset,length)` allocation
+      array) is byte-for-byte per `docs/WIRE_PROTOCOL.md` §11, written via explicit
+      `BinaryPrimitives` little-endian calls rather than the view accessor's native-endianness
+      read/write methods — this port's supported runtimes are all little-endian in practice, but
+      the wire contract itself is endianness-explicit, so the code doesn't lean on that
+      coincidence. First-fit allocation with implicit coalescing (only occupied regions are
+      tracked) is a direct port of the Python allocator's own algorithm, verified with a dedicated
+      "freed gap gets reused, not appended past" test. Dictionary-encoded batches (this port's
+      enum columns) get the same two-step strip-schema-then-copy serialization Python uses,
+      verified round-tripping through a real dictionary array.
+      **`max_externalized_response_bytes`-style hard caps don't apply here** — unlike M13's
+      external storage, SHM has no size-based rejection cap in the spec; `MaybeWriteAsync` simply
+      falls back to inline transmission when a batch doesn't fit the segment's free space, which
+      is itself governed by whatever size the client (the segment's owner) chose to create.
+      **A real, load-bearing wire-behavior discovery, found only by testing real cross-language
+      interop rather than trusting the docs' own framing**: the WIRE_PROTOCOL.md §11 resolution
+      algorithm describes the server's dynamic attach as "read-only," which reads as "the server
+      may only resolve pointer batches, never write its own" — false. Direct inspection of the
+      canonical Python `_write_unary_result`/`_run_http_producer_turn`-equivalent pipe code
+      confirms the server writes its OWN results into the same client-owned segment
+      (`maybe_write_to_shm(batch, None, shm)` runs identically on both sides), and — separately,
+      also found only by reading `_write_request` vs. `_write_batch` directly rather than assuming
+      symmetry — the segment's *identity* (`vgi_rpc.shm_segment_name`/`vgi_rpc.shm_segment_size`)
+      is advertised **only once**, on the request that establishes a call (a unary call, or a
+      stream's init request), never resent on later stream turns (which only ever carry the
+      pointer keys `vgi_rpc.shm_offset`/`vgi_rpc.shm_length`, and only when that turn's own batch
+      happens to be pointer-ized). This is why `ServeStreamAsync` attaches the segment exactly
+      once — from the init request passed in by `ServeOneAsync` — and threads that single
+      `ShmSegment` through every subsequent turn for the stream's whole lifetime rather than
+      re-deriving it per turn, which the wire data alone would make impossible after the first
+      turn. A prior implementation attempt that resolved per-turn from each turn's own metadata
+      passed every unary case but silently produced empty results on any exchange turn crossing
+      the SHM threshold — caught by a real Python-client-driven smoke test before it was ever
+      exercised by an automated one.
+      A dynamically-attached segment is always the caller's own optimization, never a contract
+      this port enforces: malformed segment metadata, an attach failure (wrong size, segment
+      doesn't exist), or a resolve/write failure on a segment this port didn't create all fall
+      back to ordinary inline pipe transmission rather than a hard error — matching the reference
+      implementation's `_maybe_attach_shm` posture exactly.
+      **HTTP is untouched by any of this — structurally, not by an added check**: SHM logic lives
+      entirely inside `RpcServer.ServeOneAsync`/`ServeStreamAsync`, which `QueryFarm.VgiRpc.Http`'s
+      own, entirely separate dispatch path never calls at all. The same "an exemption needs zero
+      extra code because the two dispatch paths were already structurally disjoint" pattern M11's
+      proxy-proof HTTP exemptions and M13's external-storage HTTP-only scoping both already
+      established, from the opposite direction this time (a feature that must stay OFF HTTP,
+      rather than one scoped ONLY to HTTP).
+      **Scope narrowing versus Python, documented in code**: this port's own client
+      (`RpcConnection<T>`/`DispatchProxy`) does not create or advertise SHM segments — only the
+      server side (attach, resolve, and write into a peer-created segment) is implemented. This is
+      sufficient for the real acceptance gate: conformance always drives this port's worker as the
+      *server*, with the canonical Python client (`vgi-rpc-test --shm SIZE`) owning the segment —
+      client-side segment creation would only matter for a from-scratch "native C# client talks to
+      a Python server over SHM" scenario, which nothing in this port's conformance surface
+      exercises today.
+      `__transport_options__` (WIRE_PROTOCOL.md §15) always answers `vgi_rpc.transport.shm=true`
+      unconditionally on pipe/unix/tcp (never reachable over HTTP for the structural reason
+      above) — this port has no runtime condition under which SHM would be unavailable on a
+      platform CLAUDE.md targets, so there's no negative case to construct.
+      Verified two ways: (1) `vgi-rpc-test --cmd <worker> --shm 8388608 --filter <implemented
+      subset>` — the *entire* already-implemented conformance surface (scalars, containers,
+      producer/exchange streaming, error handling, logging) driven over a real client-owned SHM
+      segment, all offloading transparently above the 128 KiB/1 MiB (Linux/Windows) threshold and
+      falling back to inline below it — passed clean in a linux/amd64 Docker container (skipped on
+      macOS locally, where Python's `SharedMemory` uses true `shm_open` with no discoverable file
+      path this port's non-Linux/non-Windows fallback can attach to — not a supported deployment
+      target, and CI's own conformance job runs on ubuntu-latest only, so this still gates every
+      real push); (2) a hand-rolled cross-language smoke script exercising
+      `__transport_options__` negotiation directly, a large unary echo, a producer stream, and an
+      exchange stream with a small-then-large-then-small turn sequence (to catch exactly the
+      per-turn-vs-per-stream attach bug described above) — this is what actually caught that bug,
+      before the broader `--shm`-flag conformance run was even wired up. Plus 21 new xunit tests:
+      16 `ShmSegmentTests` (allocator first-fit/reuse-freed-gap/reset, create-then-attach header
+      validation, wrong-size attach rejection, dictionary-batch round trip, backing-file cleanup
+      on `Unlink`) and 5 `ShmDispatchTests` (`__transport_options__` response shape, a hand-crafted
+      pointer-batch request parameter resolving correctly, a large result actually offloading to
+      SHM, malformed segment metadata falling back gracefully, and a plain call staying unaffected
+      — all driven directly against `RpcServer.ServeOneAsync` over an in-process pipe pair, no
+      subprocess needed). All 113 Python conformance tests (114 including the SHM-transport one,
+      on Linux) and 236 xunit tests (39+191+6 core/Http/OAuth) pass, both locally and in a
+      linux/amd64 Docker container matching CI's ubuntu-latest path.
+      Not implemented: client-side segment creation/advertisement (see the scope-narrowing note
+      above — this port's own `RpcConnection<T>` never becomes a SHM segment *owner*, only ever
+      attaches to one); the `psutil`/GC-defensive fallback behaviors the canonical Python
+      allocator's own doc comments mention for extreme allocation-count scenarios (this port's
+      `MaxAllocs`/80%-capacity warning threshold exist as documented constants, but the actual
+      logging hook is a no-op stub — see `ShmAllocator.WarnIfNearLimit`'s doc comment — since this
+      port has no logging framework threaded through that low-level a layer yet).
 - [ ] **M15 — OAuth2/PKCE browser flow.**
 - [ ] **M16 — Observability (OpenTelemetry, Sentry).**
 - [ ] **M17 — Full-suite conformance in CI across every transport, 2GiB payload test, perf pass,
