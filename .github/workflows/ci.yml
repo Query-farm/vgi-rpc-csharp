@@ -53,6 +53,13 @@ jobs:
       # cryptography: not one of vgi-rpc's own extras — test_csharp_conformance.py's TestMtls
       # class uses it directly to mint real X.509 certs (see docs/roadmap.md M9 mTLS), the same
       # way the canonical Python repo's own tests/test_mtls.py does.
-      - run: pip install "vgi-rpc[conformance,http]" pytest cryptography
+      # external: pulls in aiohttp/tenacity/zstandard — vgi_rpc.external.resolve_external_location
+      # imports aiohttp lazily for parallel/range-request fetching of large externalized objects
+      # (see docs/roadmap.md M13); without this extra, every TestExternalLocation/
+      # TestExternalizedResponseCap case whose payload crosses that internal parallel-fetch
+      # threshold fails with ModuleNotFoundError, found via a real CI run (the local sibling
+      # checkout's own dev venv already had aiohttp installed, which is exactly the trap this
+      # comment on M9's identical mTLS/cryptography miss warned about repeating).
+      - run: pip install "vgi-rpc[conformance,http,external]" pytest cryptography
       # test_csharp_conformance.py's worker_binary fixture builds the worker itself.
       - run: python -m pytest test_csharp_conformance.py -v
