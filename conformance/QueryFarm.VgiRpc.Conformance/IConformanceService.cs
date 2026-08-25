@@ -73,6 +73,14 @@ public interface IConformanceService
 
     Task<AllTypes> EchoAllTypesAsync(AllTypes data);
 
+    /// <summary>Exercises recursive parameter conversion and nested reconstruction: enums and
+    /// dataclasses inside lists/dicts/sets, plus a RecordBatch carried as embedded IPC bytes.
+    /// Mirrors <c>pack_nested_containers</c>.</summary>
+    Task<NestedContainers> PackNestedContainersAsync(List<Status> statuses, List<Point> points, Dictionary<string, Status> statusByName);
+
+    /// <summary>Echo enum members nested in a top-level list. Mirrors <c>echo_status_list</c>.</summary>
+    Task<List<Status>> EchoStatusListAsync(List<Status> statuses);
+
     // -- Annotated types -----------------------------------------------------
 
     Task<int> EchoInt32Async(int value);
@@ -270,9 +278,11 @@ public interface IConformanceService
 
     // TODO (later milestones — see docs/roadmap.md):
     //   - echo_wide_types / echo_container_wide_types / echo_embedded_arrow / echo_deep_nested /
-    //     pack_nested_containers / echo_dict_encoded_string / echo_status_list (need an
-    //     embedded-RecordBatch-as-field mechanism, a Rust/HashSet-style set type, and a
-    //     dictionary-encoding attribute override — bigger, separate work; see docs/roadmap.md)
+    //     echo_dict_encoded_string (need a dictionary-encoding attribute override for a plain
+    //     `string` field, plus the wide/temporal/decimal Arrow types nested inside containers —
+    //     bigger, separate work; see docs/roadmap.md). pack_nested_containers/echo_status_list
+    //     are implemented (M19) — they needed the embedded-RecordBatch-as-field mechanism and the
+    //     HashSet/dict-of-enum support those two also unblock.
     //   - echo_large_binary/echo_fixed_binary (need an attribute-based Arrow type override —
     //     byte[] already means the default-width binary; unlike the int8..uint64/date/timestamp/
     //     time/duration/decimal widths above, there's no distinct CLR type to hang the wider

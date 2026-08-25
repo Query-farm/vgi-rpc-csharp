@@ -13,8 +13,12 @@ namespace QueryFarm.VgiRpc.Reflection;
 ///
 /// Type mapping: string→utf8, byte[]→binary, bool→bool, integer widths→matching Arrow int
 /// width, float/double→float32/float64, enum→dictionary(int16,utf8) by member name (see
-/// <see cref="WireNaming.ForEnumMember"/>), List&lt;T&gt;/T[]→list, HashSet&lt;T&gt;→list,
-/// Dictionary&lt;K,V&gt;→map(K,V), Nullable&lt;T&gt;/a nullable reference→a nullable field.
+/// <see cref="WireNaming.ForEnumMember"/>), List&lt;T&gt;/T[]/HashSet&lt;T&gt;→list (including a
+/// list of enum/struct — see <see cref="ValueCodec"/>'s hand-built array helpers for why those
+/// two element kinds can't use the normal builder factory), Dictionary&lt;K,V&gt;→map(K,V)
+/// (including an enum-valued map), <see cref="RecordBatch"/>→binary (embedded IPC bytes, always
+/// — not subject to the two-tier dataclass rule below), Nullable&lt;T&gt;/a nullable
+/// reference→a nullable field.
 ///
 /// A nested dataclass-equivalent is a two-tier rule, confirmed empirically against the real
 /// Python reference client via <c>vgi-rpc-test</c> (a uniform native-Arrow-<c>struct</c>
@@ -195,6 +199,17 @@ public static class SchemaDerivation
         if (type.IsEnum)
         {
             return new DictionaryType(Int16Type.Default, StringType.Default, ordered: false);
+        }
+
+        // A RecordBatch always serializes as an opaque binary blob (embedded IPC bytes) — never
+        // subject to the nested/top-level dataclass two-tier rule below, since it isn't a
+        // dataclass-equivalent with properties to reflect over; it's serialized directly by
+        // ValueCodec's RecordBatch-as-binary build/extract helpers. Matches Python's own rule
+        // (pa.RecordBatch/pa.Schema -> pa.binary(), see _infer_arrow_type) — only RecordBatch is
+        // implemented here; pa.Schema-as-field has no CLR-side caller yet.
+        if (type == typeof(RecordBatch))
+        {
+            return BinaryType.Default;
         }
 
         if (TryGetElementType(type, out var elementType))
