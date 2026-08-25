@@ -1104,5 +1104,55 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       hypothesis until it's checked against a sibling port actually passing the same case. That
       check is cheap and should come *before* writing up a conclusion, not after being asked for it.
 
+- [x] **M19 — `pack_nested_containers`/`echo_status_list`: the last conformance gap closed.**
+      `dataclass.nested_container_types` was the one test failing outside `IMPLEMENTED_FILTER`
+      (M17's own full-suite check) — a real unimplemented feature, not a bug, needing three pieces
+      of new machinery `ValueCodec`/`SchemaDerivation` genuinely didn't have:
+      - **`RecordBatch` as a field value** (`NestedContainers.TaggedBatch`, mirroring
+        `Annotated[pa.RecordBatch, ArrowType(pa.binary())] | None`): `SchemaDerivation` gained an
+        explicit `type == typeof(RecordBatch) → BinaryType.Default` case (always, regardless of
+        nesting depth — a RecordBatch isn't a dataclass-equivalent, so it must never fall into the
+        two-tier struct/embedded-IPC rule that reflects over a type's own properties).
+        `ValueCodec` gained `BuildRecordBatchBinaryArray`/`ExtractRecordBatchFromBinary` — the
+        RecordBatch's own existing schema+rows serialize directly as IPC bytes, no property
+        reflection, distinct from `BuildEmbeddedRecordArray`'s dataclass path.
+      - **List-of-enum and enum-valued-map support** (`List<Status>`/`HashSet<Status>` for
+        `Statuses`/`FrozenStatuses`, `Dictionary<string, Status>` for `StatusByName`): both were
+        silently broken on the BUILD side — `ArrowArrayBuilderFactory` (which `ListArray.Builder`/
+        `MapArray.Builder` use internally for their value builders) throws `NotSupportedException`
+        for a dictionary-typed (enum) element, the same way it already did for struct (the reason
+        `BuildListOfStructArray` bypasses it). The natural first fix — build each element as its
+        own 1-row `DictionaryArray` and `ArrowArrayConcatenator.Concatenate` them, mirroring the
+        struct case exactly — compiles and looks right but throws `ArgumentException: Dictionary
+        must not be null` at runtime: a `DictionaryArray`'s dictionary-values array lives in
+        `ArrayData.Dictionary`, a sidecar field distinct from its buffers/children, and
+        `ArrowArrayConcatenator`'s generic per-type logic doesn't populate it when merging —
+        silently dropped, not caught until construction. Fixed with `BuildEnumArrayMulti` (builds
+        one combined multi-row dictionary array directly — one dictionary, N indices — never going
+        through the concatenator at all) used by both `BuildListOfEnumArray` and
+        `BuildMapArrayWithEnumValues`. The extraction (read) side needed no changes at all —
+        `ExtractSingleValue`'s per-element dispatch on an array's own runtime type already handled
+        a `DictionaryArray` nested inside a list or map correctly; only the write side, which goes
+        through the type-specific builder-factory machinery, had the gap.
+      - A second, smaller pitfall along the way: `IDictionary.Cast<DictionaryEntry>()` throws
+        `InvalidCastException` for a `Dictionary<K,V>` — `Cast<T>`'s own `IEnumerable`-typed
+        parameter resolves the GENERIC enumerator (`KeyValuePair<K,V>`), not `IDictionary`'s own
+        `GetEnumerator()` (`DictionaryEntry`), which only a `foreach` directly on an
+        `IDictionary`-STATICALLY-typed reference reaches — a easy-to-miss two-interfaces-on-one-type
+        trap, not something a compiler warning catches.
+
+      `HashSet<Status>` for `FrozenStatuses` (Python's `frozenset[Status]`) reuses
+      `SchemaDerivation`'s existing "HashSet→list" rule, which had been documented since M2 but
+      never actually exercised by a real test until now. `Dictionary must not be null`/the
+      `Cast<DictionaryEntry>` trap were both caught by running the change against the real
+      `ConformanceWorker` + real Python reference client immediately, not left to a later
+      integration pass — consistent with this repo's own standing lesson from M18 just above.
+
+      Verified against the real `ConformanceWorker` and the real Python reference suite: the full,
+      *unfiltered* reference conformance suite (not just `IMPLEMENTED_FILTER`) now passes
+      completely — **106 passed, 0 failed** (previously 105 passed, 1 failed) — the honest gap
+      called out in M17/M18 is gone. 270/270 unit tests and 116/116 `IMPLEMENTED_FILTER` tests
+      (all five transports) still pass from a clean rebuild.
+
 Full rationale for each milestone's sequencing lives in the plan this repo was bootstrapped from;
 see `CLAUDE.md` for where cross-language wire-alignment decisions are recorded as they're made.

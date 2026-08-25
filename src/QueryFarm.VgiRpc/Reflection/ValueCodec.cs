@@ -9,12 +9,17 @@ namespace QueryFarm.VgiRpc.Reflection;
 /// Encodes/decodes single CLR values to/from single-row Arrow arrays, per the type mapping in
 /// <see cref="SchemaDerivation"/>.
 ///
-/// <para><b>Milestone 2 scope note</b>: covers scalars, <see cref="Nullable{T}"/>/nullable
-/// reference wrapping any of those, <c>List&lt;T&gt;</c>/<c>T[]</c> (including nested lists) of
-/// a supported element type, <c>Dictionary&lt;K,V&gt;</c> (map), enums (dictionary-encoded), and
-/// nested dataclass-equivalents (embedded-IPC-in-binary — see
-/// <see cref="BuildEmbeddedRecordArray"/>). The wide/temporal/decimal Arrow types and
-/// list-of-struct are deferred — see docs/roadmap.md.</para>
+/// <para>Covers scalars, <see cref="Nullable{T}"/>/nullable reference wrapping any of those,
+/// <c>List&lt;T&gt;</c>/<c>T[]</c>/<c>HashSet&lt;T&gt;</c> (including nested lists, list-of-struct,
+/// and list-of-enum — the latter two hand-built since <c>ArrowArrayBuilderFactory</c> doesn't
+/// support struct/dictionary-typed elements; see <see cref="BuildListOfStructArray"/>/
+/// <see cref="BuildListOfEnumArray"/>), <c>Dictionary&lt;K,V&gt;</c> (map, including an
+/// enum-valued map — same hand-built rationale; see <see cref="BuildMapArrayWithEnumValues"/>),
+/// enums (dictionary-encoded), nested dataclass-equivalents (embedded-IPC-in-binary — see
+/// <see cref="BuildEmbeddedRecordArray"/>), and <see cref="RecordBatch"/> as a field value
+/// (embedded IPC bytes directly, no property reflection — see
+/// <see cref="BuildRecordBatchBinaryArray"/>). The wide/temporal/decimal-in-container and
+/// dictionary-encoding-override Arrow types are still deferred — see docs/roadmap.md.</para>
 /// </summary>
 public static class ValueCodec
 {
@@ -149,6 +154,7 @@ public static class ValueCodec
         {
             StringType => new StringArray.Builder().Append((string)value).Build(),
             BinaryType when value is byte[] bytes => new BinaryArray.Builder().Append(bytes).Build(),
+            BinaryType when value is RecordBatch recordBatchValue => BuildRecordBatchBinaryArray(recordBatchValue),
             BinaryType => BuildEmbeddedRecordArray(value),
             // LargeStringType/LargeBinaryType: only reachable via a [LargeWidth] parameter/return
             // (see LargeWidthAttribute) — used for the conformance suite's echo_large_string/
@@ -232,6 +238,15 @@ public static class ValueCodec
             return BuildListOfStructArray(listType, elementStructType, items);
         }
 
+        // Same rationale as the StructType case above: ArrowArrayBuilderFactory (which
+        // ListArray.Builder's constructor uses to build its ValueBuilder) doesn't support
+        // dictionary-typed (enum) elements either — needed for e.g. NestedContainers.Statuses/
+        // FrozenStatuses: List<Status>/HashSet<Status>.
+        if (listType.ValueDataType is DictionaryType elementDictType)
+        {
+            return BuildListOfEnumArray(listType, elementDictType, items);
+        }
+
         var builder = new ListArray.Builder(listType.ValueField);
         if (items is null)
         {
@@ -275,6 +290,59 @@ public static class ValueCodec
         offsetsBuilder.Append(elements.Count);
         var listData = new ArrayData(listType, length: 1, nullCount: 0, 0, [Apache.Arrow.ArrowBuffer.Empty, offsetsBuilder.Build()], [values.Data]);
         return new ListArray(listData);
+    }
+
+    /// <summary>Builds a <c>list&lt;dictionary&lt;int16,utf8&gt;&gt;</c> array (list of enum) —
+    /// NOT via the "build N one-row arrays and concatenate" pattern <see cref="BuildListOfStructArray"/>
+    /// uses: <see cref="ArrowArrayConcatenator"/> doesn't carry a <see cref="DictionaryArray"/>'s
+    /// dictionary values array (stored as <c>ArrayData.Dictionary</c>, a sidecar field distinct
+    /// from its buffers/children — not something the concatenator's generic per-type logic
+    /// populates), so concatenating dictionary-typed arrays silently drops it and the result fails
+    /// to construct. <see cref="BuildEnumArrayMulti"/> builds the combined multi-row dictionary
+    /// array directly instead.</summary>
+    private static IArrowArray BuildListOfEnumArray(ListType listType, DictionaryType elementType, System.Collections.IEnumerable? items)
+    {
+        if (items is null)
+        {
+            var emptyValues = BuildEmptyArrayOrNull(elementType, nullRow: false);
+            var offsets = new ArrowBuffer.Builder<int>().Append(0).Append(0).Build();
+            var validity = new ArrowBuffer.BitmapBuilder().Append(false).Build();
+            var data = new ArrayData(listType, length: 1, nullCount: 1, 0, [validity, offsets], [emptyValues.Data]);
+            return new ListArray(data);
+        }
+
+        var elements = items.Cast<object?>().ToList();
+        var enumClrType = InferEnumClrTypeFromEnumerable(items, elements);
+        var values = BuildEnumArrayMulti(elementType, enumClrType, elements);
+
+        var offsetsBuilder = new ArrowBuffer.Builder<int>();
+        offsetsBuilder.Append(0);
+        offsetsBuilder.Append(elements.Count);
+        var listData = new ArrayData(listType, length: 1, nullCount: 0, 0, [Apache.Arrow.ArrowBuffer.Empty, offsetsBuilder.Build()], [values.Data]);
+        return new ListArray(listData);
+    }
+
+    /// <summary>Determines the concrete enum CLR type for a collection's elements — from the
+    /// first non-null value where one exists, otherwise from the collection's own generic/array
+    /// element type (so an empty enum list still builds a correctly-typed, if empty, dictionary
+    /// array rather than failing outright). Mirrors <see cref="ExtractList"/>'s declared-type
+    /// resolution, applied to a live object instead of a compile-time <see cref="Type"/>.</summary>
+    private static Type InferEnumClrTypeFromEnumerable(System.Collections.IEnumerable items, IReadOnlyList<object?> elements)
+    {
+        foreach (var element in elements)
+        {
+            if (element is not null)
+            {
+                return element.GetType();
+            }
+        }
+
+        var itemsType = items.GetType();
+        return itemsType.IsArray
+            ? itemsType.GetElementType()!
+            : itemsType.GetGenericArguments() is [var t]
+                ? t
+                : throw new InvalidOperationException($"Cannot determine enum element type for '{itemsType}'.");
     }
 
     /// <summary>
@@ -383,6 +451,37 @@ public static class ValueCodec
     }
 
     /// <summary>
+    /// Encodes a <see cref="RecordBatch"/> field value directly as its own Arrow IPC stream
+    /// bytes (schema + the batch's own rows + EOS) — unlike <see cref="BuildEmbeddedRecordArray"/>,
+    /// there's no dataclass-property reflection involved: the RecordBatch's existing schema and
+    /// data ARE what gets serialized. Matches Python's <c>pa.RecordBatch</c>-as-field rule
+    /// (see <see cref="SchemaDerivation"/>'s doc comment) — always binary, at any nesting depth.
+    /// </summary>
+    private static IArrowArray BuildRecordBatchBinaryArray(RecordBatch batch)
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new ArrowStreamWriter(stream, batch.Schema, leaveOpen: true))
+        {
+            writer.WriteStart();
+            writer.WriteRecordBatch(batch);
+            writer.WriteEnd();
+        }
+
+        return new BinaryArray.Builder().Append(stream.ToArray()).Build();
+    }
+
+    /// <summary>Inverse of <see cref="BuildRecordBatchBinaryArray"/>: reads the embedded IPC
+    /// stream back into a <see cref="RecordBatch"/> as-is (own schema, own rows) — no property
+    /// reflection, unlike <see cref="ExtractEmbeddedRecord"/>.</summary>
+    private static RecordBatch ExtractRecordBatchFromBinary(byte[] bytes)
+    {
+        using var stream = new MemoryStream(bytes);
+        using var reader = new ArrowStreamReader(stream);
+        return reader.ReadNextRecordBatch()
+            ?? throw new InvalidOperationException("Embedded RecordBatch field had no data batch.");
+    }
+
+    /// <summary>
     /// Builds a single-row dictionary-encoded array for an enum value: the dictionary holds
     /// every member's wire name (in declaration order — a stable, deterministic ordering both
     /// sides can reproduce independently), and the one index selects <paramref name="value"/>'s
@@ -415,6 +514,46 @@ public static class ValueCodec
         return new DictionaryArray(dictType, indices, dictionaryValues);
     }
 
+    /// <summary>Multi-row twin of <see cref="BuildEnumArray"/>: one dictionary (every member's
+    /// wire name, built once) shared by an N-row indices array — needed wherever a single
+    /// combined <see cref="DictionaryArray"/> must hold more than one value (a list of enum, or
+    /// an enum-valued map's values), since <see cref="ArrowArrayConcatenator"/> can't compose one
+    /// from N one-row dictionary arrays (see <see cref="BuildListOfEnumArray"/>'s comment). A null
+    /// element appends a null index (dictionary-encoded nulls are represented in the indices, not
+    /// the dictionary itself).</summary>
+    private static IArrowArray BuildEnumArrayMulti(DictionaryType dictType, Type enumType, IReadOnlyList<object?> values)
+    {
+        var names = new List<string>();
+        var indexByMember = new Dictionary<object, short>();
+        short i = 0;
+        foreach (var field in EnumFields(enumType))
+        {
+            names.Add(WireNaming.ForEnumMember(field));
+            indexByMember[field.GetValue(null)!] = i;
+            i++;
+        }
+
+        var dictionaryValues = new StringArray.Builder().AppendRange(names).Build();
+        var indexBuilder = new Int16Array.Builder();
+        foreach (var value in values)
+        {
+            if (value is null)
+            {
+                indexBuilder.AppendNull();
+                continue;
+            }
+
+            if (!indexByMember.TryGetValue(value, out var selectedIndex))
+            {
+                throw new InvalidOperationException($"'{value}' is not a member of enum '{enumType}'.");
+            }
+
+            indexBuilder.Append(selectedIndex);
+        }
+
+        return new DictionaryArray(dictType, indexBuilder.Build(), dictionaryValues);
+    }
+
     private static object ExtractEnum(DictionaryArray array, int index, Type enumType)
     {
         var indices = (Int16Array)array.Indices;
@@ -437,6 +576,14 @@ public static class ValueCodec
 
     private static IArrowArray BuildMapArray(MapType mapType, System.Collections.IDictionary? entries)
     {
+        // MapArray.Builder's constructor calls ArrowArrayBuilderFactory.Build(mapType.ValueField.DataType)
+        // for its ValueBuilder, which throws for a dictionary-typed (enum) value the same way it
+        // does for struct — needed for e.g. NestedContainers.StatusByName: Dictionary<string, Status>.
+        if (mapType.ValueField.DataType is DictionaryType)
+        {
+            return BuildMapArrayWithEnumValues(mapType, entries);
+        }
+
         var builder = new MapArray.Builder(mapType);
         if (entries is null)
         {
@@ -452,6 +599,75 @@ public static class ValueCodec
         }
 
         return builder.Build();
+    }
+
+    /// <summary>Builds a <c>map(K, dictionary&lt;int16,utf8&gt;)</c> array (enum-valued map) by
+    /// hand, bypassing <see cref="MapArray.Builder"/> entirely — its constructor eagerly builds
+    /// BOTH key and value builders via the internal <c>ArrowArrayBuilderFactory</c>, which throws
+    /// for a dictionary-typed value the same way it does for struct. Builds the key column as N
+    /// one-row arrays concatenated (fine — keys are always a plain scalar type here, and
+    /// concatenation only breaks for <see cref="DictionaryArray"/>, see
+    /// <see cref="BuildListOfEnumArray"/>'s comment) and the value column as one combined
+    /// dictionary array via <see cref="BuildEnumArrayMulti"/>, then composes them into a
+    /// <c>list&lt;struct&lt;key, value&gt;&gt;</c> — a map's actual internal representation.
+    /// </summary>
+    private static IArrowArray BuildMapArrayWithEnumValues(MapType mapType, System.Collections.IDictionary? entries)
+    {
+        var entryStructType = new StructType([mapType.KeyField, mapType.ValueField]);
+        var enumValueType = (DictionaryType)mapType.ValueField.DataType;
+
+        if (entries is null)
+        {
+            var emptyEntries = BuildStructArray(entryStructType, value: null, isEmpty: true);
+            var nullOffsets = new ArrowBuffer.Builder<int>().Append(0).Append(0).Build();
+            var nullValidity = new ArrowBuffer.BitmapBuilder().Append(false).Build();
+            var nullData = new ArrayData(mapType, length: 1, nullCount: 1, 0, [nullValidity, nullOffsets], [emptyEntries.Data]);
+            return new MapArray(nullData);
+        }
+
+        // NOT entries.Cast<DictionaryEntry>(): Cast<T>'s own IEnumerable-typed parameter resolves
+        // Dictionary<K,V>'s GENERIC enumerator (yielding boxed KeyValuePair<K,V>, not
+        // DictionaryEntry) — only a foreach directly on an IDictionary-STATICALLY-typed reference
+        // resolves IDictionary's own GetEnumerator() (yielding IDictionaryEnumerator/DictionaryEntry),
+        // same as this method's non-enum sibling above already relies on.
+        var pairs = new List<System.Collections.DictionaryEntry>();
+        foreach (System.Collections.DictionaryEntry entry in entries)
+        {
+            pairs.Add(entry);
+        }
+
+        var keys = pairs.Select(p => p.Key).ToList();
+        var values = pairs.Select(p => p.Value).ToList();
+
+        var keyArray = pairs.Count == 0
+            ? BuildEmptyArrayOrNull(mapType.KeyField.DataType, nullRow: false)
+            : ArrowArrayConcatenator.Concatenate(keys.Select(key => BuildSingleValueArray(mapType.KeyField, key)).ToList());
+
+        Type enumClrType;
+        var firstNonNull = values.FirstOrDefault(v => v is not null);
+        if (firstNonNull is not null)
+        {
+            enumClrType = firstNonNull.GetType();
+        }
+        else if (entries.GetType().GetGenericArguments() is [_, var valueClrType])
+        {
+            enumClrType = valueClrType;
+        }
+        else
+        {
+            throw new InvalidOperationException($"Cannot determine enum value type for '{entries.GetType()}'.");
+        }
+
+        var valueArray = BuildEnumArrayMulti(enumValueType, enumClrType, values);
+
+        var entryData = new ArrayData(entryStructType, length: pairs.Count, nullCount: 0, 0, [Apache.Arrow.ArrowBuffer.Empty], [keyArray.Data, valueArray.Data]);
+        var entriesArray = new StructArray(entryData);
+
+        var offsetsBuilder = new ArrowBuffer.Builder<int>();
+        offsetsBuilder.Append(0);
+        offsetsBuilder.Append(pairs.Count);
+        var mapData = new ArrayData(mapType, length: 1, nullCount: 0, 0, [Apache.Arrow.ArrowBuffer.Empty, offsetsBuilder.Build()], [entriesArray.Data]);
+        return new MapArray(mapData);
     }
 
     private static object ExtractMap(MapArray array, int index, Type clrDictType)
@@ -573,6 +789,7 @@ public static class ValueCodec
             // listed here alongside its string sibling since both back a [LargeWidth] field).
             LargeBinaryArray a when effectiveType == typeof(byte[]) => ExtractLargeBinaryValue(a, index),
             BinaryArray a when effectiveType == typeof(byte[]) => a.GetBytes(index).ToArray(),
+            BinaryArray a when effectiveType == typeof(RecordBatch) => ExtractRecordBatchFromBinary(a.GetBytes(index).ToArray()),
             BinaryArray a => ExtractEmbeddedRecord(a.GetBytes(index).ToArray(), effectiveType),
             BooleanArray a => a.GetValue(index)!.Value,
             Int8Array a => a.Values[index],

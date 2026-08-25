@@ -14,12 +14,14 @@ The full implementation plan (context, architecture decisions, milestone roadmap
 bootstrapped from is summarized in [`docs/roadmap.md`](docs/roadmap.md) and
 [`docs/wire-protocol.md`](docs/wire-protocol.md). Read those first.
 
-**Status**: the initial milestone roadmap (M0–M18) is complete — every transport (pipe/stdio,
+**Status**: the initial milestone roadmap (M0–M19) is complete — every transport (pipe/stdio,
 Unix domain socket, TCP, HTTP, SHM) and every optional subsystem (auth, sticky sessions,
 proxy-proof, external storage, observability) from the original plan is implemented and passing
 the real cross-language conformance suite, **streaming included on every transport** (the unix/tcp
 streaming gap tracked through M17 was root-caused and fixed in M18 — see **Known issues** below).
-That is not the same as "bug-free" or "production hardened" — see **Known issues** below before
+As of M19, the full *unfiltered* reference conformance suite (not just this repo's own
+`IMPLEMENTED_FILTER`) passes completely — 106/106, zero failures. That is not the same as
+"bug-free" or "production hardened" — see **Known issues** below before
 assuming otherwise.
 
 ## Build & test
@@ -107,6 +109,17 @@ Filled in as each piece lands. Key decisions so far:
   `pa.large_binary()` (64-bit offsets) vs. the default `string`/`byte[]` mapping — closed with a
   narrow `[QueryFarm.VgiRpc.Reflection.LargeWidth]` parameter/return attribute, not a general
   mechanism. Don't reach for a bigger abstraction here unless a second real caller shows up.
+- **`frozenset[T]`/set types**: `HashSet<T>` (`FrozenSet<T>` was considered — closer to Python's
+  frozenset semantically, but has no public constructor `Activator.CreateInstance` can drive, so
+  its extraction side would need bespoke plumbing `HashSet<T>` doesn't). Wire shape is `list`
+  either way (Arrow has no native set type — Rust's own port makes the same simplification, just
+  using `Vec<T>`), so the CLR container choice only affects the server-side build path, not
+  interop. See `SchemaDerivation`/`ValueCodec`'s doc comments and `docs/roadmap.md`'s M19 entry.
+- **`pa.RecordBatch` as a field value** (not a service method's own top-level param/return —
+  that's unary echo, unrelated): always `binary` (embedded IPC bytes), never subject to the
+  nested-dataclass two-tier struct/embedded-IPC rule — a RecordBatch isn't a dataclass-equivalent
+  with properties to reflect over. See `SchemaDerivation`'s `RecordBatch` special case and
+  `ValueCodec.BuildRecordBatchBinaryArray`/`ExtractRecordBatchFromBinary`.
 
 ## Platform notes
 

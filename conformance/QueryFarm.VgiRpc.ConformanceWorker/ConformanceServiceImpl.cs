@@ -1,4 +1,6 @@
 using System.Globalization;
+using Apache.Arrow;
+using Apache.Arrow.Types;
 using QueryFarm.VgiRpc.Conformance;
 using QueryFarm.VgiRpc.Conformance.Errors;
 using QueryFarm.VgiRpc.Conformance.Types;
@@ -51,6 +53,28 @@ public sealed class ConformanceServiceImpl : IConformanceService
 
     public Task<string> InspectPointAsync(Point point) =>
         Task.FromResult($"Point({point.X.ToString(CultureInfo.InvariantCulture)}, {point.Y.ToString(CultureInfo.InvariantCulture)})");
+
+    public Task<NestedContainers> PackNestedContainersAsync(List<Status> statuses, List<Point> points, Dictionary<string, Status> statusByName)
+    {
+        // Matches pa.RecordBatch.from_pydict({"value": [1, 2]}) exactly (including pyarrow's own
+        // nullable=True inference for a plain Python-list-sourced column) — the reference impl's
+        // tagged_batch fixture, round-tripped via the embedded-RecordBatch-as-binary mechanism.
+        var batchSchema = new Schema([new Field("value", Int64Type.Default, nullable: true)], null);
+        var batch = new RecordBatch(batchSchema, [new Int64Array.Builder().AppendRange([1, 2]).Build()], length: 2);
+
+        return Task.FromResult(new NestedContainers
+        {
+            Statuses = statuses,
+            Points = points,
+            StatusByName = statusByName,
+            FrozenStatuses = [.. statuses],
+            TaggedStatus = statuses.Count > 0 ? statuses[0] : null,
+            TaggedPoint = points.Count > 0 ? points[0] : null,
+            TaggedBatch = batch,
+        });
+    }
+
+    public Task<List<Status>> EchoStatusListAsync(List<Status> statuses) => Task.FromResult(statuses);
 
     public Task<int> EchoInt32Async(int value) => Task.FromResult(value);
 
