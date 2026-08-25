@@ -14,12 +14,13 @@ The full implementation plan (context, architecture decisions, milestone roadmap
 bootstrapped from is summarized in [`docs/roadmap.md`](docs/roadmap.md) and
 [`docs/wire-protocol.md`](docs/wire-protocol.md). Read those first.
 
-**Status**: the initial milestone roadmap (M0–M17) is complete — every transport (pipe/stdio,
+**Status**: the initial milestone roadmap (M0–M18) is complete — every transport (pipe/stdio,
 Unix domain socket, TCP, HTTP, SHM) and every optional subsystem (auth, sticky sessions,
 proxy-proof, external storage, observability) from the original plan is implemented and passing
-the real cross-language conformance suite. That is not the same as "bug-free" or "production
-hardened" — see **Known issues** below before assuming otherwise, especially the unix/tcp
-streaming item, which is a real, unresolved correctness gap, not a documentation nit.
+the real cross-language conformance suite, **streaming included on every transport** (the unix/tcp
+streaming gap tracked through M17 was root-caused and fixed in M18 — see **Known issues** below).
+That is not the same as "bug-free" or "production hardened" — see **Known issues** below before
+assuming otherwise.
 
 ## Build & test
 
@@ -72,11 +73,10 @@ The acceptance gate for this port is the same one every other port uses: install
 - Run via `./run_tests.sh [transport-or-keyword-filter]`, or directly:
   `python -m pytest test_csharp_conformance.py -v`. Re-run a single failing case with
   `./inspect.sh <test_id>`.
-- The matrix now covers every transport (pipe, Unix domain socket, TCP, HTTP, SHM-over-pipe) and
-  essentially the full implemented feature surface — **except** real streaming (producer/exchange)
-  calls over Unix-domain-socket/TCP, which are excluded from those two transports' CI coverage
-  because they currently hang against the real reference client (`UNIX_TCP_FILTER` in
-  `test_csharp_conformance.py`). See **Known issues**.
+- The matrix covers every transport (pipe, Unix domain socket, TCP, HTTP, SHM-over-pipe) and the
+  full implemented feature surface, streaming included on every transport — a real bug briefly
+  excluded producer/exchange streaming from unix/tcp's CI coverage (`UNIX_TCP_FILTER`); it's been
+  root-caused, fixed, and the carve-out retired. See **Known issues**.
 
 ## Cross-language wire alignment
 
@@ -129,26 +129,27 @@ Filled in as each piece lands. Key decisions so far:
 
 ## Known issues
 
-- **Real streaming (producer/exchange) calls hang against the Python reference client over a
-  `NetworkStream`-backed transport — both Unix domain socket AND TCP** (ruling out a TCP-only
-  Nagle/buffering theory), reproducing on the very first tick. Pipe and HTTP streaming are
-  unaffected; SHM's own streaming conformance (which rides over pipe) is unaffected too. This was
-  found during M17 and investigated extensively (temporary per-turn diagnostics through
-  `RpcServer.ServeStreamAsync`, an `lldb`-attached thread dump showing every thread genuinely idle/
-  blocked on I/O rather than spinning, two from-scratch reproductions using this port's own client
-  against a real `SocketTransport.ServeUnixAsync` listener — one in-process, one against the real
-  published worker binary as a separate OS process — both completing in under 150ms with **no**
-  hang). So `RpcServer`/`SocketTransport` are not provably broken on their own; the exact
-  byte-level interaction the *real* Python client triggers remains unresolved. Leading unconfirmed
-  hypothesis: `vgi_rpc/rpc/_client.py`'s `StreamSession._write_batch` keeps the input IPC stream's
-  writer open across ticks (never closing/EOS-ing between turns), and something about how this
-  port's server handles that framing differs for a socket vs. a pipe. Next step for whoever picks
-  this up: capture the real Python client's exact socket-level writes (a `tee`/proxy capture) and
-  diff against what this port's own client sends for the identical call — much faster than
-  re-deriving the above from scratch. Full write-up: `docs/roadmap.md`'s M17 entry. Tracked in
-  `test_csharp_conformance.py` as `UNIX_TCP_FILTER` deliberately excluding
-  `producer_stream`/`exchange_stream`/`cancel`/`*_header`/`dynamic_schema_producer`/
-  `error_recovery`.
+- **(RESOLVED, M18) Real streaming (producer/exchange) used to hang against the Python reference
+  client over a `NetworkStream`-backed transport — both Unix domain socket AND TCP.** Root cause: a
+  `RecordBatch` message body is legitimately zero bytes long whenever the batch has no buffers —
+  exactly the shape of every producer-stream tick (`_TICK_BATCH` in `vgi_rpc/rpc/_types.py` is a
+  permanent zero-row, zero-column batch). `Apache.Arrow`'s `StreamExtensions.ReadFullBufferAsync`/
+  `ReadFullBuffer` called `stream.ReadAsync`/`stream.Read` with that zero-length buffer
+  unconditionally; over a real socket-backed `NetworkStream` a zero-byte read does not complete
+  immediately the way it logically should — it blocks as if waiting for the peer to send
+  *something*, instead of trivially returning `0` — so the very first tick always blocked until the
+  client gave up. `MemoryStream` doesn't have this quirk (a zero-length read there really is a
+  no-op), which is why a first hypothesis blaming pyarrow's write side looked plausible before being
+  directly disproved by `vgi-rpc-go` passing the identical case with the identical real client.
+  Fixed with a third patch to the vendored Arrow fork (`third_party/apache-arrow-dotnet/README.md`)
+  — both read helpers now short-circuit `buffer.Length == 0` before ever touching the stream,
+  matching how Go's `io.ReadFull` already special-cases a zero-length buffer. Reproduces with the
+  **stock** `Apache.Arrow` NuGet package too, so it's a real upstream `apache/arrow-dotnet` bug
+  independent of this port, worth reporting there separately. Verified against the real
+  `ConformanceWorker` and the real Python reference suite: unix/tcp now run the full
+  `IMPLEMENTED_FILTER`, streaming included, same as every other transport — the `UNIX_TCP_FILTER`
+  carve-out in `test_csharp_conformance.py` is retired. Full write-up: `docs/roadmap.md`'s M18
+  entry.
 - `QueryFarm.VgiRpc.S3`/`QueryFarm.VgiRpc.Gcs` are empty scaffolds — no real backend exists yet
   (see **Solution layout** above).
 - `examples/` has no actual sample apps yet.

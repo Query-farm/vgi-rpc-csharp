@@ -20,6 +20,9 @@ public sealed class SocketTransport : IRpcTransport, IDisposable
         // one instance used for both directions — needed to avoid a hang reading a stream's
         // schema message shortly after writing on a socket-backed transport (not observed on
         // pipe/stdio transports, where each direction was already backed by a distinct Stream).
+        // NOT implicated in the M17/M18 producer-stream-over-socket hang (see docs/roadmap.md's
+        // M17 entry) — a single shared NetworkStream, a synchronous-write wrapper, and a
+        // synchronous-read wrapper were each tested in isolation and none changed the symptom.
         _readStream = new NetworkStream(socket, FileAccess.Read, ownsSocket: false);
         _writeStream = new NetworkStream(socket, FileAccess.Write, ownsSocket: false);
     }

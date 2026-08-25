@@ -79,38 +79,6 @@ IMPLEMENTED_FILTER = ",".join(
     ]
 )
 
-# Non-streaming subset of IMPLEMENTED_FILTER, driven over unix/tcp (M17, docs/roadmap.md). Real
-# streaming conformance over these two transports is a KNOWN, TRACKED GAP, not a deliberate scope
-# cut: producer_stream/exchange_stream/etc. hang against the real Python reference client on a
-# NetworkStream-backed transport (unix or tcp — both, TCP loopback and a Unix domain socket, so
-# it's not a TCP-specific Nagle/buffering issue) somewhere around the first tick's response,
-# *specifically* when driven by that client — this port's own client, and this port's own server
-# hosted in-process, both drive the identical produce_n call over a real unix socket without any
-# hang (see the investigation notes in docs/roadmap.md's M17 entry), so the dispatch/streaming
-# code itself is not provably broken; the exact interaction that trips it remains unresolved.
-# Unary calls (including this milestone's own large_payload additions) are unaffected — this is
-# what actually closes the M4-era gap of unix/tcp never having been driven through more than a
-# hand-picked smoke subset.
-UNIX_TCP_FILTER = ",".join(
-    [
-        "large_payload.*",
-        "scalar_echo.*",
-        "void.*",
-        "complex_types.*",
-        "optional.*",
-        "dataclass.echo_point",
-        "dataclass.echo_bounding_box",
-        "dataclass.inspect_point",
-        "annotated.*",
-        "multi_param.*",
-        "errors.*",
-        "logging.*",
-        "boundary_values.*",
-        "protocol_version.*",
-        "dataclass.echo_all_types",
-        "dataclass.echo_all_types_with_nulls",
-    ]
-)
 
 
 @pytest.fixture(scope="session")
@@ -605,13 +573,16 @@ def test_shm_transport_implemented_subset_fully_conformant(worker_binary: Path) 
 
 
 def test_unix_transport_implemented_subset_fully_conformant(unix_worker: str) -> None:
-    """The non-streaming subset (UNIX_TCP_FILTER — see its own comment for why streaming is
-    excluded here specifically), driven over a Unix domain socket (M17, docs/roadmap.md) —
-    RpcServer's core dispatch loop (ServeAsync/ServeOneAsync) is transport-agnostic, but a
-    NetworkStream-backed transport exercises real partial-read behavior a pipe's own OS buffering
-    can mask (see WireReader/PayloadTooLargeException, added for exactly this transport family),
-    so this is a genuine additional check, not just the same test rerun for coverage's sake."""
-    report = _run_vgi_rpc_test(unix=unix_worker, filter_pattern=UNIX_TCP_FILTER)
+    """The full IMPLEMENTED_FILTER, streaming included, driven over a Unix domain socket (M17,
+    docs/roadmap.md) — RpcServer's core dispatch loop (ServeAsync/ServeOneAsync) is
+    transport-agnostic, but a NetworkStream-backed transport exercises real partial-read behavior
+    a pipe's own OS buffering can mask (see WireReader/PayloadTooLargeException, added for exactly
+    this transport family), so this is a genuine additional check, not just the same test rerun
+    for coverage's sake. Streaming was excluded here for a time (a real bug, not a deliberate
+    scope cut — see docs/roadmap.md's M17/M18 entries for the root cause and fix: a zero-length
+    RecordBatch body blocked forever on a NetworkStream-backed ReadAsync instead of completing
+    immediately) and is now included like every other transport."""
+    report = _run_vgi_rpc_test(unix=unix_worker, filter_pattern=IMPLEMENTED_FILTER)
     failed = [t for t in report["results"] if not t["passed"] and not t["skipped"]]
     assert not failed, "Unix-transport conformance failures in the implemented subset:\n" + "\n".join(
         f"  {t['name']}: {t.get('error', '')}" for t in failed
@@ -621,7 +592,7 @@ def test_unix_transport_implemented_subset_fully_conformant(unix_worker: str) ->
 
 def test_tcp_transport_implemented_subset_fully_conformant(tcp_worker: str) -> None:
     """Same as test_unix_transport_implemented_subset_fully_conformant, over TCP loopback."""
-    report = _run_vgi_rpc_test(tcp=tcp_worker, filter_pattern=UNIX_TCP_FILTER)
+    report = _run_vgi_rpc_test(tcp=tcp_worker, filter_pattern=IMPLEMENTED_FILTER)
     failed = [t for t in report["results"] if not t["passed"] and not t["skipped"]]
     assert not failed, "TCP-transport conformance failures in the implemented subset:\n" + "\n".join(
         f"  {t['name']}: {t.get('error', '')}" for t in failed

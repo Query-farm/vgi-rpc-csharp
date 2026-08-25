@@ -1,8 +1,9 @@
 # Vendored: Apache Arrow .NET (patched for per-batch `custom_metadata`)
 
 This directory vendors `Apache.Arrow` and `Apache.Arrow.Scalars` from
-[apache/arrow-dotnet](https://github.com/apache/arrow-dotnet), **with one small patch applied on
-top of the `v23.0.0` release tag.**
+[apache/arrow-dotnet](https://github.com/apache/arrow-dotnet), **with three small patches applied
+on top of the `v23.0.0` release tag** (one cherry-picked from an upstream PR, two authored directly
+in this vendoring — see below for each).
 
 ## Why this exists
 
@@ -62,6 +63,30 @@ correct answer; the reference's own `_accept_typed_refusal` helper exists for ex
 If/when this vendoring is removed (see below), this behavior would need to move to whatever reader
 the real `Apache.Arrow` package ships — either by re-adding an equivalent patch, or by having
 `WireReader` peek the message header itself before delegating to the stock reader.
+
+## Third patch: zero-length `ReadFullBufferAsync`/`ReadFullBuffer` fast path (vgi-rpc-csharp-specific)
+
+Also not cherry-picked from any upstream PR — authored directly in this vendoring for the M17/M18
+unix/tcp streaming hang (see `docs/roadmap.md`'s M18 entry for the full investigation). Root cause:
+`StreamExtensions.ReadFullBufferAsync`/`ReadFullBuffer` called `stream.ReadAsync`/`stream.Read`
+with a **zero-length** buffer whenever a message's body is legitimately empty — which a
+`RecordBatch` with no buffers (e.g. a zero-column schema) always is. `MemoryStream` treats a
+zero-length read as the trivial no-op it logically is, but a real socket-backed `NetworkStream`
+does not: a zero-byte `ReadAsync`/`Read` blocks as if waiting for the peer to send *something* (or
+close), instead of returning `0` immediately. In a lockstep protocol where the peer is itself
+waiting on *our* response, nothing else is ever coming, so this blocked forever — confirmed via a
+zero-vgi-rpc-dependency reproducer (stock `Apache.Arrow` NuGet package, no vendored fork, real
+`pyarrow` client) and pinned to the exact syscall via `strace`: the full message body had already
+arrived and been read correctly; the *next*, spurious zero-length read is what hung. Go's own IPC
+reader never hits this because `io.ReadFull` special-cases a zero-length buffer and returns without
+issuing a read syscall at all (documented Go stdlib behavior) — this vendoring now does the same:
+both `ReadFullBufferAsync` and `ReadFullBuffer` return `0` immediately when `buffer.Length == 0`,
+before ever touching `stream`.
+
+If/when this vendoring is removed (see below), this fix would need to move to whatever reader the
+real `Apache.Arrow` package ships — worth reporting upstream to `apache/arrow-dotnet` independently
+of this port, since it reproduces with the stock NuGet package and has nothing to do with the
+custom_metadata patch above.
 
 ## What's NOT vendored
 
