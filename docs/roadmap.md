@@ -709,11 +709,11 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       automated tests, per the established habit — which is exactly what caught the `expires_at`
       timestamp-unit bug before any automated test had a chance to encode the wrong value as
       "expected."
-      Not implemented: S3/GCS `IExternalStorage` backends themselves (`QueryFarm.VgiRpc.S3`/`.Gcs`
-      remain empty scaffold projects — the pointer-batch protocol and the storage seam are complete
-      and backend-agnostic; wiring an actual AWS/GCS SDK behind `IExternalStorage` is separable,
-      lower-risk work with no conformance dependency, since the suite only requires *an*
-      HTTP-addressable backend, not a specific one).
+      Not implemented at this milestone: S3/GCS `IExternalStorage` backends themselves
+      (`QueryFarm.VgiRpc.S3`/`.Gcs` were empty scaffold projects here — the pointer-batch protocol
+      and the storage seam are complete and backend-agnostic; wiring an actual AWS/GCS SDK behind
+      `IExternalStorage` is separable, lower-risk work with no conformance dependency, since the
+      suite only requires *an* HTTP-addressable backend, not a specific one). Closed in M20.
 - [x] **M14 — SHM transport.** Full port of `vgi_rpc/shm.py` — `QueryFarm.VgiRpc.Shm.ShmAllocator`/
       `ShmSegment`/`ShmPointerBatch`, plus `__transport_options__` negotiation and dynamic
       per-request attach wired into `RpcServer.ServeOneAsync`/`ServeStreamAsync`. A zero-copy
@@ -1153,6 +1153,56 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       completely — **106 passed, 0 failed** (previously 105 passed, 1 failed) — the honest gap
       called out in M17/M18 is gone. 270/270 unit tests and 116/116 `IMPLEMENTED_FILTER` tests
       (all five transports) still pass from a clean rebuild.
+
+- [x] **M20 — Real S3/GCS `IExternalStorage` backends.** Closes M13's deliberately-deferred gap:
+      `QueryFarm.VgiRpc.S3`/`.Gcs` go from empty scaffolds to real `S3Storage`/`GcsStorage`
+      implementations, both implementing *both* `IExternalStorage` (plain upload) and
+      `IUploadUrlProvider` (presigned PUT/GET pair for client-side externalization) — structurally
+      closest to vgi-rpc-java's own `S3Storage`/`GcsStorage` (fluent builder, disposable,
+      endpoint-override/path-style knobs for S3-compatible stores), though Java only implements
+      the upload side so far; Python is the only other port implementing both directions.
+      `AWSSDK.S3` bumped 3.7.416 → 4.0.102.4 as part of this (the 3.x line hit AWS end-of-support
+      in 2026 — building the first real usage against an already-EOL major version would be
+      starting behind); `Google.Cloud.Storage.V1` bumped 4.11.0 → 4.15.0 opportunistically.
+
+      **Three non-obvious `AWSSDK.S3` v4 traps, all found and fixed during this work** — see
+      `CLAUDE.md`'s Platform notes for the full list (region+ServiceURL interaction, presigned-URL
+      scheme, presigned-URL Content-Type coupling). All three were root-caused by direct,
+      methodical isolation against a real RustFS container rather than guessing: a raw
+      `curl --aws-sigv4` request with the identical credentials succeeding the entire time is what
+      proved credentials were never the issue and kept the investigation pointed at the SDK's own
+      request construction instead.
+
+      **Testing**: real-protocol integration tests (`test/QueryFarm.VgiRpc.S3.Tests`/`.Gcs.Tests`),
+      run via Testcontainers against RustFS (S3-compatible, same pinned digest vgi-rpc-java uses)
+      and fake-gcs-server (same pinned digest) — no cloud credentials, no network egress. The S3
+      suite proves presigned URLs are genuinely SigV4-method-bound (a mutated signature and a
+      GET-url-used-as-PUT both get real 403s from RustFS, not a mock pretending to check).
+      Found and fixed one real emulator-specific bug along the way: fake-gcs-server's
+      `-public-host localhost` flag makes its XML-API-style flat object routing
+      (`/{bucket}/{object}`, what a V4 signed URL's path targets) key off the request's `Host`
+      header matching that value *exactly* — connecting via the container's own IP (Testcontainers'
+      default `.Hostname`/`.Host`) reaches the identical server but 404s; the fix is using
+      `localhost` explicitly when constructing the test's own endpoint URI, confirmed directly via
+      `curl --resolve` before touching any test code. Per that same emulator's own documented
+      limitation (confirmed executable, not just asserted, in a dedicated test): fake-gcs-server
+      does not validate signed-URL query parameters at all, so the GCS integration suite proves
+      URL *shape* and upload/download correctness but — unlike the S3/RustFS suite — cannot prove
+      signer correctness; real GCS would be needed for that specific claim.
+
+      Deliberately **not** wired into the default `dotnet build`/`dotnet test` gate or
+      `vgi-rpc-csharp.slnx` — mirrors vgi-rpc-java's own separate `integrationTest` Gradle source
+      set for the identical reason (Docker-dependent tests don't belong in the same fast-feedback
+      loop as pure unit tests). Run explicitly:
+      `dotnet test test/QueryFarm.VgiRpc.S3.Tests test/QueryFarm.VgiRpc.Gcs.Tests`.
+
+      Cross-language conformance is unaffected by design: both the canonical Python reference's own
+      `S3Storage`/`GCSStorage` unit tests (`moto`/a mocked `google.cloud.storage` client) and this
+      port's new integration tests verify against emulators, never real cloud credentials — the
+      `IExternalStorage`/`IUploadUrlProvider` seam itself was already fully conformance-tested via
+      `FakeStorageBackend` since M13, and that remains the cross-language gate. 270/270 unit tests,
+      116/116 `IMPLEMENTED_FILTER` conformance tests, and both new integration suites (3 S3 + 2 GCS)
+      pass from a clean rebuild.
 
 Full rationale for each milestone's sequencing lives in the plan this repo was bootstrapped from;
 see `CLAUDE.md` for where cross-language wire-alignment decisions are recorded as they're made.

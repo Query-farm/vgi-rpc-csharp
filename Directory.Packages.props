@@ -23,9 +23,11 @@
     <PackageVersion Include="Microsoft.IdentityModel.JsonWebTokens" Version="8.4.0" />
     <PackageVersion Include="Microsoft.IdentityModel.Protocols.OpenIdConnect" Version="8.4.0" />
 
-    <!-- External storage -->
-    <PackageVersion Include="AWSSDK.S3" Version="3.7.416" />
-    <PackageVersion Include="Google.Cloud.Storage.V1" Version="4.11.0" />
+    <!-- External storage. AWSSDK.S3 pinned to the 4.x line deliberately — the 3.x major line
+         reached AWS end-of-support in 2026; building the first real S3Storage against an
+         already-EOL major version would be starting behind. -->
+    <PackageVersion Include="AWSSDK.S3" Version="4.0.102.4" />
+    <PackageVersion Include="Google.Cloud.Storage.V1" Version="4.15.0" />
 
     <!-- Observability -->
     <PackageVersion Include="OpenTelemetry" Version="1.15.3" />
@@ -37,6 +39,11 @@
     <PackageVersion Include="xunit.runner.visualstudio" Version="3.0.2" />
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
     <PackageVersion Include="coverlet.collector" Version="6.0.4" />
+    <!-- Docker-gated real-protocol integration tests for S3/GCS (see
+         test/QueryFarm.VgiRpc.S3.Tests, .Gcs.Tests) — matches vgi-rpc-java's own precedent of
+         verifying presigned URLs are genuinely method-bound against a real S3-compatible/GCS
+         emulator, not a request stub. -->
+    <PackageVersion Include="Testcontainers" Version="4.14.0" />
 
     <!-- Source link -->
     <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="8.0.0" />

@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <Description>S3-backed IExternalStorage implementation for vgi-rpc large-payload externalization. (Scaffold only — see Milestone 13 in docs/roadmap.md.)</Description>
+    <Description>S3-backed IExternalStorage/IUploadUrlProvider implementation for vgi-rpc large-payload externalization. See Milestone 19 in docs/roadmap.md.</Description>
     <RootNamespace>QueryFarm.VgiRpc.S3</RootNamespace>
   </PropertyGroup>
 
@@ -9,6 +9,7 @@
     <PackageReference Include="AWSSDK.S3" />
     <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
     <ProjectReference Include="..\QueryFarm.VgiRpc\QueryFarm.VgiRpc.csproj" />
+    <ProjectReference Include="..\QueryFarm.VgiRpc.Http\QueryFarm.VgiRpc.Http.csproj" />
   </ItemGroup>
 
 </Project>

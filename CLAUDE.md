@@ -14,11 +14,12 @@ The full implementation plan (context, architecture decisions, milestone roadmap
 bootstrapped from is summarized in [`docs/roadmap.md`](docs/roadmap.md) and
 [`docs/wire-protocol.md`](docs/wire-protocol.md). Read those first.
 
-**Status**: the initial milestone roadmap (M0–M19) is complete — every transport (pipe/stdio,
+**Status**: the initial milestone roadmap (M0–M20) is complete — every transport (pipe/stdio,
 Unix domain socket, TCP, HTTP, SHM) and every optional subsystem (auth, sticky sessions,
-proxy-proof, external storage, observability) from the original plan is implemented and passing
-the real cross-language conformance suite, **streaming included on every transport** (the unix/tcp
-streaming gap tracked through M17 was root-caused and fixed in M18 — see **Known issues** below).
+proxy-proof, external storage — including real `.S3`/`.Gcs` backends as of M20, observability)
+from the original plan is implemented and passing the real cross-language conformance suite,
+**streaming included on every transport** (the unix/tcp streaming gap tracked through M17 was
+root-caused and fixed in M18 — see **Known issues** below).
 As of M19, the full *unfiltered* reference conformance suite (not just this repo's own
 `IMPLEMENTED_FILTER`) passes completely — 106/106, zero failures. That is not the same as
 "bug-free" or "production hardened" — see **Known issues** below before
@@ -41,13 +42,21 @@ nested one per `src/`, `test/`, `conformance/`, `benchmark/`, `examples/` folder
 ## Solution layout
 
 - `src/` — published packages (`QueryFarm.VgiRpc` core + optional add-ons: `.Http`,
-  `.Http.OAuth`, `.OpenTelemetry`, `.Sentry`). `.S3`/`.Gcs` are still **empty scaffolds** — the
-  `IExternalStorage`/`IUploadUrlProvider` seam they'd implement lives in `.Http` and is exercised
-  by conformance today only via a fake in-repo backend (`FakeStorageBackend` in
-  `conformance/QueryFarm.VgiRpc.ConformanceWorker/`), not a real S3/GCS client. Don't assume these
-  two packages do anything — check before depending on them.
+  `.Http.OAuth`, `.OpenTelemetry`, `.Sentry`, `.S3`, `.Gcs`). `.S3`/`.Gcs` (M20) are real
+  `IExternalStorage`/`IUploadUrlProvider` implementations (that seam itself lives in `.Http`) —
+  `S3Storage`/`GcsStorage`, both presign PUT+GET URL pairs in addition to the plain upload path.
+  Conformance still exercises the seam only via a fake in-repo backend (`FakeStorageBackend` in
+  `conformance/QueryFarm.VgiRpc.ConformanceWorker/`) — that's deliberate (see M20's roadmap entry:
+  the canonical Python reference's own S3/GCS unit tests mock the cloud SDKs the same way, and
+  cross-language conformance was never meant to depend on real cloud credentials). `.S3`/`.Gcs`
+  are instead verified by `test/QueryFarm.VgiRpc.S3.Tests`/`.Gcs.Tests` — real-protocol
+  integration tests against RustFS/fake-gcs-server via Testcontainers, Docker-gated, deliberately
+  **not** wired into the default `dotnet build`/`dotnet test` gate (mirrors vgi-rpc-java's own
+  separate `integrationTest` Gradle source set) — run them explicitly:
+  `dotnet test test/QueryFarm.VgiRpc.S3.Tests test/QueryFarm.VgiRpc.Gcs.Tests`.
 - `test/` — xUnit unit/integration tests, one project per `src/` project (`QueryFarm.VgiRpc.Tests`,
-  `.Http.Tests`, `.Http.OAuth.Tests`, `.OpenTelemetry.Tests`, `.Sentry.Tests`).
+  `.Http.Tests`, `.Http.OAuth.Tests`, `.OpenTelemetry.Tests`, `.Sentry.Tests`), plus the two
+  Docker-gated `.S3.Tests`/`.Gcs.Tests` projects described above (not in `vgi-rpc-csharp.slnx`).
 - `conformance/` — shared `IConformanceService` interface/types + the runnable conformance worker.
   Not published.
 - `benchmark/` — mirrors `conformance/`'s shape for perf testing. Small and honestly scoped (a
@@ -139,6 +148,24 @@ Filled in as each piece lands. Key decisions so far:
   this explicitly rather than letting it surface as an opaque `OverflowException`; keep that
   precedent in mind before adding any new code path that materializes a wire value as a single
   managed array/string.
+- **`AWSSDK.S3` v4 + a custom `ServiceURL` (any non-real-AWS S3-compatible store: MinIO,
+  LocalStack, RustFS, ...) has three non-obvious traps**, all confirmed directly against a real
+  RustFS instance (a raw `curl --aws-sigv4` request with the identical credentials succeeded the
+  whole time, proving these were never a credentials problem):
+  1. Setting `AmazonS3Config.RegionEndpoint` *together with* `ServiceURL` makes **every** request
+     fail `403 InvalidAccessKeyId`, even `ListBucketsAsync` (the simplest possible signed call)
+     with genuinely correct credentials. Use `AuthenticationRegion` (a plain region string)
+     instead whenever `ServiceURL` is set; `RegionEndpoint` alone is still correct for real AWS
+     S3 (no `ServiceURL` override).
+  2. `AmazonS3Config.UseHttp` does **not** affect presigned-URL generation — a plain-http
+     `ServiceURL` still gets `https://` presigned URLs by default, which then fail the TLS
+     handshake against a server that was never speaking TLS. Set `Protocol` on each individual
+     `GetPreSignedUrlRequest` instead.
+  3. Setting `GetPreSignedUrlRequest.ContentType` becomes part of what's signed — fine for a
+     presign-then-immediately-upload call this port fully controls (`S3Storage.UploadAsync`), but
+     wrong for a presigned URL handed to an external caller (`GenerateUploadUrlAsync`): it forces
+     that caller to send the exact same `Content-Type` header or SigV4 rejects the PUT outright.
+     See `QueryFarm.VgiRpc.S3.S3Storage`'s constructor/`NewPresignRequest` comments for all three.
 
 ## Known issues
 
@@ -163,8 +190,6 @@ Filled in as each piece lands. Key decisions so far:
   `IMPLEMENTED_FILTER`, streaming included, same as every other transport — the `UNIX_TCP_FILTER`
   carve-out in `test_csharp_conformance.py` is retired. Full write-up: `docs/roadmap.md`'s M18
   entry.
-- `QueryFarm.VgiRpc.S3`/`QueryFarm.VgiRpc.Gcs` are empty scaffolds — no real backend exists yet
-  (see **Solution layout** above).
 - `examples/` has no actual sample apps yet.
 - Not yet published to NuGet.org (see **Release process**).
 
