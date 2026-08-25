@@ -819,7 +819,66 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       `MaxAllocs`/80%-capacity warning threshold exist as documented constants, but the actual
       logging hook is a no-op stub — see `ShmAllocator.WarnIfNearLimit`'s doc comment — since this
       port has no logging framework threaded through that low-level a layer yet).
-- [ ] **M15 — OAuth2/PKCE browser flow.**
+- [x] **M15 — OAuth2/PKCE browser flow.** Full port of the standards-based core of the canonical
+      Python repo's `vgi_rpc.http._oauth`/`_oauth_pkce` — `QueryFarm.VgiRpc.Http.OAuth.
+      OAuthResourceMetadata`/`OAuthEndpoints` (RFC 9728 protected-resource metadata,
+      `GET /.well-known/oauth-protected-resource`, the `WWW-Authenticate` challenge builder) and
+      `Pkce`/`OAuthPkce`/`OAuthPkceConfig` (RFC 7636 PKCE, a signed session cookie, OIDC discovery,
+      Authorization Code + PKCE token exchange, the 401→302 redirect middleware, and the
+      `{prefix}/_oauth/callback`/`{prefix}/_oauth/logout` routes). As the plan itself flagged going
+      in, this milestone has no wire contract and gates no conformance test — the acceptance bar
+      here is real end-to-end HTTP behavior against a fake identity provider, not cross-language
+      byte compatibility.
+      **Scope narrower than Python, documented in code** — three pieces of the reference module
+      are deliberately not ported, each a product-specific extension layered on top of the
+      standards-based flow rather than the flow itself: (1) the external-frontend
+      `_vgi_return_to` redirect (token delivered via URL fragment to a separate SPA origin — a
+      Query.Farm/Cupola-specific integration); (2) `POST {prefix}/_oauth/token`, a same-site
+      token-exchange proxy for browser clients that can't hold a `client_secret`; (3) the
+      JS-readable display-identity cookie derived from the `id_token`'s profile claims (cosmetic
+      landing-page integration). The device-code-flow config fields
+      (`DeviceCodeClientId`/`DeviceCodeClientSecret`) are kept on `OAuthResourceMetadata` for
+      parity — Python itself only ever exposes them as metadata too, no port (including this one)
+      implements an actual device-code flow.
+      The session cookie carrying PKCE state across the redirect uses this port's own signed
+      binary format (HMAC-SHA256, version/timestamp/length-prefixed fields), not Python's
+      byte-for-byte layout — the established M6/M10 precedent applies again: this cookie is
+      transport-implementation-internal, read only by the same server process that wrote it, never
+      parsed cross-language, so there's no wire contract to preserve. OIDC discovery reuses the
+      exact same `ConfigurationManager<OpenIdConnectConfiguration>` M9's `JwtAuth` already uses
+      (cached, auto-refreshing) rather than hand-rolling a second discovery cache — one class doing
+      this job correctly beats two.
+      The 401→302 middleware buffers the downstream response (`context.Response.Body` swapped for
+      a `MemoryStream` around `next(context)`) so a 401 can be fully discarded and replaced with a
+      302 after the fact — ASP.NET Core has no "peek the status, then decide" hook the way Falcon's
+      `process_response` does natively, so this is the standard response-buffering-middleware
+      pattern instead.
+      **One real bug found by the same class of "test the actual HTTP behavior" verification this
+      whole session has repeatedly relied on**: the error page's original implementation used
+      `string.Format` against a raw string literal template containing literal CSS braces
+      (`body { font-family: ...; }`) — `string.Format` tries to parse every `{`/`}` as a
+      placeholder, so *every* OAuth error response (missing code, state mismatch, tampered cookie,
+      IdP error) 500'd instead of showing the intended 400/502 with a readable message. Caught
+      immediately by the first real-HTTP callback test run, before it was ever a manual
+      curl-verification step; fixed by switching to plain token replacement
+      (`"__MESSAGE__".Replace(...)`), which has no brace-parsing behavior to collide with the
+      template's own CSS.
+      Verified with 25 new xunit tests (`OAuthPkceTests`) — a real in-process Kestrel host serving
+      the middleware + callback/logout routes behind a plain endpoint that always 401s, a second
+      real in-process Kestrel host as a fake IdP (OIDC discovery + token endpoint), driven with a
+      non-redirect-following `HttpClient` through the entire browser-GET-401 → redirect → simulated
+      IdP callback → token exchange → auth-cookie-set → redirect-to-original-page flow, plus the
+      CSRF (state mismatch), tampered/missing session cookie, IdP error, logout, RFC 9728 metadata
+      validation/serialization, `WWW-Authenticate` header, and PKCE (RFC 7636 Appendix B's own
+      worked S256 test vector) cases individually. All 255 xunit tests (39+191+25
+      core/Http/Http.OAuth) pass, both locally and in a linux/amd64 Docker container matching CI's
+      ubuntu-latest path; the existing 113 (+1 skipped on macOS) Python conformance tests are
+      unaffected, as expected for a feature with no wire contract.
+      Not implemented: the three product-specific extensions noted above; wiring this into the
+      conformance worker's own CLI (nothing in this port has a "browse page" to protect yet — the
+      worker's HTTP surface is exclusively the RPC/health/sticky/introspection routes M6–M13
+      already built, none of which are the kind of browser-navigable page this flow protects, so
+      there is no natural integration point until a future milestone adds one).
 - [ ] **M16 — Observability (OpenTelemetry, Sentry).**
 - [ ] **M17 — Full-suite conformance in CI across every transport, 2GiB payload test, perf pass,
       packaging/release, docs pass.**

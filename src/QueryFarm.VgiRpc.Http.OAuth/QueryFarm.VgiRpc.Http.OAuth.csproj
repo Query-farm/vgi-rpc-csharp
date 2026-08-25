@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <Description>JWT/JWKS validation (M9) and OAuth2/PKCE browser flow (M15, not yet implemented) for vgi-rpc's HTTP transport. See docs/roadmap.md.</Description>
+    <Description>JWT/JWKS validation (M9) and OAuth2/PKCE browser flow (M15) for vgi-rpc's HTTP transport. See docs/roadmap.md.</Description>
     <RootNamespace>QueryFarm.VgiRpc.Http.OAuth</RootNamespace>
   </PropertyGroup>
 
