@@ -879,7 +879,62 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       worker's HTTP surface is exclusively the RPC/health/sticky/introspection routes M6–M13
       already built, none of which are the kind of browser-navigable page this flow protects, so
       there is no natural integration point until a future milestone adds one).
-- [ ] **M16 — Observability (OpenTelemetry, Sentry).**
+- [x] **M16 — Observability (OpenTelemetry, Sentry).** A generic dispatch-observability seam —
+      `QueryFarm.VgiRpc.Server.IRpcDispatchHook`/`DispatchHookInfo`/`CompositeDispatchHook` — the
+      C# analog of the canonical Python repo's `_DispatchHook` protocol
+      (`vgi_rpc/rpc/_common.py`), which `QueryFarm.VgiRpc.OpenTelemetry.OtelDispatchHook` and
+      `QueryFarm.VgiRpc.Sentry.SentryDispatchHook` both implement as pure consumers — exactly the
+      seam the original plan's own M16 entry anticipated ("both are pure consumers of one
+      `IRpcDispatchHook` seam shared with the access-log writer"), landing this milestone as a
+      genuinely additive, non-invasive change: `RpcServer`'s constructor gained one new optional
+      `dispatchHooks` parameter, and every existing dispatch path keeps working byte-for-byte
+      unchanged when it's omitted (the default).
+      **This is the first milestone with no wire contract and no conformance test** (the plan
+      flagged this going in, same framing as M15's OAuth flow) — the acceptance bar is real
+      tracing/error-capture behavior against real listeners, not cross-language compatibility.
+      `OtelDispatchHook` is built entirely on the BCL's own `System.Diagnostics.ActivitySource`/
+      `System.Diagnostics.Metrics.Meter` — matches the original plan's own stated intent ("native
+      W3C trace-context propagation, no manual carrier plumbing") — and needs **no OpenTelemetry
+      SDK package reference at all**: any OTel SDK the *hosting application* configures
+      (`AddSource("vgi_rpc")`/`AddMeter("vgi_rpc")`) automatically captures every span/metric this
+      hook records. This is a genuine simplification over Python's `OtelConfig`, which has to
+      accept explicit `TracerProvider`/`MeterProvider` instances since Python has no BCL-native
+      diagnostics primitives to piggyback on. `SentryDispatchHook` wraps the official `Sentry`
+      NuGet SDK — matching Python's explicit "does not manage the DSN or SDK lifecycle" stance
+      exactly: callers run `SentrySdk.Init(...)` themselves before constructing `RpcServer`, and
+      every call in this hook is a no-op when the SDK was never initialized
+      (`SentrySdk.IsEnabled == false`).
+      **Scope narrower than Python, documented in code, in three ways**: (1) the dispatch-hook
+      contract itself carries method/protocol/server identity, duration, and error — not Python's
+      additional `AuthContext` (caller principal/domain/claims, resolved through entirely
+      different mechanisms on HTTP vs. pipe/unix/tcp with no shared abstraction yet) or
+      `CallStatistics` (per-call row/byte counts, not tracked anywhere in this port today); (2)
+      `SentryDispatchHook` skips Python's parameter-value recording (with its credential-name
+      redactor and tag whitelist), claim tags, per-exception-type ignore list, and — deliberately —
+      the "auto-attach when `sentry_sdk.is_initialized()`" implicit-registration magic, in favor of
+      the same explicit, opt-in-via-constructor-parameter pattern every other optional feature in
+      this repo already uses; (3) **both hooks are wired only into `RpcServer`'s own dispatch loop
+      (pipe/unix/tcp transports)** — `QueryFarm.VgiRpc.Http.RpcHttpEndpoints` is a structurally
+      separate dispatch path (as established repeatedly since M9) with its own several dispatch
+      points (unary, stream-init, stream-exchange, each HTTP request independently), and wiring
+      the hook seam through all of them is real, scoped, separable follow-up work this milestone
+      deliberately didn't take on, given the "zero conformance dependency, lowest priority"
+      framing and remaining budget for M17. `RpcServer.DispatchHook` is `internal` and already
+      exposed for exactly this — a future HTTP-path wiring pass needs no core-assembly change.
+      Verified with 15 new xunit tests across two new test projects
+      (`QueryFarm.VgiRpc.OpenTelemetry.Tests`, `QueryFarm.VgiRpc.Sentry.Tests`), both direct
+      (calling the hook's `OnDispatchStart`/`OnDispatchEnd` directly against a real
+      `ActivityListener`+`MeterListener` pair, or a real `SentrySdk.Init` with a fake no-network
+      `ITransport` and a `BeforeSend` hook capturing actual `SentryEvent` objects rather than
+      parsed envelope bytes) and end-to-end (a real `RpcServer` dispatching over an in-process
+      pipe transport, mirroring `RpcServerClientTests`' own pattern, proving the hook fires
+      correctly from real dispatch, not just when called directly). All 270 xunit tests
+      (39+191+25+7+8 core/Http/Http.OAuth/OpenTelemetry/Sentry) pass, both locally and in a
+      linux/amd64 Docker container matching CI's ubuntu-latest path; the existing 113 (+1 skipped
+      on macOS) Python conformance tests are unaffected, as expected for a feature with no wire
+      contract.
+      Not implemented: the three scope-narrowing items above; wiring the hook seam into
+      `RpcHttpEndpoints`'s several dispatch points.
 - [ ] **M17 — Full-suite conformance in CI across every transport, 2GiB payload test, perf pass,
       packaging/release, docs pass.**
 

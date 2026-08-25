@@ -19,6 +19,8 @@
   <Folder Name="/test/">
     <Project Path="test/QueryFarm.VgiRpc.Http.OAuth.Tests/QueryFarm.VgiRpc.Http.OAuth.Tests.csproj" />
     <Project Path="test/QueryFarm.VgiRpc.Http.Tests/QueryFarm.VgiRpc.Http.Tests.csproj" />
+    <Project Path="test/QueryFarm.VgiRpc.OpenTelemetry.Tests/QueryFarm.VgiRpc.OpenTelemetry.Tests.csproj" />
+    <Project Path="test/QueryFarm.VgiRpc.Sentry.Tests/QueryFarm.VgiRpc.Sentry.Tests.csproj" />
     <Project Path="test/QueryFarm.VgiRpc.Tests/QueryFarm.VgiRpc.Tests.csproj" />
   </Folder>
   <Folder Name="/third_party/" />

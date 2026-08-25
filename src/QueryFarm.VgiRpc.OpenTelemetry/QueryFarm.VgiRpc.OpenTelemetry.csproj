@@ -1,12 +1,19 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <Description>OpenTelemetry tracing/metrics instrumentation for vgi-rpc via ActivitySource/Meter. (Scaffold only — see Milestone 16 in docs/roadmap.md.)</Description>
+    <Description>OpenTelemetry tracing/metrics instrumentation for vgi-rpc via ActivitySource/Meter (M16). See docs/roadmap.md.</Description>
     <RootNamespace>QueryFarm.VgiRpc.OpenTelemetry</RootNamespace>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="OpenTelemetry" />
+    <!-- No OpenTelemetry SDK package reference: OtelDispatchHook is built entirely on the BCL's
+         own System.Diagnostics.ActivitySource/System.Diagnostics.Metrics.Meter — see that class's
+         doc comment for why that's a deliberate simplification versus the canonical Python
+         implementation's explicit TracerProvider/MeterProvider wiring, not a missing dependency.
+         A hosting application that wants an actual exporter configures the OpenTelemetry SDK
+         itself (e.g. OpenTelemetry.Exporter.OpenTelemetryProtocol, already centrally pinned in
+         Directory.Packages.props for exactly that use) and points it at the "vgi_rpc" source/meter
+         name this package registers. -->
     <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
     <ProjectReference Include="..\QueryFarm.VgiRpc\QueryFarm.VgiRpc.csproj" />
   </ItemGroup>

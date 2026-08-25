@@ -23,6 +23,7 @@ public sealed class RpcServer
     private readonly object _implementation;
     private readonly string _serverId;
     private readonly IAccessLogSink? _accessLog;
+    private readonly IRpcDispatchHook? _dispatchHook;
 
     /// <summary>The service interface's simple name — the access log's <c>protocol</c> field.</summary>
     public string ProtocolName { get; }
@@ -57,12 +58,30 @@ public sealed class RpcServer
     /// transports that emit their own <see cref="AccessLogRecord"/>s outside this dispatch loop.</summary>
     internal IAccessLogSink? AccessLog => _accessLog;
 
-    public RpcServer(Type serviceInterface, object implementation, string? serverId = null, IAccessLogSink? accessLog = null)
+    /// <summary>The configured dispatch hook (see <see cref="IRpcDispatchHook"/>, M16), or
+    /// <see langword="null"/> if none — for transports (<c>QueryFarm.VgiRpc.Http</c>) that
+    /// dispatch outside this class's own <see cref="ServeOneAsync"/>/<see cref="ServeStreamAsync"/>
+    /// loop and so call <see cref="IRpcDispatchHook.OnDispatchStart"/>/
+    /// <see cref="IRpcDispatchHook.OnDispatchEnd"/> themselves, around their own dispatch points.</summary>
+    internal IRpcDispatchHook? DispatchHook => _dispatchHook;
+
+    /// <param name="serviceInterface">The service interface type to reflect method schemas from.</param>
+    /// <param name="implementation">The service implementation instance to dispatch calls to.</param>
+    /// <param name="serverId">This server instance's id — a random GUID when omitted.</param>
+    /// <param name="accessLog">Optional access-log sink — see <see cref="AccessLog"/>.</param>
+    /// <param name="dispatchHooks">Zero or more observability hooks (M16) — e.g.
+    /// <c>QueryFarm.VgiRpc.OpenTelemetry.OtelDispatchHook</c>,
+    /// <c>QueryFarm.VgiRpc.Sentry.SentryDispatchHook</c> — fanned out via
+    /// <see cref="CompositeDispatchHook"/>. Empty/<see langword="null"/> (the default) means no
+    /// hooks at all, matching every other optional-observability feature's opt-in-by-default
+    /// posture in this port.</param>
+    public RpcServer(Type serviceInterface, object implementation, string? serverId = null, IAccessLogSink? accessLog = null, IReadOnlyList<IRpcDispatchHook>? dispatchHooks = null)
     {
         _methods = ServiceRegistry.GetMethods(serviceInterface);
         _implementation = implementation;
         _serverId = serverId ?? Guid.NewGuid().ToString("n");
         _accessLog = accessLog;
+        _dispatchHook = dispatchHooks is { Count: > 0 } ? new CompositeDispatchHook(dispatchHooks) : null;
         ProtocolName = serviceInterface.Name;
         ProtocolHash = ComputeProtocolHash(_methods);
     }
@@ -245,6 +264,9 @@ public sealed class RpcServer
         var status = "ok";
         var errorType = "";
         var errorMessage = "";
+        Exception? hookError = null;
+        var hookInfo = new DispatchHookInfo(info.WireName, "unary", ProtocolName, _serverId);
+        var hookToken = _dispatchHook?.OnDispatchStart(hookInfo);
         try
         {
             var result = await info.InvokeAsync(_implementation, args, context).ConfigureAwait(false);
@@ -273,11 +295,13 @@ public sealed class RpcServer
             status = "error";
             errorType = actual.GetType().Name;
             errorMessage = actual.Message;
+            hookError = actual;
             var metadata = LogMessage.FromException(actual).AddToMetadata();
             await writer.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(info.ResultSchema), metadata), cancellationToken).ConfigureAwait(false);
         }
         finally
         {
+            _dispatchHook?.OnDispatchEnd(hookToken, hookInfo, hookError);
             await EmitAccessLogAsync(info.WireName, "unary", status, errorType, errorMessage, start, requestForLog: request, cancellationToken: cancellationToken).ConfigureAwait(false);
         }
 
@@ -314,6 +338,9 @@ public sealed class RpcServer
         // Matches Python's uuid.uuid4().hex (32 lowercase hex chars).
         var streamId = Guid.NewGuid().ToString("N");
 
+        var hookInfo = new DispatchHookInfo(info.WireName, "stream", ProtocolName, _serverId);
+        var hookToken = _dispatchHook?.OnDispatchStart(hookInfo);
+
         var invokeContext = info.HasContextParameter ? new BufferedCallContext() : null;
         IRpcStream stream;
         try
@@ -324,6 +351,7 @@ public sealed class RpcServer
         catch (Exception exc)
         {
             var actual = Unwrap(exc);
+            _dispatchHook?.OnDispatchEnd(hookToken, hookInfo, actual);
             await WriteErrorStreamAsync(transport.Output, s_emptySchema, actual, cancellationToken).ConfigureAwait(false);
             await EmitAccessLogAsync(info.WireName, "stream", "error", actual.GetType().Name, actual.Message, start, streamId: streamId, cancellationToken: cancellationToken).ConfigureAwait(false);
             return true;
@@ -375,6 +403,7 @@ public sealed class RpcServer
         catch (Exception) when (!cancellationToken.IsCancellationRequested)
         {
             // client never opened the tick/exchange input stream
+            _dispatchHook?.OnDispatchEnd(hookToken, hookInfo, null);
             await EmitAccessLogAsync(info.WireName, "stream", "ok", "", "", start, streamId: streamId, cancellationToken: cancellationToken).ConfigureAwait(false);
             return true;
         }
@@ -382,6 +411,7 @@ public sealed class RpcServer
         var streamStatus = "ok";
         var streamErrorType = "";
         var streamErrorMessage = "";
+        Exception? streamHookError = null;
         while (true)
         {
             AnnotatedBatch? inputBatch;
@@ -438,6 +468,7 @@ public sealed class RpcServer
                 streamStatus = "error";
                 streamErrorType = actual.GetType().Name;
                 streamErrorMessage = actual.Message;
+                streamHookError = actual;
                 var metadata = LogMessage.FromException(actual).AddToMetadata();
                 await outputWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), metadata), cancellationToken).ConfigureAwait(false);
                 break;
@@ -466,6 +497,7 @@ public sealed class RpcServer
             }
         }
 
+        _dispatchHook?.OnDispatchEnd(hookToken, hookInfo, streamHookError);
         await EmitAccessLogAsync(info.WireName, "stream", streamStatus, streamErrorType, streamErrorMessage, start, streamId: streamId, cancellationToken: cancellationToken).ConfigureAwait(false);
         return true;
     }
