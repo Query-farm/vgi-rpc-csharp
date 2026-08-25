@@ -14,7 +14,7 @@ The full implementation plan (context, architecture decisions, milestone roadmap
 bootstrapped from is summarized in [`docs/roadmap.md`](docs/roadmap.md) and
 [`docs/wire-protocol.md`](docs/wire-protocol.md). Read those first.
 
-**Status**: the initial milestone roadmap (M0–M20) is complete — every transport (pipe/stdio,
+**Status**: the initial milestone roadmap (M0–M21) is complete — every transport (pipe/stdio,
 Unix domain socket, TCP, HTTP, SHM) and every optional subsystem (auth, sticky sessions,
 proxy-proof, external storage — including real `.S3`/`.Gcs` backends as of M20, observability)
 from the original plan is implemented and passing the real cross-language conformance suite,
@@ -169,6 +169,23 @@ Filled in as each piece lands. Key decisions so far:
 
 ## Known issues
 
+- **No client-side subprocess transport, and no typed streaming or HTTP client proxy** (found
+  while writing M21's examples). `RpcClientProxy<T>`/`RpcConnection<T>` only ever marshal calls
+  over an already-connected `IRpcTransport` and only support unary calls
+  (`RpcClientProxy<T>.Invoke` calls `CallUnaryAsync` unconditionally) — there's no
+  `SubprocessTransport` to spawn a child process from the client side, and no client that consumes
+  an `RpcStream<TState>` or that speaks HTTP through a typed proxy rather than raw
+  `WireWriter`/`WireReader` calls. None of this is a correctness bug — server-side dispatch for
+  all of these is fully implemented and conformance-tested (streaming across every transport since
+  M18; every real HTTP call in this repo's own test suite already goes through `RpcHttpEndpoints`)
+  — it's a client-side API surface gap, and a C# client isn't the only way to close it: a server
+  built with this package is already fully drivable by any other vgi-rpc port's client (the
+  conformance suite does exactly that, over every transport, via the Python reference client) —
+  a from-scratch C# client for these three cases is not in scope of this gap, just one possible
+  future addition. `examples/03-subprocess` and `examples/04-http` show the small amount of code
+  needed to fill each gap directly in C# today; promoting either into the library proper
+  (`QueryFarm.VgiRpc.Transport.SubprocessTransport`, an `IAsyncEnumerable`-based stream client, an
+  HTTP `RpcConnection`-equivalent) is natural future work.
 - **(RESOLVED, M18) Real streaming (producer/exchange) used to hang against the Python reference
   client over a `NetworkStream`-backed transport — both Unix domain socket AND TCP.** Root cause: a
   `RecordBatch` message body is legitimately zero bytes long whenever the batch has no buffers —
@@ -190,15 +207,16 @@ Filled in as each piece lands. Key decisions so far:
   `IMPLEMENTED_FILTER`, streaming included, same as every other transport — the `UNIX_TCP_FILTER`
   carve-out in `test_csharp_conformance.py` is retired. Full write-up: `docs/roadmap.md`'s M18
   entry.
-- `examples/` has no actual sample apps yet.
-- Not yet published to NuGet.org (see **Release process**).
+- `examples/` has a scoped set of runnable sample apps (`01-hello-world` through `04-http`) — see
+  the root README's Examples table. Streaming and a typed HTTP client aren't covered by an example
+  yet (see this file's streaming/HTTP client notes above and in `docs/roadmap.md`).
 
 ## Release process
 
 Bump `Directory.Build.props`'s root `<Version>` (one version for every package, moving in
-lockstep), tag, publish a GitHub Release — `release.yml` verifies the tag matches `<Version>` and
-publishes to NuGet.org. Packaging itself is verified as of `<Version>` 0.2.0 (`dotnet pack -c
-Release` succeeds cleanly for all 7 publishable packages) but no tag has been pushed and nothing
-has been published yet — the tag-push/publish step is a deliberately manual, human-triggered
-action (hard to reverse once packages land on NuGet.org), not something to do autonomously even
-under a broad "finish everything" instruction.
+lockstep), tag (`v<Version>`), publish a GitHub Release — `release.yml` verifies the tag matches
+`<Version>` and publishes all 7 packages to NuGet.org via Trusted Publishing (OIDC, no stored API
+key). Proven end-to-end: `<Version>` 0.2.0 was tagged, released, and all 7 packages are live on
+NuGet.org under the `rustyconover` account. The tag-push/publish step is still a deliberately
+manual, human-triggered action (hard to reverse once packages land on NuGet.org), not something to
+do autonomously even under a broad "finish everything" instruction.

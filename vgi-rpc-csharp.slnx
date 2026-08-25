@@ -7,6 +7,14 @@
     <Project Path="conformance/QueryFarm.VgiRpc.Conformance/QueryFarm.VgiRpc.Conformance.csproj" />
     <Project Path="conformance/QueryFarm.VgiRpc.ConformanceWorker/QueryFarm.VgiRpc.ConformanceWorker.csproj" />
   </Folder>
+  <Folder Name="/examples/">
+    <Project Path="examples/01-hello-world/HelloWorld.csproj" />
+    <Project Path="examples/02-structured-types/StructuredTypes.csproj" />
+    <Project Path="examples/03-subprocess/Worker/Worker.csproj" />
+    <Project Path="examples/03-subprocess/Client/SubprocessClient.csproj" />
+    <Project Path="examples/04-http/Server/HttpServer.csproj" />
+    <Project Path="examples/04-http/Client/HttpClientExample.csproj" />
+  </Folder>
   <Folder Name="/src/">
     <Project Path="src/QueryFarm.VgiRpc.Gcs/QueryFarm.VgiRpc.Gcs.csproj" />
     <Project Path="src/QueryFarm.VgiRpc.Http.OAuth/QueryFarm.VgiRpc.Http.OAuth.csproj" />

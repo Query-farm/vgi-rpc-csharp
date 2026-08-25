@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <Description>HTTP client that connects to the ../Server demo HTTP server.</Description>
+    <RootNamespace>QueryFarm.VgiRpc.Examples.Http.Client</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\src\QueryFarm.VgiRpc.Http\QueryFarm.VgiRpc.Http.csproj" />
+  </ItemGroup>
+
+</Project>

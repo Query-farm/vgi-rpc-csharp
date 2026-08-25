@@ -15,7 +15,7 @@
 
   <!-- Single version for every package in this repo; see docs/versioning.md -->
   <PropertyGroup>
-    <Version>0.2.0</Version>
+    <Version>0.3.0</Version>
   </PropertyGroup>
 
   <PropertyGroup>

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <Description>HTTP server example: serves a service over ASP.NET Core / Kestrel via app.MapVgiRpc(...).</Description>
+    <RootNamespace>QueryFarm.VgiRpc.Examples.Http.Server</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="..\..\..\src\QueryFarm.VgiRpc.Http\QueryFarm.VgiRpc.Http.csproj" />
+  </ItemGroup>
+
+</Project>

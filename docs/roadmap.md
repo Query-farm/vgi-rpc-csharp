@@ -1204,5 +1204,61 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       116/116 `IMPLEMENTED_FILTER` conformance tests, and both new integration suites (3 S3 + 2 GCS)
       pass from a clean rebuild.
 
+- [x] **M21 — Getting-started examples + README rewrite.** Between M20 and this milestone, the repo
+      was also made public (`Query-farm/vgi-rpc-csharp`, Apache-2.0), CI (`ci.yml`) was verified
+      green on GitHub, and `<Version>` 0.2.0 was tagged and released — `release.yml` published all
+      7 packages to NuGet.org via Trusted Publishing (OIDC token exchange, no stored API key; see
+      CLAUDE.md's Release process). This milestone is the first pass at *using* that published
+      package from the outside: four runnable example projects under `examples/`, modeled on the
+      canonical Python repo's own `examples/hello_world.py`/`structured_types.py`/
+      `subprocess_worker.py`+`subprocess_client.py`/`http_server.py`+`http_client.py`, and a full
+      README rewrite (Installation, Quick Start, a C# type-mapping table, Transports, Streaming,
+      Error Handling, Authentication, External Storage, Examples).
+
+      **Two real client-side gaps surfaced by actually trying to write these examples**, not
+      previously called out this plainly anywhere: this port has no client-side
+      subprocess-spawning transport (`RpcClientProxy<T>`/`RpcConnection<T>` only ever talk over an
+      already-connected `IRpcTransport`), and no typed streaming or HTTP client proxy at all
+      (`RpcClientProxy<T>.Invoke` only calls `CallUnaryAsync`; every real HTTP call in this repo's
+      own tests is driven by the Python reference client). Both are structurally minor — the fix
+      in each case is a small `IRpcTransport` implementation or a direct `WireWriter`/`WireReader`
+      call — but they only show up when something outside the test suite tries to *use* the client
+      side for these cases, which is exactly what writing `examples/03-subprocess` and
+      `examples/04-http` did. Documented in the README's Transports/Streaming sections (not
+      hidden) rather than glossed over, alongside the actual point worth making: a from-scratch
+      C# client isn't the only way to close either gap, or even necessarily in scope — every
+      vgi-rpc port shares one wire protocol specifically so a server built with this package is
+      already fully drivable by any other port's client with zero server-side changes, which is
+      exactly what the cross-language conformance suite does (Python reference client, every
+      transport, streaming included, since M18). Promoting a native C# client for these cases into
+      the library proper remains natural future work, just not a blocker. Streaming itself is NOT
+      broken — server-side dispatch (`RpcServer.ServeStreamAsync`) is fully implemented and
+      conformance-tested across every transport since M18; only a typed C# *client* for consuming
+      one doesn't exist yet.
+
+      Final example set (all four verified to build, run, and produce correct output on a clean
+      `dotnet build -c Release` — no partial/aspirational examples):
+      - `01-hello-world` — in-process pipe transport, unary calls.
+      - `02-structured-types` — POCO parameters/returns with an enum, `List<T>`, `Dictionary<K,V>`.
+      - `03-subprocess` — `Worker` (stdio server) + `Client` (spawns it via a ~30-line hand-rolled
+        `SubprocessTransport : IRpcTransport` wrapping `System.Diagnostics.Process`), including
+        `RpcException` propagation from a server-side `throw`.
+      - `04-http` — `Server` (`app.MapVgiRpc(...)` on Kestrel) + `Client` (one unary call built
+        directly from `ValueCodec.BuildRow`/`WireWriter`/`WireReader` over `HttpClient`, since no
+        typed HTTP client exists yet — response compression disabled via `compressionLevel: null`
+        so the example's own wire-reading code doesn't also have to implement Content-Encoding
+        negotiation).
+
+      All six new example `.csproj`s (`03-subprocess` and `04-http` each have two) were added to
+      `vgi-rpc-csharp.slnx` under a new `/examples/` folder so `dotnet build`/`dotnet test` (bare,
+      the form CI uses) exercises them too — surfaced one real solution-file constraint along the
+      way: `.slnx` project *names* (derived from each `.csproj`'s file name, not its folder) must
+      be unique within a solution folder, so the two example `Client.csproj`s were renamed to
+      `SubprocessClient.csproj`/`HttpClientExample.csproj` (`MSB4025` otherwise). Verified end to
+      end on a clean Linux ARM64 box: `dotnet build -c Release` (0 errors), `dotnet test -c
+      Release` (270/270 passing, unchanged), `dotnet format --verify-no-changes` (clean), and each
+      of the four examples run manually with correct output, including the subprocess example's
+      remote-error path and the HTTP example's server+client pair over a real Kestrel listener.
+
 Full rationale for each milestone's sequencing lives in the plan this repo was bootstrapped from;
 see `CLAUDE.md` for where cross-language wire-alignment decisions are recorded as they're made.
