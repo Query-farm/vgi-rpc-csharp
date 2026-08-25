@@ -80,6 +80,29 @@ public sealed class SessionLostException : RpcException
     }
 }
 
+/// <summary>The incoming request's declared payload size exceeds what this runtime's array/buffer
+/// types can represent (~2^31 bytes — no managed <c>byte[]</c>/reader buffer on any .NET runtime
+/// can hold more). Thrown server-side by <see cref="Wire.WireReader"/> after it has already
+/// drained the oversized body off the wire, so the connection stays usable for the next call —
+/// see <c>docs/roadmap.md</c> M17 and the mandatory conformance test
+/// <c>large_payload.echo_binary_over_int32_max</c>, whose reference explicitly sanctions exactly
+/// this kind of typed refusal. No dedicated <c>error_kind</c> wire token exists for this case in
+/// the shared cross-language vocabulary (see this file's own class doc comment on
+/// <see cref="RpcException.ErrorKind"/> being an open set) — it surfaces as a plain application-level error,
+/// the same way a user's own thrown exception would.</summary>
+public sealed class PayloadTooLargeException : RpcException
+{
+    public long DeclaredBodyLength { get; }
+
+    public PayloadTooLargeException(long declaredBodyLength)
+        : base(
+            nameof(PayloadTooLargeException),
+            $"Request payload is {declaredBodyLength} bytes, which exceeds the maximum size this runtime can represent ({int.MaxValue} bytes).")
+    {
+        DeclaredBodyLength = declaredBodyLength;
+    }
+}
+
 /// <summary>The server is shutting down and is no longer accepting new sticky sessions/calls. See
 /// <see cref="SessionLostException"/>'s doc comment — same "wire type is a fixed cross-language
 /// string, not this class's own C# name" reasoning applies here (Python: <c>ServerDrainingError</c>).</summary>

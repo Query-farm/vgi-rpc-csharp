@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -29,9 +30,15 @@ WORKER_OUTPUT = REPO_ROOT / "artifacts" / "conformance-worker"
 # Test categories/methods implemented so far (unary only — see docs/roadmap.md M2). Grows as
 # later milestones land: M3 adds producer_stream/exchange_stream/*_header/cancel/dynamic_schema,
 # M2-continued adds dataclass.echo_all_types* + the wide-Arrow-type methods once list-of-struct
-# support lands, M4+ adds large_payload/http_response_cap.
+# support lands, M4+ adds http_response_cap; M17 closes the remaining large_payload gap (see
+# docs/roadmap.md) — echo_binary_4mib (a real 4 MiB round trip, catching short-write bugs) and the
+# mandatory echo_binary_over_int32_max (2^31+1 bytes, which no managed byte[]/reader buffer on any
+# .NET runtime can hold — this port answers with a typed PayloadTooLargeException refusal that
+# drains the oversized body first so the connection survives, which the reference's own
+# _accept_typed_refusal helper explicitly sanctions).
 IMPLEMENTED_FILTER = ",".join(
     [
+        "large_payload.*",
         "scalar_echo.*",
         "void.*",
         "complex_types.*",
@@ -69,6 +76,39 @@ IMPLEMENTED_FILTER = ",".join(
         "exchange_stream.cast_float32_to_float64",
         "exchange_stream.cast_exact_schema",
         "exchange_stream.cast_incompatible_column_name",
+    ]
+)
+
+# Non-streaming subset of IMPLEMENTED_FILTER, driven over unix/tcp (M17, docs/roadmap.md). Real
+# streaming conformance over these two transports is a KNOWN, TRACKED GAP, not a deliberate scope
+# cut: producer_stream/exchange_stream/etc. hang against the real Python reference client on a
+# NetworkStream-backed transport (unix or tcp — both, TCP loopback and a Unix domain socket, so
+# it's not a TCP-specific Nagle/buffering issue) somewhere around the first tick's response,
+# *specifically* when driven by that client — this port's own client, and this port's own server
+# hosted in-process, both drive the identical produce_n call over a real unix socket without any
+# hang (see the investigation notes in docs/roadmap.md's M17 entry), so the dispatch/streaming
+# code itself is not provably broken; the exact interaction that trips it remains unresolved.
+# Unary calls (including this milestone's own large_payload additions) are unaffected — this is
+# what actually closes the M4-era gap of unix/tcp never having been driven through more than a
+# hand-picked smoke subset.
+UNIX_TCP_FILTER = ",".join(
+    [
+        "large_payload.*",
+        "scalar_echo.*",
+        "void.*",
+        "complex_types.*",
+        "optional.*",
+        "dataclass.echo_point",
+        "dataclass.echo_bounding_box",
+        "dataclass.inspect_point",
+        "annotated.*",
+        "multi_param.*",
+        "errors.*",
+        "logging.*",
+        "boundary_values.*",
+        "protocol_version.*",
+        "dataclass.echo_all_types",
+        "dataclass.echo_all_types_with_nulls",
     ]
 )
 
@@ -139,8 +179,12 @@ def _spawn_http_worker(worker_binary: Path, *extra_args: str) -> Iterator[str]:
 
 @pytest.fixture
 def http_worker(worker_binary: Path) -> Iterator[str]:
-    """A plain --http worker, no auth."""
-    yield from _spawn_http_worker(worker_binary)
+    """A plain --http worker, no auth. --max-response-bytes is bumped from the worker's own 64
+    KiB default to comfortably fit large_payload.echo_binary_4mib's real 4 MiB response (M17) —
+    safe to raise here because http_response_cap.unary_strict_fail/exchange_strict_fail (also in
+    IMPLEMENTED_FILTER) read the server's own advertised cap via caps.max_response_bytes and
+    request 4x *that*, so they still trigger the same strict-fail path at any cap value."""
+    yield from _spawn_http_worker(worker_binary, "--max-response-bytes", str(8 * 1024 * 1024))
 
 
 @pytest.fixture
@@ -403,16 +447,111 @@ def _make_test_cert(cn: str = "test-client", *, days_valid: int = 365, not_befor
     return quote(pem)
 
 
+def _spawn_unix_worker(worker_binary: Path, *extra_args: str) -> Iterator[str]:
+    """Spawns the worker in --unix mode (plus any extra flags) and yields its socket path.
+
+    Unlike --cmd's spawn-and-drive-over-stdio model (where vgi-rpc-test itself owns the
+    subprocess), --unix/--tcp run the worker as an independently-listening background process
+    vgi-rpc-test connects to afterward — see _spawn_http_worker's own docstring for the same
+    distinction, which this mirrors.
+    """
+    sock_path = tempfile.mktemp(prefix="vgi-rpc-test-", suffix=".sock")
+    proc = subprocess.Popen(  # noqa: S603
+        [str(worker_binary), "--unix", sock_path, *extra_args],
+        cwd=REPO_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline()
+        assert line.startswith("UNIX:"), f"Worker did not print a UNIX:<path> discovery line (got: {line!r})"
+        # The discovery line prints just before the listener actually binds (see Program.cs) — poll
+        # for the socket file itself rather than trusting the print alone as proof it's up yet.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not Path(sock_path).exists():
+            time.sleep(0.05)
+        assert Path(sock_path).exists(), f"Worker never created the unix socket at {sock_path}"
+        yield sock_path
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        Path(sock_path).unlink(missing_ok=True)
+
+
+def _spawn_tcp_worker(worker_binary: Path, *extra_args: str) -> Iterator[str]:
+    """Spawns the worker in --tcp mode against an OS-assigned ephemeral port (avoids picking a
+    fixed port that could collide) and yields the actual bound "host:port" it reports back."""
+    proc = subprocess.Popen(  # noqa: S603
+        [str(worker_binary), "--tcp", "127.0.0.1:0", *extra_args],
+        cwd=REPO_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        deadline = time.monotonic() + 10
+        port_line = ""
+        while time.monotonic() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            if line.startswith("PORT:"):
+                port_line = line
+                break
+        match = re.match(r"PORT:(\d+)", port_line)
+        assert match, f"Worker did not print a PORT:<port> discovery line within 10s (got: {port_line!r})"
+        yield f"127.0.0.1:{match.group(1)}"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@pytest.fixture
+def unix_worker(worker_binary: Path) -> Iterator[str]:
+    yield from _spawn_unix_worker(worker_binary)
+
+
+@pytest.fixture
+def tcp_worker(worker_binary: Path) -> Iterator[str]:
+    yield from _spawn_tcp_worker(worker_binary)
+
+
 def _run_vgi_rpc_test(
-    cmd: str | None = None, *, url: str | None = None, filter_pattern: str | None = None, shm_size: int | None = None
+    cmd: str | None = None,
+    *,
+    url: str | None = None,
+    unix: str | None = None,
+    tcp: str | None = None,
+    filter_pattern: str | None = None,
+    shm_size: int | None = None,
 ) -> dict:
-    assert (cmd is None) != (url is None), "pass exactly one of cmd or url"
+    modes = [m for m in (cmd, url, unix, tcp) if m is not None]
+    assert len(modes) == 1, "pass exactly one of cmd, url, unix, or tcp"
     assert shm_size is None or cmd is not None, "--shm only applies to --cmd (pipe transport)"
+    if cmd is not None:
+        transport_args = ["--cmd", cmd]
+    elif url is not None:
+        transport_args = ["--url", url]
+    elif unix is not None:
+        transport_args = ["--unix", unix]
+    else:
+        assert tcp is not None
+        transport_args = ["--tcp", tcp]
+
     args = [
         sys.executable,
         "-c",
         "from vgi_rpc.conformance._test_cli import main; main()",
-        *(["--cmd", cmd] if cmd is not None else ["--url", url]),  # type: ignore[list-item]
+        *transport_args,
         "--format",
         "json",
     ]
@@ -460,6 +599,31 @@ def test_shm_transport_implemented_subset_fully_conformant(worker_binary: Path) 
     report = _run_vgi_rpc_test(str(worker_binary), filter_pattern=IMPLEMENTED_FILTER, shm_size=8 * 1024 * 1024)
     failed = [t for t in report["results"] if not t["passed"] and not t["skipped"]]
     assert not failed, "SHM-transport conformance failures in the implemented subset:\n" + "\n".join(
+        f"  {t['name']}: {t.get('error', '')}" for t in failed
+    )
+    assert report["passed"] > 0, "Expected at least one test to run."
+
+
+def test_unix_transport_implemented_subset_fully_conformant(unix_worker: str) -> None:
+    """The non-streaming subset (UNIX_TCP_FILTER — see its own comment for why streaming is
+    excluded here specifically), driven over a Unix domain socket (M17, docs/roadmap.md) —
+    RpcServer's core dispatch loop (ServeAsync/ServeOneAsync) is transport-agnostic, but a
+    NetworkStream-backed transport exercises real partial-read behavior a pipe's own OS buffering
+    can mask (see WireReader/PayloadTooLargeException, added for exactly this transport family),
+    so this is a genuine additional check, not just the same test rerun for coverage's sake."""
+    report = _run_vgi_rpc_test(unix=unix_worker, filter_pattern=UNIX_TCP_FILTER)
+    failed = [t for t in report["results"] if not t["passed"] and not t["skipped"]]
+    assert not failed, "Unix-transport conformance failures in the implemented subset:\n" + "\n".join(
+        f"  {t['name']}: {t.get('error', '')}" for t in failed
+    )
+    assert report["passed"] > 0, "Expected at least one test to run."
+
+
+def test_tcp_transport_implemented_subset_fully_conformant(tcp_worker: str) -> None:
+    """Same as test_unix_transport_implemented_subset_fully_conformant, over TCP loopback."""
+    report = _run_vgi_rpc_test(tcp=tcp_worker, filter_pattern=UNIX_TCP_FILTER)
+    failed = [t for t in report["results"] if not t["passed"] and not t["skipped"]]
+    assert not failed, "TCP-transport conformance failures in the implemented subset:\n" + "\n".join(
         f"  {t['name']}: {t.get('error', '')}" for t in failed
     )
     assert report["passed"] > 0, "Expected at least one test to run."

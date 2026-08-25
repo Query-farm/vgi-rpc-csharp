@@ -6,9 +6,12 @@ that uses Apache Arrow's IPC Streaming Format as its wire protocol, with no IDL/
 services are plain interfaces, and Arrow schemas are derived from them by reflection. This port
 targets **.NET 10** and runs on **Windows and Linux**.
 
-> **Status: early scaffold.** This repository is under active initial development against the
-> milestone roadmap in [`docs/roadmap.md`](docs/roadmap.md). Nothing here is ready to depend on
-> yet — see that file for what's implemented so far.
+> **Status: feature-complete against the initial milestone roadmap** (M0–M17 in
+> [`docs/roadmap.md`](docs/roadmap.md)) — every transport, auth mode, and optional subsystem in
+> the original plan is implemented and passing the real cross-language conformance suite. One
+> known gap: real streaming (producer/exchange) calls over the Unix-domain-socket and TCP
+> transports hang against the reference Python client (pipe and HTTP streaming are unaffected) —
+> see M17's entry in the roadmap for the investigation notes. Not yet released to NuGet.org.
 
 ## Wire compatibility
 
@@ -16,8 +19,11 @@ vgi-rpc-csharp implements the same byte-level wire protocol as the canonical Pyt
 and its other ports (Go, Rust, TypeScript, Java), so peers written in any of those languages can
 interoperate over pipe/stdio, Unix domain socket, TCP, or HTTP. See
 [`docs/wire-protocol.md`](docs/wire-protocol.md) for the protocol summary and the one C#-specific
-implementation wrinkle (Apache.Arrow's .NET library can't write per-batch `custom_metadata`, so this
-repo hand-rolls that one layer of framing).
+implementation wrinkle: the stock `Apache.Arrow` NuGet package can't write or read per-batch
+`custom_metadata` (every vgi-rpc protocol semantic — method name, versions, log/error info, stream
+continuation tokens — rides on it), so this repo vendors a small, surgically patched copy of
+`apache/arrow-dotnet` instead of hand-rolling the FlatBuffers framing itself — see
+`third_party/apache-arrow-dotnet/README.md` for exactly what's patched and why.
 
 ## Modules
 

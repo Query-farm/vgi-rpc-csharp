@@ -150,6 +150,11 @@ public static class ValueCodec
             StringType => new StringArray.Builder().Append((string)value).Build(),
             BinaryType when value is byte[] bytes => new BinaryArray.Builder().Append(bytes).Build(),
             BinaryType => BuildEmbeddedRecordArray(value),
+            // LargeStringType/LargeBinaryType: only reachable via a [LargeWidth] parameter/return
+            // (see LargeWidthAttribute) — used for the conformance suite's echo_large_string/
+            // echo_large_binary, whose reference declares pa.large_string()/pa.large_binary().
+            LargeStringType => new LargeStringArray.Builder().Append((string)value).Build(),
+            LargeBinaryType when value is byte[] largeBytes => new LargeBinaryArray.Builder().Append(largeBytes).Build(),
             BooleanType => new BooleanArray.Builder().Append((bool)value).Build(),
             Int8Type => new Int8Array.Builder().Append((sbyte)value).Build(),
             UInt8Type => new UInt8Array.Builder().Append((byte)value).Build(),
@@ -186,6 +191,8 @@ public static class ValueCodec
             // Whether this BinaryType represents a byte[] or an embedded record is
             // indistinguishable (and irrelevant) for an empty/null array — both encode identically.
             BinaryType => nullRow ? new BinaryArray.Builder().AppendNull().Build() : new BinaryArray.Builder().Build(),
+            LargeStringType => nullRow ? new LargeStringArray.Builder().AppendNull().Build() : new LargeStringArray.Builder().Build(),
+            LargeBinaryType => nullRow ? new LargeBinaryArray.Builder().AppendNull().Build() : new LargeBinaryArray.Builder().Build(),
             BooleanType => nullRow ? new BooleanArray.Builder().AppendNull().Build() : new BooleanArray.Builder().Build(),
             Int8Type => nullRow ? new Int8Array.Builder().AppendNull().Build() : new Int8Array.Builder().Build(),
             UInt8Type => nullRow ? new UInt8Array.Builder().AppendNull().Build() : new UInt8Array.Builder().Build(),
@@ -561,6 +568,10 @@ public static class ValueCodec
             // reading it here as a plain string is what lets that interop even though this
             // port's own outgoing schema for the same CLR `string` is always Utf8Type.
             LargeStringArray a => a.GetString(index),
+            // LargeBinaryArray must be checked before the plain BinaryArray cases below (it's
+            // not one — LargeStringArray/LargeBinaryArray are a distinct hierarchy — but is
+            // listed here alongside its string sibling since both back a [LargeWidth] field).
+            LargeBinaryArray a when effectiveType == typeof(byte[]) => ExtractLargeBinaryValue(a, index),
             BinaryArray a when effectiveType == typeof(byte[]) => a.GetBytes(index).ToArray(),
             BinaryArray a => ExtractEmbeddedRecord(a.GetBytes(index).ToArray(), effectiveType),
             BooleanArray a => a.GetValue(index)!.Value,
@@ -591,6 +602,36 @@ public static class ValueCodec
             DictionaryArray a => ExtractEnum(a, index, effectiveType),
             _ => throw NotSupportedYet(array.Data.DataType),
         };
+    }
+
+    /// <summary>
+    /// Materializes one <see cref="LargeBinaryArray"/> value as a <c>byte[]</c> — guarding
+    /// explicitly against .NET's own single-array size ceiling (<see cref="System.Array.MaxLength"/>,
+    /// ~2^31-57 bytes on every CLR, deliberately smaller than a large-binary column can represent)
+    /// instead of letting <see cref="LargeBinaryArray.GetBytes(int)"/>'s internal
+    /// <c>checked((int)...)</c> cast fail with a bare, unexplained <see cref="OverflowException"/>.
+    ///
+    /// A value this large cannot be held in a managed <c>byte[]</c> on any CLR — this is a
+    /// genuine platform capability limit, not a configurable cap, so refusing it here (rather
+    /// than crashing mid-extraction) is the correct behavior. The conformance suite's
+    /// <c>large_payload.echo_binary_over_int32_max</c> test (2^31+1 bytes) explicitly sanctions
+    /// exactly this: any typed error is an acceptable answer provided the connection survives
+    /// (see the reference's <c>_accept_typed_refusal</c>). <see cref="QueryFarm.VgiRpc.Server.RpcServer"/>'s
+    /// existing dispatch try/catch around <see cref="ExtractRow"/> already turns any exception thrown here
+    /// into a normal wire-level error response — this method doesn't need its own error-kind or
+    /// wire handling, only to fail with a clear message instead of an opaque overflow.
+    /// </summary>
+    private static byte[] ExtractLargeBinaryValue(LargeBinaryArray array, int index)
+    {
+        var offsets = array.ValueOffsets;
+        var length = offsets[index + 1] - offsets[index];
+        if (length > System.Array.MaxLength)
+        {
+            throw new NotSupportedException(
+                $"Value is {length} bytes, which exceeds the largest byte[] this runtime can represent ({System.Array.MaxLength} bytes).");
+        }
+
+        return array.GetBytes(index).ToArray();
     }
 
     private static object ExtractList(ListArray array, int index, Type clrListType)

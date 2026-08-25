@@ -64,7 +64,7 @@ public sealed class RpcMethodInfo
             Kind = RpcMethodKind.Unary;
             ResultSchema = ResultClrType == typeof(void)
                 ? new Schema([], metadata: null)
-                : new Schema([SchemaDerivation.FieldFor("result", ResultClrType)], metadata: null);
+                : new Schema([SchemaDerivation.FieldFor("result", ResultClrType, method.ReturnParameter.IsDefined(typeof(LargeWidthAttribute)))], metadata: null);
         }
     }
 

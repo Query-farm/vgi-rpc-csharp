@@ -34,60 +34,69 @@ public static class SchemaDerivation
     private static readonly ConcurrentDictionary<Type, StructType> s_nestedStructTypeCache = new();
 
     /// <summary>Builds the top-level Arrow field for a CLR type under the given wire name.</summary>
-    public static Field FieldFor(string wireName, Type clrType) =>
-        new(wireName, ArrowTypeFor(clrType, out var nullable), nullable);
+    public static Field FieldFor(string wireName, Type clrType) => FieldFor(wireName, clrType, largeWidth: false);
+
+    /// <summary>Same as <see cref="FieldFor(string, Type)"/>, forcing the 64-bit-offset variant
+    /// for a <c>string</c>/<c>byte[]</c> type — see <see cref="LargeWidthAttribute"/>.</summary>
+    public static Field FieldFor(string wireName, Type clrType, bool largeWidth) =>
+        new(wireName, ArrowTypeFor(clrType, largeWidth, out var nullable), nullable);
 
     /// <summary>
     /// Resolves the top-level Arrow type for a CLR type, unwrapping <see cref="Nullable{T}"/>
     /// and reporting whether the field should be nullable on the wire.
     /// </summary>
-    public static IArrowType ArrowTypeFor(Type clrType, out bool nullable)
+    public static IArrowType ArrowTypeFor(Type clrType, out bool nullable) => ArrowTypeFor(clrType, largeWidth: false, out nullable);
+
+    /// <summary>Same as <see cref="ArrowTypeFor(Type, out bool)"/>, forcing the 64-bit-offset
+    /// variant for a <c>string</c>/<c>byte[]</c> type — see <see cref="LargeWidthAttribute"/>.</summary>
+    public static IArrowType ArrowTypeFor(Type clrType, bool largeWidth, out bool nullable)
     {
         if (Nullable.GetUnderlyingType(clrType) is { } underlying)
         {
             nullable = true;
-            return ArrowTypeForNonNullable(underlying, nested: false);
+            return ArrowTypeForNonNullable(underlying, nested: false, largeWidth);
         }
 
         // Reference types default to nullable on the wire unless a caller has independently
         // established (e.g. via NullabilityInfoContext on the originating member) that they
         // aren't — this overload doesn't have access to that context, so it errs permissive.
         nullable = clrType.IsClass || clrType.IsInterface;
-        return ArrowTypeForNonNullable(clrType, nested: false);
+        return ArrowTypeForNonNullable(clrType, nested: false, largeWidth);
     }
 
     /// <summary>
     /// Resolves nullability from a parameter's actual nullable-reference-type annotation (via
     /// <see cref="NullabilityInfoContext"/>) rather than guessing from "is a reference type".
+    /// Honors a <see cref="LargeWidthAttribute"/> on the parameter.
     /// </summary>
     public static Field FieldForParameter(string wireName, ParameterInfo parameter) =>
-        FieldForMember(wireName, parameter.ParameterType, new NullabilityInfoContext().Create(parameter), nested: false);
+        FieldForMember(wireName, parameter.ParameterType, new NullabilityInfoContext().Create(parameter), nested: false, largeWidth: parameter.IsDefined(typeof(LargeWidthAttribute)));
 
     /// <summary>Same as <see cref="FieldForParameter"/>, for a property of a dataclass-equivalent's own fields.</summary>
     public static Field FieldForProperty(string wireName, PropertyInfo property) =>
-        FieldForMember(wireName, property.PropertyType, new NullabilityInfoContext().Create(property), nested: true);
+        FieldForMember(wireName, property.PropertyType, new NullabilityInfoContext().Create(property), nested: true, largeWidth: false);
 
-    private static Field FieldForMember(string wireName, Type clrType, NullabilityInfo info, bool nested)
+    private static Field FieldForMember(string wireName, Type clrType, NullabilityInfo info, bool nested, bool largeWidth)
     {
         if (Nullable.GetUnderlyingType(clrType) is { } underlying)
         {
-            return new Field(wireName, ArrowTypeForNonNullable(underlying, nested), nullable: true);
+            return new Field(wireName, ArrowTypeForNonNullable(underlying, nested, largeWidth), nullable: true);
         }
 
         var nullable = info.WriteState is NullabilityState.Nullable || !clrType.IsValueType && info.WriteState != NullabilityState.NotNull;
-        return new Field(wireName, ArrowTypeForNonNullable(clrType, nested), nullable);
+        return new Field(wireName, ArrowTypeForNonNullable(clrType, nested, largeWidth), nullable);
     }
 
-    private static IArrowType ArrowTypeForNonNullable(Type type, bool nested)
+    private static IArrowType ArrowTypeForNonNullable(Type type, bool nested, bool largeWidth = false)
     {
         if (type == typeof(string))
         {
-            return StringType.Default;
+            return largeWidth ? LargeStringType.Default : StringType.Default;
         }
 
         if (type == typeof(byte[]))
         {
-            return BinaryType.Default;
+            return largeWidth ? LargeBinaryType.Default : BinaryType.Default;
         }
 
         if (type == typeof(bool))
@@ -213,7 +222,7 @@ public static class SchemaDerivation
 
     /// <summary>A list/map element field — unwraps <see cref="Nullable{T}"/> (there's no
     /// <see cref="NullabilityInfoContext"/> source for a bare generic-argument type, so
-    /// reference-type elements default to nullable, matching <see cref="ArrowTypeFor"/>'s
+    /// reference-type elements default to nullable, matching <see cref="ArrowTypeFor(Type, out bool)"/>'s
     /// top-level-parameter behavior).</summary>
     private static Field ElementField(string name, Type elementType, bool nested, bool forceNonNullable)
     {
@@ -304,6 +313,6 @@ public static class SchemaDerivation
         type
             .GetProperties(BindingFlags.Public | BindingFlags.Instance)
             .Where(p => p.CanRead && p.GetIndexParameters().Length == 0)
-            .Select(p => FieldForMember(WireNaming.ForProperty(p), p.PropertyType, new NullabilityInfoContext().Create(p), nested))
+            .Select(p => FieldForMember(WireNaming.ForProperty(p), p.PropertyType, new NullabilityInfoContext().Create(p), nested, largeWidth: false))
             .ToArray();
 }

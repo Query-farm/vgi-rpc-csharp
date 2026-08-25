@@ -145,6 +145,15 @@ public sealed class RpcServer
             _ = await reader.ReadSchemaAsync(cancellationToken).ConfigureAwait(false);
             request = await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false);
         }
+        catch (PayloadTooLargeException exc) when (!cancellationToken.IsCancellationRequested)
+        {
+            // Unlike the catch-all below, WireReader has already drained the oversized body off
+            // the wire before throwing this — the connection is still in sync, so refuse with a
+            // normal typed error and keep serving instead of tearing the whole connection down.
+            // See PayloadTooLargeException's doc comment and docs/roadmap.md M17.
+            await WriteErrorStreamAsync(transport.Output, s_emptySchema, exc, cancellationToken).ConfigureAwait(false);
+            return true;
+        }
         catch (Exception) when (!cancellationToken.IsCancellationRequested)
         {
             // The channel closed (cleanly or otherwise) before a full request arrived — the

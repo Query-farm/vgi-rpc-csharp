@@ -1,4 +1,5 @@
 using QueryFarm.VgiRpc.Conformance.Types;
+using QueryFarm.VgiRpc.Reflection;
 using QueryFarm.VgiRpc.Server;
 using QueryFarm.VgiRpc.Streaming;
 
@@ -125,6 +126,18 @@ public interface IConformanceService
     /// default <c>Utf8Type</c> (32-bit offsets) — functionally equivalent for every payload size
     /// the external-storage conformance suite actually exercises (tens of KB).</summary>
     Task<string> EchoLargeStringAsync(string value);
+
+    // -- Large payload (M17) --------------------------------------------------
+
+    /// <summary>Echoes <paramref name="value"/> — wire-typed <c>large_binary</c> (64-bit offsets,
+    /// via <see cref="LargeWidthAttribute"/>), matching the reference's
+    /// <c>Annotated[bytes, ArrowType(pa.large_binary())]</c>. Backs both the mandatory
+    /// <c>large_payload.echo_binary_over_int32_max</c> conformance test (2^31+1 bytes — a size no
+    /// managed <c>byte[]</c> can represent on any CLR, so this port answers with a typed refusal;
+    /// see <see cref="Reflection.ValueCodec"/>'s <c>ExtractLargeBinaryValue</c>) and the smaller
+    /// <c>echo_binary_4mib</c> short-write regression check.</summary>
+    [return: LargeWidth]
+    Task<byte[]> EchoLargeBinaryAsync([LargeWidth] byte[] value);
 
     // -- Multi-param & defaults ---------------------------------------------
 

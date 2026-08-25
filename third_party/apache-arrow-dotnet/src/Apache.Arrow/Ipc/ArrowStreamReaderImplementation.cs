@@ -91,7 +91,16 @@ namespace Apache.Arrow.Ipc
 
                 Flatbuf.Message message = Flatbuf.Message.GetRootAsMessage(CreateByteBuffer(messageBuff));
 
-                int bodyLength = checked((int)message.BodyLength);
+                // [vgi-rpc-csharp patch] Was a bare `checked((int)message.BodyLength)` — throws an
+                // opaque OverflowException with the stream left mid-message (header consumed, huge
+                // body still unread). ArrowIpcBodyTooLargeException carries the declared length so
+                // a caller can drain exactly that many bytes and keep the connection usable. See
+                // ArrowIpcBodyTooLargeException.cs.
+                if (message.BodyLength > int.MaxValue)
+                {
+                    throw new ArrowIpcBodyTooLargeException(message.BodyLength);
+                }
+                int bodyLength = (int)message.BodyLength;
 
                 IMemoryOwner<byte> bodyBuffOwner = AllocateMessageBodyBuffer(bodyLength);
                 Memory<byte> bodyBuff = bodyBuffOwner.Memory.Slice(0, bodyLength);
@@ -136,11 +145,12 @@ namespace Apache.Arrow.Ipc
 
                 Flatbuf.Message message = Flatbuf.Message.GetRootAsMessage(CreateByteBuffer(messageBuff));
 
+                // [vgi-rpc-csharp patch] Was a plain OverflowException — see the matching comment
+                // in ReadMessageAsync (the async twin of this method) for why
+                // ArrowIpcBodyTooLargeException replaces it.
                 if (message.BodyLength > int.MaxValue)
                 {
-                    throw new OverflowException(
-                        $"Arrow IPC message body length ({message.BodyLength}) is larger than " +
-                        $"the maximum supported message size ({int.MaxValue})");
+                    throw new ArrowIpcBodyTooLargeException(message.BodyLength);
                 }
                 int bodyLength = (int)message.BodyLength;
 

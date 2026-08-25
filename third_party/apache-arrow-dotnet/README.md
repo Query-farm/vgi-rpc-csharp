@@ -38,6 +38,31 @@ The third commit's cross-language pythonnet tests were **not** vendored into thi
 project here — see `test/QueryFarm.VgiRpc.Tests/Wire/` in this repo for our own coverage of the
 same round-trip, exercised through `QueryFarm.VgiRpc`'s wire layer instead).
 
+## Second patch: `ArrowIpcBodyTooLargeException` (vgi-rpc-csharp-specific, not from an upstream PR)
+
+Unlike the custom_metadata patch above, this one is **not** cherry-picked from any upstream PR —
+it's authored directly in this vendoring, for a narrower, vgi-rpc-csharp-specific reason (M17, see
+`docs/roadmap.md`): the reader's own message-body-length handling threw a bare `OverflowException`
+(async path) or a similarly bare one (sync path) when a message's declared body length exceeds
+`int.MaxValue` — with the message *header* already fully consumed from the stream but the *body*
+(potentially gigabytes) left completely unread. A caller catching that exception generically (as
+`QueryFarm.VgiRpc.Server.RpcServer.ServeOneAsync` used to) has no way to tell "the stream is fine,
+just refuse this one oversized message" apart from "the stream is genuinely broken" — so it always
+had to assume the worse case and tear down the whole connection.
+
+`ArrowIpcBodyTooLargeException` (`src/Apache.Arrow/Ipc/ArrowIpcBodyTooLargeException.cs`) replaces
+both throw sites in `ArrowStreamReaderImplementation.cs` (`ReadMessageAsync` and `ReadRecordBatch`)
+and carries the declared body length, so `QueryFarm.VgiRpc.Wire.WireReader` can drain exactly that
+many bytes off the stream (keeping it in sync with the sender) before the server replies with a
+normal typed wire error and keeps serving. This is what backs the conformance suite's mandatory
+`large_payload.echo_binary_over_int32_max` test (a 2^31+1-byte payload — larger than any managed
+`byte[]`/reader buffer on this or any .NET runtime can hold, so a typed refusal is the only
+correct answer; the reference's own `_accept_typed_refusal` helper exists for exactly this case).
+
+If/when this vendoring is removed (see below), this behavior would need to move to whatever reader
+the real `Apache.Arrow` package ships — either by re-adding an equivalent patch, or by having
+`WireReader` peek the message header itself before delegating to the stock reader.
+
 ## What's NOT vendored
 
 Only `src/Apache.Arrow/` and `src/Apache.Arrow.Scalars/` (Arrow's own dependency of the former).
