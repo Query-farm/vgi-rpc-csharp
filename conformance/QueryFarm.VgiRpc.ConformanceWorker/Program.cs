@@ -138,6 +138,32 @@ if (options.Http)
         authenticate = null;
     }
 
+    // Proxy proof composes with whatever authenticate delegate was selected above (spec §8: a
+    // precondition, ANDed with user authentication) via ProxyProof.RequireAll — see that method's
+    // doc comment for why this port needs no special combinator type to get "gate first, inner
+    // only on success" for free. None of the other conformance flags are exercised together with
+    // --proof-mode by the shared TestProxyProof group's own fixtures today, but composing here
+    // rather than replacing keeps that combination correct if a future test needs it.
+    var proxyProofRequired = false;
+    if (options.ProofMode is { } modeArg && modeArg != "off")
+    {
+        var mode = modeArg switch
+        {
+            "allow" => ProxyProofMode.Allow,
+            "require" => ProxyProofMode.Require,
+            _ => throw new ArgumentException($"--proof-mode must be off|allow|require, got '{modeArg}'"),
+        };
+        var config = new ProxyProofConfig(
+            mode,
+            originId: options.ProofOriginId ?? "",
+            secrets: options.ProofSecrets is { } s ? ProxyProof.ParseSecrets(s) : null,
+            skewSeconds: options.ProofSkewSeconds,
+            enableReplayCache: !options.ProofNoReplayCache);
+        var gate = ProxyProof.CreateGate(config);
+        authenticate = ProxyProof.RequireAll(gate, authenticate);
+        proxyProofRequired = mode == ProxyProofMode.Require;
+    }
+
     var tokenKey = options.TokenKeyHex is { } hex ? Convert.FromHexString(hex) : null;
     StickySessionRegistry? sticky = null;
     if (options.ConformanceSticky)
@@ -151,7 +177,7 @@ if (options.Http)
             echoHeaders: echoHeaders);
     }
 
-    app.MapVgiRpc(server, maxResponseBytes: 65536, authenticate: authenticate, proxyHint: options.ConformanceProxyHint, corsPolicyName: corsEnabled ? CorsPolicyName : null, tokenKey: tokenKey, sticky: sticky);
+    app.MapVgiRpc(server, maxResponseBytes: 65536, authenticate: authenticate, proxyHint: options.ConformanceProxyHint, corsPolicyName: corsEnabled ? CorsPolicyName : null, tokenKey: tokenKey, sticky: sticky, proxyProofRequired: proxyProofRequired);
 
     // Test-only admin endpoint — NOT part of MapVgiRpc's real surface. Lets
     // TestSticky::test_drain_rejects_new_opens flip the drain flag over the wire instead of
@@ -245,6 +271,11 @@ internal sealed class CliOptions
     public double? StickyTtlSeconds { get; private init; }
     public bool StickyAuth { get; private init; }
     public string? TokenKeyHex { get; private init; }
+    public string? ProofMode { get; private init; }
+    public string? ProofOriginId { get; private init; }
+    public string? ProofSecrets { get; private init; }
+    public int ProofSkewSeconds { get; private init; } = 30;
+    public bool ProofNoReplayCache { get; private init; }
 
     public static CliOptions? Parse(string[] args)
     {
@@ -263,6 +294,11 @@ internal sealed class CliOptions
         double? stickyTtlSeconds = null;
         var stickyAuth = false;
         string? tokenKeyHex = null;
+        string? proofMode = null;
+        string? proofOriginId = null;
+        string? proofSecrets = null;
+        var proofSkewSeconds = 30;
+        var proofNoReplayCache = false;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -338,6 +374,26 @@ internal sealed class CliOptions
                     // which is what makes the rejection meaningful rather than a decrypt failure.
                     tokenKeyHex = RequireValue(args, ref i, "--token-key");
                     break;
+                case "--proof-mode":
+                    // "off"|"allow"|"require" — mirrors the reference repo's
+                    // tests/conformance/proof_harness.py::ProofWorkerConfig.mode, driven by the
+                    // shared TestProxyProof group's proof_worker_factory fixture (see
+                    // docs/roadmap.md M11).
+                    proofMode = RequireValue(args, ref i, "--proof-mode");
+                    break;
+                case "--proof-origin-id":
+                    proofOriginId = RequireValue(args, ref i, "--proof-origin-id");
+                    break;
+                case "--proof-secrets":
+                    // "kid:hex,kid:hex" — see ProxyProof.ParseSecrets.
+                    proofSecrets = RequireValue(args, ref i, "--proof-secrets");
+                    break;
+                case "--proof-skew":
+                    proofSkewSeconds = int.Parse(RequireValue(args, ref i, "--proof-skew"));
+                    break;
+                case "--proof-no-replay-cache":
+                    proofNoReplayCache = true;
+                    break;
                 default:
                     Console.Error.WriteLine($"Unknown argument: {args[i]}");
                     return null;
@@ -370,6 +426,11 @@ internal sealed class CliOptions
             StickyTtlSeconds = stickyTtlSeconds,
             StickyAuth = stickyAuth,
             TokenKeyHex = tokenKeyHex,
+            ProofMode = proofMode,
+            ProofOriginId = proofOriginId,
+            ProofSecrets = proofSecrets,
+            ProofSkewSeconds = proofSkewSeconds,
+            ProofNoReplayCache = proofNoReplayCache,
         };
     }
 

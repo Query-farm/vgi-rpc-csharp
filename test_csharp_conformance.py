@@ -223,6 +223,42 @@ def conformance_http_sticky_auth_port(worker_binary: Path) -> Iterator[int]:
     yield from _spawn_http_worker_port(worker_binary, "--sticky-auth")
 
 
+# M11 (see docs/roadmap.md): proxy proof. Like M10 sticky sessions, the canonical Python repo
+# ships a full TestProxyProof (+ TestProxyProofOffMode) group in vgi_rpc.conformance._pytest_suite
+# — imported directly below, mirroring vgi-rpc-java/tests/test_java_conformance.py's own
+# proof_worker_factory fixture. The suite owns the test matrix; this only has to know how to spawn
+# one worker for a given vgi_rpc.conformance.proof_harness.ProofWorkerConfig.
+@pytest.fixture
+def proof_worker_factory(worker_binary: Path):
+    """Returns a callable(ProofWorkerConfig) -> context manager yielding a ProofWorker."""
+    import contextlib
+
+    from vgi_rpc.conformance.proof_harness import ProofWorker
+
+    @contextlib.contextmanager
+    def spawn(config):
+        args = [
+            "--proof-mode",
+            config.mode,
+            "--proof-origin-id",
+            config.origin_id,
+            "--proof-secrets",
+            config.secrets,
+            "--proof-skew",
+            str(config.skew_seconds),
+        ]
+        if not config.replay_cache:
+            args.append("--proof-no-replay-cache")
+        gen = _spawn_http_worker_port(worker_binary, *args)
+        port = next(gen)
+        try:
+            yield ProofWorker(port=port, prefix="", config=config)
+        finally:
+            next(gen, None)
+
+    yield spawn
+
+
 _CORS_ALLOWED_ORIGIN = "https://allowed.example.com"
 
 
@@ -723,3 +759,9 @@ class TestMtls:
 # (conformance_http_port et al.) — see the comment above those fixtures for why this is imported
 # rather than hand-written like TestUnauthorized/TestCors/TestMtls.
 from vgi_rpc.conformance._pytest_suite import TestSticky  # noqa: E402,F401
+
+# M11: the canonical TestProxyProof (+ TestProxyProofOffMode) groups, collected against the
+# proof_worker_factory fixture defined above. TestProxyProofOffMode reuses conformance_http_port
+# (the M10 sticky fixture) — a sticky-enabled worker with no proxy-proof gate configured still
+# satisfies "unconfigured worker accepts without a proof", which is exactly the property under test.
+from vgi_rpc.conformance._pytest_suite import TestProxyProof, TestProxyProofOffMode  # noqa: E402,F401

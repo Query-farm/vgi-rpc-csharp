@@ -116,12 +116,19 @@ public static class RpcHttpEndpoints
     /// (the default) leaves the wire byte-identical to the non-sticky framework, matching
     /// Python's opt-in default. Session tokens are sealed with the same <paramref name="tokenKey"/>
     /// stream call-id tokens use, matching Python's single shared <c>token_key</c>.</param>
-    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null, long? maxResponseBytes = null, AuthenticateDelegate? authenticate = null, string? proxyHint = null, string? corsPolicyName = null, StickySessionRegistry? sticky = null)
+    /// <param name="proxyProofRequired">Set when <paramref name="authenticate"/> enforces proxy
+    /// proof in <c>require</c> mode (see <see cref="ProxyProof.CreateGate"/>) — advertises
+    /// <see cref="ProxyProof.ProofRequiredHeader"/> on every response, per
+    /// <c>docs/proxy-proof-spec.md</c> §2.2. Like <paramref name="proxyHint"/>, this is
+    /// operator-declared rather than derived: <paramref name="authenticate"/> is an opaque
+    /// callback (possibly composed via <see cref="ProxyProof.RequireAll"/>), so `MapVgiRpc` has
+    /// no way to introspect whether it enforces proxy proof or in which mode.</param>
+    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null, long? maxResponseBytes = null, AuthenticateDelegate? authenticate = null, string? proxyHint = null, string? corsPolicyName = null, StickySessionRegistry? sticky = null, bool proxyProofRequired = false)
     {
         tokenKey ??= RandomNumberGenerator.GetBytes(32);
         var registry = new StreamCallRegistry();
-        var health = endpoints.MapMethods($"{prefix}/health", ["GET", "HEAD"], (HttpContext context) => HandleHealthAsync(server, context));
-        var capabilities = endpoints.MapMethods($"{prefix}/health", ["OPTIONS"], (HttpContext context) => HandleCapabilitiesAsync(context, maxResponseBytes, sticky));
+        var health = endpoints.MapMethods($"{prefix}/health", ["GET", "HEAD"], (HttpContext context) => HandleHealthAsync(server, context, proxyProofRequired));
+        var capabilities = endpoints.MapMethods($"{prefix}/health", ["OPTIONS"], (HttpContext context) => HandleCapabilitiesAsync(context, maxResponseBytes, sticky, proxyProofRequired));
         var unary = endpoints.MapPost($"{prefix}/{{method}}", (string method, HttpContext context) => HandleUnaryAsync(server, method, context, compressionLevel, maxResponseBytes, authenticate, proxyHint, sticky, tokenKey));
         var init = endpoints.MapPost($"{prefix}/{{method}}/init", (string method, HttpContext context) => HandleStreamInitAsync(server, method, context, compressionLevel, tokenKey, registry, authenticate, proxyHint, sticky));
         var exchange = endpoints.MapPost($"{prefix}/{{method}}/exchange", (string method, HttpContext context) => HandleStreamExchangeAsync(server, method, context, compressionLevel, tokenKey, registry, maxResponseBytes, authenticate, proxyHint, sticky));
@@ -322,7 +329,7 @@ public static class RpcHttpEndpoints
     /// and <c>VGI-Supported-Encodings</c> naming the codecs this server can actually produce for
     /// responses (see <see cref="s_producibleEncodings"/> — gzip only, for now).
     /// </summary>
-    private static Task HandleCapabilitiesAsync(HttpContext context, long? maxResponseBytes, StickySessionRegistry? sticky)
+    private static Task HandleCapabilitiesAsync(HttpContext context, long? maxResponseBytes, StickySessionRegistry? sticky, bool proxyProofRequired)
     {
         var headers = context.Response.Headers;
         if (maxResponseBytes is { } cap)
@@ -345,11 +352,18 @@ public static class RpcHttpEndpoints
             }
         }
 
+        if (proxyProofRequired)
+        {
+            // docs/proxy-proof-spec.md §2.2 — require mode only, never emitted as "false" in
+            // off/allow (writers MUST emit it only in require mode).
+            headers[ProxyProof.ProofRequiredHeader] = "true";
+        }
+
         context.Response.StatusCode = StatusCodes.Status200OK;
         return Task.CompletedTask;
     }
 
-    private static Task HandleHealthAsync(RpcServer server, HttpContext context)
+    private static Task HandleHealthAsync(RpcServer server, HttpContext context, bool proxyProofRequired)
     {
         // Matches Python's _HealthResource: a small pre-shaped JSON body, and (per the porting
         // guide's mandatory-flags contract) a bodyless HEAD variant with the same headers — the
@@ -362,6 +376,13 @@ public static class RpcHttpEndpoints
         });
         context.Response.ContentType = "application/json";
         context.Response.ContentLength = body.Length;
+        if (proxyProofRequired)
+        {
+            // docs/proxy-proof-spec.md §2.2 — "advertise on every response"; GET/HEAD /health is
+            // itself proof-exempt (§2.3) and is what TestProxyProof's own capability check probes
+            // directly (a plain GET, not OPTIONS), unlike sticky's OPTIONS-only discovery contract.
+            context.Response.Headers[ProxyProof.ProofRequiredHeader] = "true";
+        }
         if (HttpMethods.IsHead(context.Request.Method))
         {
             return Task.CompletedTask;

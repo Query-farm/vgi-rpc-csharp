@@ -457,7 +457,87 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       needed for conformance — every sticky test drives this port's HTTP *server* from the real
       Python client, never the reverse — but a future C#-to-C# deployment wanting sticky sessions
       would need it added).
-- [ ] **M11 — Proxy proof.**
+- [x] **M11 — Proxy proof.** Full port of `vgi_rpc.http._proof` —
+      `QueryFarm.VgiRpc.Http.ProxyProof`/`ProxyProofConfig`/`NonceCache`. HMAC-SHA256 evidence
+      that a request arrived through a trusted proxy: `VGI-Proxy-Proof: v1.<kid>.<ts>.<nonce>.<mac>`,
+      verified per spec §6's exact 9-step order (cheap charset/format checks before any MAC is
+      computed, so an unparseable header costs a few regex matches rather than a hash), with a
+      two-sided timestamp window (checking only the upper bound would let a far-future timestamp
+      pass forever — spec explicitly calls this out as a real defect seen elsewhere) and a
+      constant-time MAC compare (`CryptographicOperations.FixedTimeEquals`) selected by `kid`
+      (public, so branching on it is safe — only the one resulting MAC needs the constant-time
+      path). `NonceCache` is a direct port of Python's `OrderedDict`-based bounded replay cache
+      (TTL + hard capacity cap, oldest-evicted-on-overflow, `System.Collections.Generic.OrderedDictionary`
+      standing in for `collections.OrderedDict` — same "uniform TTL means insertion order is
+      expiry order" sweep-from-front trick). `ProxyProofConfig` validates eagerly at construction
+      (mirrors Python's `__post_init__`: `require`/`allow` mode with no secrets, no `origin_id`,
+      a wrong-length secret, or a non-positive skew all throw immediately — "a shared secret spans
+      two independently deployed processes; a lax parse means require mode becomes a 100%
+      rejection outage with no diagnostic").
+      **Architecture note (the one genuine simplification over Python, and a bigger one than
+      M10's):** Python needs a distinct `PreconditionGate`/`require_all` combinator system because
+      its `chain_authenticate` is an OR-combinator that swallows `ValueError` to try the next
+      credential, so a precondition gate must raise a distinguished exception type
+      (`PermissionError`) to avoid being silently skipped by that combinator. This port's
+      `AuthenticateDelegate` has no OR-combinator at all — there is exactly one authenticate
+      delegate per `MapVgiRpc` call — so plain sequential `async`/`await` composition
+      (`ProxyProof.RequireAll(gate, inner)`, three lines: await the gate, then await inner if
+      given) already gives the exact "gate first, only call inner on success" behavior spec §8
+      requires, with nothing around to swallow the gate's exception. No distinguished exception
+      type needed at all — `AuthFailure` (the same type every other authenticator in this port
+      already throws) is sufficient.
+      Exemptions (spec §2.3 — `OPTIONS` on any path, `/.well-known/*`, `{prefix}/health` reachable
+      without a proof in every mode) needed **zero extra code**: this port's authenticate delegates
+      are only ever invoked from inside the unary/init/exchange dispatch handlers, never for
+      `/health` or `OPTIONS /health`; `/.well-known/*` has no routes in this port at all; and CORS
+      preflight `OPTIONS` requests are intercepted by ASP.NET Core's own CORS middleware before
+      reaching any mapped endpoint. All three exemptions were already structurally true before
+      this milestone existed.
+      Capability header (`VGI-Proxy-Proof-Required`, `require` mode only) required touching both
+      `HandleCapabilitiesAsync` (`OPTIONS /health`, matching sticky's existing discovery contract)
+      *and*, unlike sticky, `HandleHealthAsync` (plain `GET`/`HEAD /health`) — the conformance
+      suite's own capability check (`_health_headers`) probes a plain GET, not OPTIONS, so both
+      needed the header. `MapVgiRpc` gained a `proxyProofRequired: bool` parameter, operator-set
+      like `proxyHint` rather than derived — `authenticate` is an opaque (possibly
+      `RequireAll`-composed) callback, so `MapVgiRpc` has no way to introspect whether it enforces
+      proxy proof or in which mode (spec §2.2 makes this normative, not a shortcut: "a port that
+      tries to infer it from the callback will get it wrong for `require_all(gate, inner)` — which
+      is the shape every real deployment uses").
+      Attribution (spec §9: verified proof surfaces in claims, never in `domain`/`principal`) uses
+      the same `HttpContext.Items` convention as `MtlsIdentity`/`AuthIdentity` from M9/M10
+      (`ProxyProofResult.SetOn`/`GetFrom`) — this port's now-established, documented answer to not
+      having a full claims-propagation-to-dispatch mechanism yet.
+      Wired into the conformance worker via `--proof-mode off|allow|require`, `--proof-origin-id`,
+      `--proof-secrets kid:hex,...`, `--proof-skew <seconds>`, `--proof-no-replay-cache` — composed
+      with whatever authenticate delegate an existing flag (`--sticky-auth`, `--conformance-mtls-subject`,
+      …) already selected via `RequireAll`, rather than replacing it, so the composition stays
+      correct if a future conformance fixture needs both at once.
+      Verified by directly collecting the canonical Python repo's own `TestProxyProof` +
+      `TestProxyProofOffMode` groups (`from vgi_rpc.conformance._pytest_suite import TestProxyProof,
+      TestProxyProofOffMode`) — the same higher-fidelity pattern M10 established over hand-written
+      httpx2 tests, since a complete canonical suite already existed. `TestProxyProofOffMode`
+      reuses M10's own `conformance_http_port` fixture (a sticky-enabled worker with no proxy-proof
+      gate configured) — no new fixture needed, and a nice confirmation that "opt-in, off by
+      default" composes cleanly across milestones. All 22 `TestProxyProof`/`TestProxyProofOffMode`
+      tests passed on the **first real run against the real worker** — no bugs found this time
+      (unlike M9's mTLS/M10's sticky sessions, each of which surfaced at least one real bug before
+      going green), which is itself a signal the design fidelity to the Python reference held up.
+      Plus 42 new `ProxyProofTests` xunit tests covering the token codec (mint/verify round-trip,
+      a fixed canonical-string vector, every §6 rejection reason individually, wrong-origin
+      audience binding, both timestamp-window bounds), the nonce replay cache (fresh/replay/
+      overflow-eviction/TTL-sweep), `ParseSecrets`/`ProxyProofConfig` validation, the gate/`RequireAll`
+      composition (including the anti-oracle assertion that a rejection detail never echoes the
+      caller-controlled `kid` or internal reason code), and `DeriveSecret`. All 70 Python
+      conformance tests and 165 xunit tests (18+141+6 core/Http/OAuth) pass, both locally and in a
+      linux/amd64 Docker container matching CI's ubuntu-latest path. Manually curl/httpx-verified
+      against a running worker (health exemption, unauthenticated rejection, valid-proof
+      acceptance, wrong-origin rejection) before writing the automated tests, per the established
+      habit.
+      Not implemented: distributed/cross-process replay tracking and secret distribution via a
+      fetched trust document (both explicitly out of scope per spec §13); the "AND with a
+      configured user authenticator" composition is implemented and documented
+      (`ProxyProof.RequireAll`) but not exercised by a dedicated conformance fixture today (the
+      imported `TestProxyProof` suite doesn't currently test that combination against any port).
 - [ ] **M12 — Token introspection.**
 - [ ] **M13 — External storage (S3/GCS).**
 - [ ] **M14 — SHM transport.**
