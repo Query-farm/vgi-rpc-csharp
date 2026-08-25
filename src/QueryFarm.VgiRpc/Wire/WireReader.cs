@@ -58,6 +58,28 @@ public sealed class WireReader : IDisposable
         return batch is null ? null : new AnnotatedBatch(batch, _reader.LastBatchCustomMetadata);
     }
 
+    /// <summary>
+    /// Reads and discards any batches still remaining on this logical IPC stream, through its
+    /// EOS marker. Required after reading the one batch a caller actually wanted (a unary/stream-
+    /// init request, one exchange turn) and before doing anything else with the shared underlying
+    /// channel — <see cref="ArrowStreamReader"/> (like every other Arrow IPC reader this port's
+    /// sibling ports use — confirmed against both <c>vgi-rpc-go</c>'s <c>drainInputStream</c>/
+    /// <c>ipc.NewReader(...).Next()</c> loop and <c>vgi-rpc-java</c>'s <c>IpcStreamReader.drain()</c>,
+    /// both called unconditionally at the equivalent point) stops as soon as it has the one batch
+    /// a caller asked for; it does NOT consume the trailing EOS marker (or any further batches) on
+    /// its own. Leaving those bytes unread means the NEXT reader constructed over the same channel
+    /// — e.g. <see cref="Server.RpcServer.ServeStreamAsync"/>'s own input reader, built fresh right
+    /// after the stream-init request is read — starts misaligned, no longer at a real message
+    /// boundary. Safe to call even when the stream is already fully consumed (a no-op).
+    /// </summary>
+    public async Task DrainRemainingBatchesAsync(CancellationToken cancellationToken = default)
+    {
+        while (await ReadNextAsync(cancellationToken).ConfigureAwait(false) is not null)
+        {
+            // discard
+        }
+    }
+
     /// <summary>Reads and discards exactly <paramref name="byteCount"/> bytes so a stream stays
     /// in sync after refusing a message without materializing its body.</summary>
     private static async Task DrainAsync(Stream stream, long byteCount, CancellationToken cancellationToken)

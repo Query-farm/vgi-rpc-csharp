@@ -1042,5 +1042,67 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       set; the known unix/tcp streaming gap called out explicitly rather than glossed over (see
       above) so it isn't rediscovered from scratch by a future session.
 
+- [x] **M18 — Unix/tcp streaming hang: root cause found and fixed.** Resumed the M17 investigation
+      with a from-scratch, zero-vgi-rpc-dependency reproducer (stock `Apache.Arrow` NuGet package,
+      no vendored fork; real `pyarrow`; a raw `AF_UNIX` socket) to isolate the exact trigger outside
+      this codebase entirely, cross-platform (macOS/kqueue, Linux x64 Docker/epoll, Linux ARM64
+      EC2/epoll, Windows 11/IOCP) and cross-version (.NET 9 and 10, pyarrow 18.1.0 and 25.0.1).
+
+      **A first hypothesis — that this was an upstream pyarrow client bug (`write_batch()` never
+      pushing bytes for a zero-column `RecordBatch`) — was formed, written up, and then directly
+      disproved** by the most important check of all: does a sibling port actually pass this same
+      case? It does. `vgi-rpc-go`'s real conformance suite
+      (`TestProducerStream::test_produce_n[unix]` and 8 siblings, using the exact same real Python
+      client, the exact same zero-column `_TICK_BATCH`, over the exact same kind of Unix domain
+      socket) passes in well under a second. That single check — prompted by direct pushback ("did
+      you test this across pyarrow versions, this seems strange as this was working before"; the
+      version sweep found nothing, but the sibling-port check did) — retired the pyarrow theory
+      outright: if pyarrow genuinely never wrote the bytes, Go's server would block on them too. A
+      direct capture (`pyarrow.ipc.new_stream(BytesIO, ...)`, inspecting `buf.tell()` after each
+      `write_batch()` call) confirmed pyarrow writes real bytes synchronously on every call, no
+      deferral at all — the write side was never the problem.
+
+      **Real root cause, pinned exactly via `strace` and targeted instrumentation of the vendored
+      reader:** a `RecordBatch` message body is legitimately **zero bytes long** whenever the batch
+      has no buffers — exactly the shape of every producer-stream tick, since
+      `vgi_rpc/rpc/_types.py`'s cached `_TICK_BATCH` is a permanent zero-row, zero-column batch.
+      `Apache.Arrow`'s `StreamExtensions.ReadFullBufferAsync`/`ReadFullBuffer` called
+      `stream.ReadAsync`/`stream.Read` with that zero-length buffer unconditionally. Over a
+      `MemoryStream` this is a harmless no-op (confirmed: feeding the exact captured wire bytes
+      through a `MemoryStream` parses correctly and instantly) — but over a real socket-backed
+      `NetworkStream`, a zero-byte `ReadAsync`/`Read` does **not** complete immediately the way it
+      logically should; it blocks as if waiting for the peer to send *something* (or close), instead
+      of trivially returning `0`. `strace` on the hung server showed the full 64-byte message body
+      already fully received and correctly parsed (`CreateArrowObjectFromMessage` returning a valid
+      zero-row batch) — the very next call was a spurious zero-length read that then sat with no
+      further syscalls on that fd until the client gave up ~8s later and the socket closed, at which
+      point the zero-length read finally "completed" (returning 0, indistinguishable from a
+      deliberate EOF). That's why every earlier timing measurement lined up almost exactly with
+      whatever the client's own read timeout happened to be — that was the client giving up and
+      closing the connection, not any internal .NET/Arrow timer. Go's own IPC reader never hits this
+      because Go's `io.ReadFull` special-cases a zero-length buffer and returns without issuing a
+      read syscall at all (documented stdlib behavior) — nothing Go-specific about sockets, purely a
+      library-level difference in whether the zero-length case short-circuits.
+
+      **Fix**: `third_party/apache-arrow-dotnet`'s `StreamExtensions.ReadFullBufferAsync`/
+      `ReadFullBuffer` gained a third patch (see that vendoring's README) — a `buffer.Length == 0`
+      fast path returning `0` immediately, before ever touching `stream`, matching Go's behavior.
+      Verified with the same production-faithful reproducer (real unbuffered `pyarrow` client,
+      `buffering=0` exactly matching `UnixTransport`/`TcpTransport`'s real writer construction,
+      split `NetworkStream` read/write matching `SocketTransport`) — all 5 tick/response turns now
+      complete in single-digit milliseconds, every time. Verified against the *real*
+      `ConformanceWorker` and the real Python reference test suite: `UNIX_TCP_FILTER` (the
+      non-streaming subset carved out in M17) is retired entirely — `test_unix_transport_...` and
+      `test_tcp_transport_...` in `test_csharp_conformance.py` now run the full `IMPLEMENTED_FILTER`
+      like every other transport, streaming included, and pass. Reproduces with the **stock**
+      `Apache.Arrow` NuGet package too (confirmed via the standalone reproducer, which never
+      references the vendored fork), so this is a real upstream `apache/arrow-dotnet` bug independent
+      of vgi-rpc-csharp — worth reporting there separately from this fix.
+
+      This is also a standing lesson: the first write-up of a root cause, however well-evidenced it
+      feels (cross-platform reproduction, a clean A/B, a production-faithful client), is still a
+      hypothesis until it's checked against a sibling port actually passing the same case. That
+      check is cheap and should come *before* writing up a conclusion, not after being asked for it.
+
 Full rationale for each milestone's sequencing lives in the plan this repo was bootstrapped from;
 see `CLAUDE.md` for where cross-language wire-alignment decisions are recorded as they're made.

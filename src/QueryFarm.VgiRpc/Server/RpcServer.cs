@@ -144,6 +144,18 @@ public sealed class RpcServer
             using var reader = new WireReader(transport.Input);
             _ = await reader.ReadSchemaAsync(cancellationToken).ConfigureAwait(false);
             request = await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false);
+            if (request is not null)
+            {
+                // The request is a self-contained IPC stream (schema + 1 batch + EOS) the client
+                // fully wrote before this call returns control, but ReadNextAsync only reads the
+                // one batch — it never consumes the trailing EOS marker. Leaving that unread
+                // desyncs the NEXT reader constructed over this same channel (this method's own
+                // ServeStreamAsync call below opens a fresh one for the tick/exchange loop).
+                // Mirrors vgi-rpc-go's drainInputStream / vgi-rpc-java's IpcStreamReader.drain(),
+                // both called at this exact point (right after a successful read, before any
+                // validation that might short-circuit).
+                await reader.DrainRemainingBatchesAsync(cancellationToken).ConfigureAwait(false);
+            }
         }
         catch (PayloadTooLargeException exc) when (!cancellationToken.IsCancellationRequested)
         {
@@ -421,6 +433,13 @@ public sealed class RpcServer
         var streamErrorType = "";
         var streamErrorMessage = "";
         Exception? streamHookError = null;
+        // Set false only on the natural-EOS exit below, where ReadNextAsync already consumed the
+        // input stream's own EOS marker — there is nothing left to drain, and on a shared,
+        // persistent channel (pipe/stdio, where one worker process serves every call in the
+        // session) calling ReadNextAsync again would read into whatever the client sends NEXT
+        // (the following top-level request), corrupting its framing. Every other exit (cancel,
+        // error, producer finish, mid-stream disconnect) can still have unread bytes queued.
+        var inputNeedsDrain = true;
         while (true)
         {
             AnnotatedBatch? inputBatch;
@@ -435,6 +454,7 @@ public sealed class RpcServer
 
             if (inputBatch is null)
             {
+                inputNeedsDrain = false;
                 break; // client closed its input stream (EOS) — the normal way an exchange ends
             }
 
@@ -503,6 +523,36 @@ public sealed class RpcServer
             if (collector.Finished)
             {
                 break;
+            }
+        }
+
+        // Close the output stream (sends EOS to the client) FIRST, then drain whatever the
+        // client's input stream still has queued — draining before closing output can deadlock:
+        // a client blocked reading the response it's waiting for hasn't closed its own writer
+        // yet, so the drain read would block forever. Only the natural "client closed its input
+        // stream" exit above has nothing left to drain; every other exit (cancel, error,
+        // producer finish, even a disconnect mid-stream) can still have unread bytes queued.
+        // Mirrors vgi-rpc-go's "Close output writer (sends EOS) ... Drain remaining input" and
+        // vgi-rpc-java's closeStreamCleanly, both at this exact point.
+        try
+        {
+            await outputWriter.WriteEosAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Best-effort — the connection may already be broken, which the drain below will
+            // discover on its own without needing this to have succeeded first.
+        }
+
+        if (inputNeedsDrain)
+        {
+            try
+            {
+                await inputReader.DrainRemainingBatchesAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                // Best-effort — client already gone, or the stream was never fully opened.
             }
         }
 
