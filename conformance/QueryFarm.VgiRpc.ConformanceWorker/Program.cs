@@ -116,12 +116,14 @@ if (options.Http)
         // certificate, using its Subject CN as principal — see docs/roadmap.md M9 mTLS.
         authenticate = MtlsAuth.FromSubject();
     }
-    else if (options.StickyAuth)
+    else if (options.StickyAuth || options.Introspect)
     {
         // Maps X-Conformance-Principal to an AuthIdentity — absent header stays anonymous (never
         // rejected, so unauthenticated probes like GET /health keep working), matching the
         // canonical Python repo's tests/serve_conformance_http.py::_principal_from_header
-        // exactly. Backs TestSticky::test_cross_principal_replay_rejected (spec §9.1).
+        // exactly. Backs TestSticky::test_cross_principal_replay_rejected (spec §9.1) and (shared
+        // with --introspect, since token introspection's caller identity is resolved the exact
+        // same way) TestTokenIntrospection's caller-authorization checks (docs/roadmap.md M12).
         authenticate = context =>
         {
             var principal = context.Request.Headers["X-Conformance-Principal"].ToString();
@@ -177,7 +179,27 @@ if (options.Http)
             echoHeaders: echoHeaders);
     }
 
-    app.MapVgiRpc(server, maxResponseBytes: 65536, authenticate: authenticate, proxyHint: options.ConformanceProxyHint, corsPolicyName: corsEnabled ? CorsPolicyName : null, tokenKey: tokenKey, sticky: sticky, proxyProofRequired: proxyProofRequired);
+    // Fixed constants docs/porting-guide.md's "HTTP token introspection" section and the
+    // canonical TestTokenIntrospection conformance group require exactly (see
+    // vgi_rpc.conformance._pytest_suite's _INTROSPECTOR/_SUBJECT_TOKEN/_SUBJECT_PRINCIPAL/
+    // _UNAVAILABLE_TOKEN — the JWS trap token needs no entry here at all: the shape guard in
+    // TokenIntrospection.HandleAsync rejects it before ever reaching this resolver, and the
+    // conformance suite's own trap token is deliberately *not* pre-registered — resolving it
+    // would be the bug the test exists to catch).
+    TokenIntrospection.TokenResolver? introspectResolver = null;
+    IReadOnlySet<string>? introspectPrincipals = null;
+    if (options.Introspect)
+    {
+        introspectResolver = token => Task.FromResult(token switch
+        {
+            "conformance-opaque-subject-token" => new TokenIdentity("subject@conformance.example"),
+            "conformance-unavailable-token" => throw new AuthUnavailableException(),
+            _ => (TokenIdentity?)null,
+        });
+        introspectPrincipals = new HashSet<string> { "conformance-introspector" };
+    }
+
+    app.MapVgiRpc(server, maxResponseBytes: 65536, authenticate: authenticate, proxyHint: options.ConformanceProxyHint, corsPolicyName: corsEnabled ? CorsPolicyName : null, tokenKey: tokenKey, sticky: sticky, proxyProofRequired: proxyProofRequired, introspectResolver: introspectResolver, introspectPrincipals: introspectPrincipals);
 
     // Test-only admin endpoint — NOT part of MapVgiRpc's real surface. Lets
     // TestSticky::test_drain_rejects_new_opens flip the drain flag over the wire instead of
@@ -276,6 +298,7 @@ internal sealed class CliOptions
     public string? ProofSecrets { get; private init; }
     public int ProofSkewSeconds { get; private init; } = 30;
     public bool ProofNoReplayCache { get; private init; }
+    public bool Introspect { get; private init; }
 
     public static CliOptions? Parse(string[] args)
     {
@@ -299,6 +322,7 @@ internal sealed class CliOptions
         string? proofSecrets = null;
         var proofSkewSeconds = 30;
         var proofNoReplayCache = false;
+        var introspect = false;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -394,6 +418,14 @@ internal sealed class CliOptions
                 case "--proof-no-replay-cache":
                     proofNoReplayCache = true;
                     break;
+                case "--introspect":
+                    // Enables POST {prefix}/__introspect_token__ with the fixed constants
+                    // docs/porting-guide.md's "HTTP token introspection" section and
+                    // vgi_rpc.conformance._pytest_suite's TestTokenIntrospection group require —
+                    // see docs/roadmap.md M12. Caller identity comes from the same
+                    // X-Conformance-Principal convention --sticky-auth already uses.
+                    introspect = true;
+                    break;
                 default:
                     Console.Error.WriteLine($"Unknown argument: {args[i]}");
                     return null;
@@ -431,6 +463,7 @@ internal sealed class CliOptions
             ProofSecrets = proofSecrets,
             ProofSkewSeconds = proofSkewSeconds,
             ProofNoReplayCache = proofNoReplayCache,
+            Introspect = introspect,
         };
     }
 

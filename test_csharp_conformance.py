@@ -259,6 +259,16 @@ def proof_worker_factory(worker_binary: Path):
     yield spawn
 
 
+# M12 (see docs/roadmap.md): token introspection. Same import-the-canonical-suite pattern as
+# M10/M11. TestTokenIntrospection needs one worker with the fixed constants
+# vgi_rpc.conformance._pytest_suite requires; TestTokenIntrospectionOffMode reuses
+# conformance_http_port (the M10 sticky fixture, no introspect resolver configured).
+@pytest.fixture
+def conformance_http_introspect_port(worker_binary: Path) -> Iterator[int]:
+    """A worker with token introspection enabled — for TestTokenIntrospection."""
+    yield from _spawn_http_worker_port(worker_binary, "--introspect")
+
+
 _CORS_ALLOWED_ORIGIN = "https://allowed.example.com"
 
 
@@ -765,3 +775,8 @@ from vgi_rpc.conformance._pytest_suite import TestSticky  # noqa: E402,F401
 # (the M10 sticky fixture) — a sticky-enabled worker with no proxy-proof gate configured still
 # satisfies "unconfigured worker accepts without a proof", which is exactly the property under test.
 from vgi_rpc.conformance._pytest_suite import TestProxyProof, TestProxyProofOffMode  # noqa: E402,F401
+
+# M12: the canonical TestTokenIntrospection (+ TestTokenIntrospectionOffMode) groups, collected
+# against conformance_http_introspect_port (above) and conformance_http_port (M10's sticky
+# fixture) respectively.
+from vgi_rpc.conformance._pytest_suite import TestTokenIntrospection, TestTokenIntrospectionOffMode  # noqa: E402,F401

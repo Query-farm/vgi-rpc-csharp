@@ -538,7 +538,73 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       configured user authenticator" composition is implemented and documented
       (`ProxyProof.RequireAll`) but not exercised by a dedicated conformance fixture today (the
       imported `TestProxyProof` suite doesn't currently test that combination against any port).
-- [ ] **M12 — Token introspection.**
+- [x] **M12 — Token introspection.** Full port of `vgi_rpc.http.server._introspect` —
+      `QueryFarm.VgiRpc.Http.TokenIntrospection`/`TokenIdentity`/`AuthUnavailableException`/
+      `IntrospectionRateLimiter`. `POST {prefix}/__introspect_token__` resolves an opaque bearer
+      credential to a principal, for a reverse proxy that terminates the only public listener and
+      must know which principal a credential authenticates as before it can authorize anything.
+      No standalone spec doc for this feature (unlike M9–M11) — the normative source is
+      `docs/porting-guide.md`'s "HTTP token introspection" section, followed exactly, including
+      its "why the guards are hard requirements" list: the response is a closed set
+      (`principal`/`token_name`/`ttl_seconds`, never claims — asserted as a closed key set by the
+      conformance suite itself, `test_response_carries_no_claims`); the route is mandatory and
+      always mounted (a worker that doesn't implement it MUST still answer `404 not_enabled` —
+      never fall through to the generic route's `415`, which a caller classifying 401/403/404 as
+      definitive and everything else as transient would read as "retry later" and loop forever
+      against a worker that will never support the feature); the introspector allowlist has no
+      permissive default (`TokenIntrospection.NormalizePrincipals` throws on an empty/missing
+      allowlist, matching Python's `_normalise_principals`); a JWS-shaped subject
+      (`^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$`) is rejected without ever reaching the
+      resolver; every rejection is uniform (unknown/expired/malformed all produce byte-identical
+      404 responses — asserted directly, `test_rejections_are_indistinguishable`); the credential
+      never appears in a response.
+      **Definitive vs. transient, carried through exactly**: the endpoint's own "did not resolve"
+      is `404` (a caller may negative-cache it), so a resolver whose backing store is down must
+      not borrow that shape — it throws `AuthUnavailableException` instead, mapped to `503` +
+      `Retry-After` (never `Cache-Control: no-store`, which is for definitive rejections only).
+      `AuthUnavailableException`'s doc comment is explicit about *not* needing Python's "must not
+      be a `ValueError`" workaround: that exists solely so Python's OR-combinator
+      (`chain_authenticate`) doesn't misread an outage as "not my credential, try the next" — this
+      port has no such combinator (see M11's `ProxyProof.RequireAll` note), so a distinct
+      exception type here is just good API hygiene (an outage can't be mistaken for "did not
+      resolve" at the call site), not a workaround for anything.
+      Caller authorization runs through the SAME `authenticate` delegate every other route already
+      uses (`TryRejectUnauthenticatedAsync`, unchanged) — introspection layers its allowlist check
+      on top of normal auth, never instead of it, reading the `AuthIdentity` whatever authenticator
+      already resolved. The route is unconditionally mounted by `MapVgiRpc` (mirroring Python's
+      `app.add_route` always running, branching only on which resource class); a `null`
+      `introspectResolver` makes every request answer the mandatory `404 not_enabled`.
+      `IntrospectionRateLimiter` is a direct port of Python's `_RateLimiter` (fixed-window, keyed
+      by caller, whole-map reset at the window boundary rather than per-key ageing) — present
+      because the endpoint is a credential→identity oracle even when correctly restricted: an
+      allowlisted caller whose own credential leaks can still test guesses, and rate limiting
+      bounds (does not close) that.
+      Wired into the conformance worker via `--introspect`, sharing the exact same
+      `X-Conformance-Principal` → `AuthIdentity` authenticate delegate `--sticky-auth` already
+      established (the caller-identity resolution really is identical — both need "an authenticated
+      principal from a request header, for conformance-fixture purposes only"), plus a fixed
+      resolver matching the conformance suite's exact required constants
+      (`conformance-opaque-subject-token` → `subject@conformance.example`,
+      `conformance-unavailable-token` → throws `AuthUnavailableException`; the JWS trap token
+      needs no entry at all, since the shape guard rejects it before the resolver is ever called —
+      registering it would be the bug the trap exists to catch).
+      Verified by directly collecting the canonical Python repo's own `TestTokenIntrospection` +
+      `TestTokenIntrospectionOffMode` groups — the same pattern M10/M11 established. All 17 tests
+      passed on the **first real run against the real worker**, no bugs found (matching M11's
+      proxy proof, not M9/M10's mTLS/sticky — a second data point that porting-guide-driven
+      features with this much explicit "why" documentation port cleanly the first time). Plus 21
+      new `TokenIntrospectionTests` xunit tests covering the full decision tree directly (valid
+      resolve, no-claims closed-key-set assertion, indistinguishable-rejection byte-for-byte
+      comparison, unauthenticated/non-introspector refusal, the JWS-guard-blocks-the-resolver
+      assertion via a resolver that records whether it was called, credential-never-echoed across
+      both success and failure, the 503/Retry-After outage path, malformed-body handling, rate
+      limiting, and `NormalizePrincipals`/`TokenDigest` directly). All 87 Python conformance tests
+      and 186 xunit tests (18+162+6 core/Http/OAuth) pass, both locally and in a linux/amd64
+      Docker container matching CI's ubuntu-latest path. Manually curl-verified every response
+      shape (200/404/403/503, the disabled-worker fallback, the capability header) against a
+      running worker before writing the automated tests.
+      Not implemented: nothing scoped out — this milestone is a complete, faithful port of the
+      guide's contract.
 - [ ] **M13 — External storage (S3/GCS).**
 - [ ] **M14 — SHM transport.**
 - [ ] **M15 — OAuth2/PKCE browser flow.**
