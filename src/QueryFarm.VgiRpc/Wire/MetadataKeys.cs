@@ -21,6 +21,8 @@ public static class MetadataKeys
     public const string RequestId = "vgi_rpc.request_id";
     public const string Location = "vgi_rpc.location";
     public const string LocationSha256 = "vgi_rpc.location.sha256";
+    public const string LocationFetchMs = "vgi_rpc.location.fetch_ms";
+    public const string LocationSource = "vgi_rpc.location.source";
     public const string ShmOffset = "vgi_rpc.shm_offset";
     public const string ShmLength = "vgi_rpc.shm_length";
     public const string ShmSegmentName = "vgi_rpc.shm_segment_name";

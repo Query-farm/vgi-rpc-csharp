@@ -605,7 +605,115 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       running worker before writing the automated tests.
       Not implemented: nothing scoped out — this milestone is a complete, faithful port of the
       guide's contract.
-- [ ] **M13 — External storage (S3/GCS).**
+- [x] **M13 — External storage (S3/GCS).** Full port of `vgi_rpc/external.py` +
+      `vgi_rpc/external_fetch.py` — `QueryFarm.VgiRpc.Http.ExternalLocation`/`ExternalFetch`/
+      `RequestCap`. The ExternalLocation pointer-batch protocol (a zero-row batch carrying
+      `vgi_rpc.location`/`vgi_rpc.location.sha256` custom_metadata) lets a large batch be uploaded
+      to remote storage and replaced with a pointer the other side transparently re-fetches — the
+      unary result path, both directions of a producer/exchange turn's single emitted data batch,
+      and every inbound HTTP data route (`/echo`, `/init`, `/exchange`) all wired.
+      **Two scope narrowings versus Python, both documented in code**: (1) log batches within a
+      producer/exchange turn always stay inline — only the turn's one data batch is ever a
+      candidate for externalization, whereas Python's `maybe_externalize_collector` also
+      externalizes the log-batch bundle; (2) the fetch side is a simplified single streaming GET
+      with manual per-hop-validated redirects (`ExternalFetch`), not Python's parallel
+      Range-request/HEAD-probing machinery — every `TestExternalFetchSecurity` conformance case
+      passes against it, since the conformance payloads stay in the tens-of-KB range, but a
+      genuinely large externalized object would want the parallel-fetch behavior back.
+      `max_externalized_response_bytes` is enforced **hard, with no continuation escape valve, on
+      every method type** — unary, producer, and exchange alike — via a predict-then-refuse split
+      (`ExternalLocation.PredictExternalizeBytes` before `MaybeExternalizeAsync`) so a
+      cap-violating upload is refused before the storage round-trip ever happens, matching the
+      spec's explicit warning that at least one port shipped the cap advertised-but-unenforced.
+      This is deliberately *not* soft the way the unrelated `max_response_bytes` wire cap stays
+      soft/unenforced for producer turns (M7) — bytes already uploaded cannot be un-uploaded.
+      `max_request_bytes` (413, including a `CappedStream` that catches a chunked body with no
+      declared `Content-Length` mid-read, not just a `Content-Length` pre-check) and the synthetic
+      `POST {prefix}/__upload_url__/init` control route (client-to-server externalization: the
+      server vends a pre-signed upload/download URL pair via `IUploadUrlProvider`, the client PUTs
+      directly to storage, then re-POSTs a pointer batch) are both wired through
+      `ExternalizationOptions`, a single bundling record `MapVgiRpc` takes so a caller wanting only
+      request-side pointer resolution doesn't have to thread five independent parameters.
+      **Two real bugs found and fixed during conformance verification, both by the same class of
+      mistake** (an Apache.Arrow (.NET) API defaulting silently instead of erroring):
+      (1) `TimestampArray.Builder()`'s parameterless constructor defaults to `TimeUnit.Millisecond`
+      while `__upload_url__/init`'s response schema declared its `expires_at` field
+      `TimeUnit.Microsecond` — the builder never checked its own output against the field it was
+      building for, so every vended `expires_at` came back 1000x wrong (an upload URL "expiring"
+      at 1970-01-21 instead of an hour from now) until manual curl/Python-client verification
+      caught it; fixed by constructing the builder with the schema's exact unit explicit.
+      (2) `Schema` (Apache.Arrow) never overrides `object.Equals` — `ExternalLocation.ResolveAsync`
+      compared a fetched batch's schema against the original pointer's schema via `.Equals()`,
+      which is reference equality by default and so always failed for two independently-built
+      schemas of identical shape, surfacing as every request-side pointer resolution raising
+      "Schema mismatch" even when the schemas printed identically. Fixed by exposing
+      `ValueCodec.SchemasEqual` (previously `private`, used internally by `CoerceBatch`'s own
+      fast-path check) as `public` and using it for the structural (name/type-id) comparison this
+      needs, rather than each call site hand-rolling its own.
+      **One real pre-M13 gap found and fixed along the way**: `HandleStreamInitAsync` never ran a
+      producer's first tick at all — every producer stream's `/init` response carried zero data,
+      deferring the entire first `ProduceAsync` call to the client's first `/exchange` round trip.
+      The canonical Python implementation instead folds a producer's first tick into `/init`
+      itself (`_run_http_producer_turn`, invoked from the init handler) — found because
+      `TestExternalInputRoutes::test_stream_init_resolves_external_input` is the first conformance
+      case that inspects a raw `/init` response body directly rather than driving it through the
+      client's own tolerant iteration protocol. Fixed by running one produce tick during `/init`
+      for producer streams (mirroring the shape already established in the exchange handler's own
+      producer branch: logs, then data, then a token sentinel — or, if the stream finishes on that
+      very first tick, no token at all, matching Python's "no continuation possible, nothing to
+      hand the client" behavior) — exchange streams are unaffected, since nothing is produced until
+      the client sends its first exchange turn. This changes tick-count timing only (one fewer
+      HTTP round trip for a producer that emits on tick one), not correctness; the full existing
+      suite (113 Python + 191 xunit tests) was re-run afterward specifically to catch any
+      regression in `producer_stream.*`/`TestSticky`'s streaming-counter cases, and none appeared.
+      Two new conformance-worker-only methods needed for the imported suites to have something to
+      call: `echo_large_string` (wire-named to match Python's `pa.large_string()`-typed method, but
+      implemented over plain `Utf8Type` — this port has no attribute-based Arrow-type-width
+      override yet, so there's no distinct CLR type to hang `large_string` off of the way
+      `decimal`/`timestamp` hang off their own attribute; functionally equivalent for every payload
+      size the suite exercises) and `ProduceOversizedBatchAsync`/`OversizedProducerState` (a
+      producer analog of the existing `OversizedUnaryAsync`/`ExchangeOversizedAsync`, needed by
+      `TestExternalizedResponseCap::test_producer_gets_no_continuation_escape`). Reading a
+      Python-client-sent `pa.large_string()` column also required a genuine `ValueCodec` gap fix
+      unrelated to width-override attributes: `ExtractSingleValue` had no case for
+      `LargeStringArray` at all (only `StringArray`), so the very first cross-language call threw
+      `NotSupportedException` — fixed by reading it as a plain string, same as `StringArray`.
+      `FakeStorageBackend` (conformance-worker-only, mirrors Python's own conformance
+      `FakeStorageBackend` adapter) implements both `IExternalStorage` and `IUploadUrlProvider`
+      against the canonical `vgi_rpc.conformance.fake_storage` HTTP service's `POST /alloc` + `PUT`
+      wire contract, wired in via new worker flags: `--fake-storage <url>`,
+      `--externalize-threshold`, `--max-request-bytes`, `--compression none|zstd`,
+      `--max-fetch-bytes`, `--max-decompressed-fetch-bytes`, `--reject-localhost-redirects`,
+      `--max-response-bytes` (an override — this worker previously hardcoded 65536 unconditionally
+      for M7's strict-fail tests), `--max-externalized-response-bytes`. Unlike Python, which splits
+      this across two scripts (`serve_conformance_http.py` / `serve_conformance_http_strict.py`),
+      this port's one worker binary unifies both — the same shape the Rust port's own
+      `--http-with-storage`/`--strict` flags already converged on independently, and the closest
+      existing precedent for a single-worker port.
+      Verified by directly collecting the canonical Python repo's own `TestExternalLocation` +
+      `TestExternalizedResponseCap` (`vgi_rpc.conformance._pytest_suite`) and
+      `TestExternalInputRoutes` + `TestExternalFetchFailures` + `TestExternalFetchSecurity` +
+      `TestExternalStorageUrlPair` (`vgi_rpc.conformance._external_pytest` — a separate raw-HTTP
+      driver module since these tests place pointer batches on inbound routes directly, which the
+      ordinary RPC proxy deliberately hides) groups — the same pattern M10/M11/M12 established.
+      All 26 tests passed after fixing the three bugs above. Plus 29 new `ExternalLocationTests`
+      xunit tests covering `GetTotalBufferSize`/`MakePointerBatch`/`IsExternalLocationBatch`/
+      `PredictExternalizeBytes`/`MaybeExternalizeAsync` directly (including a full externalize→
+      resolve round trip against a real loopback `HttpListener`, not a mock), `ExternalFetch`'s
+      validator/redaction/redirect-loop/cap-enforcement/pre-fetch-rejection behavior, and
+      `RequestCap`'s declared-vs-observed 413 paths (including the chunked-body case). All 113
+      Python conformance tests and 191 xunit tests (18+167+6 core/Http/OAuth) pass, both locally
+      and in a linux/amd64 Docker container matching CI's ubuntu-latest path. Manually curl/Python-
+      client-verified end-to-end (small-payload-stays-inline, large-payload-externalizes,
+      capability advertisement, `request_upload_urls` PUT/GET round-trip) before writing the
+      automated tests, per the established habit — which is exactly what caught the `expires_at`
+      timestamp-unit bug before any automated test had a chance to encode the wrong value as
+      "expected."
+      Not implemented: S3/GCS `IExternalStorage` backends themselves (`QueryFarm.VgiRpc.S3`/`.Gcs`
+      remain empty scaffold projects — the pointer-batch protocol and the storage seam are complete
+      and backend-agnostic; wiring an actual AWS/GCS SDK behind `IExternalStorage` is separable,
+      lower-risk work with no conformance dependency, since the suite only requires *an*
+      HTTP-addressable backend, not a specific one).
 - [ ] **M14 — SHM transport.**
 - [ ] **M15 — OAuth2/PKCE browser flow.**
 - [ ] **M16 — Observability (OpenTelemetry, Sentry).**

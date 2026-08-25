@@ -90,6 +90,8 @@ public sealed class ConformanceServiceImpl : IConformanceService
         return Task.FromResult(new byte[targetBytes]);
     }
 
+    public Task<string> EchoLargeStringAsync(string value) => Task.FromResult(value);
+
     public Task<double> AddFloatsAsync(double a, double b) => Task.FromResult(a + b);
 
     public Task<string> ConcatenateAsync(string prefix, string suffix, string separator) =>
@@ -152,6 +154,9 @@ public sealed class ConformanceServiceImpl : IConformanceService
 
     public Task<RpcStream<StreamState>> ProduceErrorMidStreamAsync(long emitBeforeError) =>
         Task.FromResult(new RpcStream<StreamState>(ConformanceStreamSchemas.Counter, new ErrorAfterNState(emitBeforeError)));
+
+    public Task<RpcStream<StreamState>> ProduceOversizedBatchAsync(long rowsPerBatch) =>
+        Task.FromResult(new RpcStream<StreamState>(ConformanceStreamSchemas.Counter, new OversizedProducerState(rowsPerBatch)));
 
     public Task<RpcStream<StreamState>> ExchangeScaleAsync(double factor) =>
         Task.FromResult(new RpcStream<StreamState>(ExchangeSchemas.Scale, new ScaleExchangeState(factor), InputSchema: ExchangeSchemas.Scale));

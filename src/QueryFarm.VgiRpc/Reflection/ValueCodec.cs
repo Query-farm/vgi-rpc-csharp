@@ -63,7 +63,13 @@ public static class ValueCodec
         return new RecordBatch(targetSchema, arrays, batch.Length);
     }
 
-    private static bool SchemasEqual(Schema a, Schema b)
+    /// <summary>Structural schema comparison (field count/name/type-id order) — <see cref="Schema"/>
+    /// (Apache.Arrow) never overrides <see cref="object.Equals(object?)"/>, so it's reference
+    /// equality by default and two independently-built schemas of identical shape compare unequal.
+    /// Public so callers outside this class (e.g. <c>QueryFarm.VgiRpc.Http.ExternalLocation</c>'s
+    /// resolved-pointer schema check) get the same loose, name/type-id-only comparison this class
+    /// itself uses for its own fast-path check above, rather than each hand-rolling one.</summary>
+    public static bool SchemasEqual(Schema a, Schema b)
     {
         if (a.FieldsList.Count != b.FieldsList.Count)
         {
@@ -548,6 +554,13 @@ public static class ValueCodec
         return array switch
         {
             StringArray a => a.GetString(index),
+            // LargeStringArray: not part of this port's own schema derivation (no CLR type to
+            // hang pa.large_string() off of yet — see docs/roadmap.md), but the conformance
+            // suite's echo_large_string is driven by the canonical Python client, which builds
+            // its request using the reference protocol's declared pa.large_string() column —
+            // reading it here as a plain string is what lets that interop even though this
+            // port's own outgoing schema for the same CLR `string` is always Utf8Type.
+            LargeStringArray a => a.GetString(index),
             BinaryArray a when effectiveType == typeof(byte[]) => a.GetBytes(index).ToArray(),
             BinaryArray a => ExtractEmbeddedRecord(a.GetBytes(index).ToArray(), effectiveType),
             BooleanArray a => a.GetValue(index)!.Value,

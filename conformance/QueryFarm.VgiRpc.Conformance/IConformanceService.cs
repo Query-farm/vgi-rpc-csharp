@@ -115,6 +115,17 @@ public interface IConformanceService
     /// <c>max_response_bytes</c> so strict-fail behavior can be verified.</summary>
     Task<byte[]> OversizedUnaryAsync(long targetBytes);
 
+    // -- External storage (M13) ------------------------------------------------
+
+    /// <summary>Echoes <paramref name="value"/> — the same shape as <see cref="EchoStringAsync"/>,
+    /// but wire-named <c>echo_large_string</c> to match the canonical Python method conformance
+    /// tests drive with genuinely large payloads to trigger server-response externalization. The
+    /// reference declares this over <c>pa.large_string()</c> (64-bit offsets); this port has no
+    /// attribute-based Arrow-type-width override yet (see docs/roadmap.md), so it reuses the
+    /// default <c>Utf8Type</c> (32-bit offsets) — functionally equivalent for every payload size
+    /// the external-storage conformance suite actually exercises (tens of KB).</summary>
+    Task<string> EchoLargeStringAsync(string value);
+
     // -- Multi-param & defaults ---------------------------------------------
 
     Task<double> AddFloatsAsync(double a, double b);
@@ -159,6 +170,13 @@ public interface IConformanceService
     Task<RpcStream<StreamState>> ProduceWithLogsAsync(long count);
 
     Task<RpcStream<StreamState>> ProduceErrorMidStreamAsync(long emitBeforeError);
+
+    /// <summary>Emits one batch of <paramref name="rowsPerBatch"/> {index, value} rows, then
+    /// finishes — used by HTTP-only conformance tests (M13's <c>TestExternalizedResponseCap</c>
+    /// and M7's <c>TestHttpResponseCapSoftWire</c>) to deliberately overshoot the operator-
+    /// configured response cap for a single producer turn. The single-batch shape ensures the
+    /// overshoot happens before any continuation-token boundary.</summary>
+    Task<RpcStream<StreamState>> ProduceOversizedBatchAsync(long rowsPerBatch);
 
     // -- Exchange streams --------------------------------------------------
 
@@ -238,15 +256,14 @@ public interface IConformanceService
     Task<RpcStream<StreamState>> ExchangeSessionCounterAsync();
 
     // TODO (later milestones — see docs/roadmap.md):
-    //   - oversized_unary / produce_oversized_batch (HTTP response-cap conformance, M7)
     //   - echo_wide_types / echo_container_wide_types / echo_embedded_arrow / echo_deep_nested /
     //     pack_nested_containers / echo_dict_encoded_string / echo_status_list (need an
     //     embedded-RecordBatch-as-field mechanism, a Rust/HashSet-style set type, and a
     //     dictionary-encoding attribute override — bigger, separate work; see docs/roadmap.md)
-    //   - echo_large_string/echo_large_binary/echo_fixed_binary (need an attribute-based Arrow
-    //     type override — string/byte[] already mean the default-width string/binary; unlike
-    //     the int8..uint64/date/timestamp/time/duration/decimal widths above, there's no
-    //     distinct CLR type to hang the wider variant off of)
-    //   - produce_large_batches / produce_oversized_batch / produce_error_on_init
+    //   - echo_large_binary/echo_fixed_binary (need an attribute-based Arrow type override —
+    //     byte[] already means the default-width binary; unlike the int8..uint64/date/timestamp/
+    //     time/duration/decimal widths above, there's no distinct CLR type to hang the wider
+    //     variant off of; echo_large_string is ported above reusing plain Utf8Type)
+    //   - produce_large_batches / produce_error_on_init
     //   - large_payload.* (2GiB+ transport-level gap — M4)
 }

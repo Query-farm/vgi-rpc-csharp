@@ -39,6 +39,36 @@ public sealed class CounterState(long count) : ProducerState
     }
 }
 
+/// <summary>Emits one large {index, value} batch of <c>rowsPerBatch</c> rows, then finishes on
+/// the next turn. Used by HTTP-only conformance tests to deliberately overshoot the operator-
+/// configured response cap in a single producer iteration — the single-batch shape ensures the
+/// overshoot happens before any continuation-token boundary. Mirrors <c>OversizedBatchState</c>.</summary>
+public sealed class OversizedProducerState(long rowsPerBatch) : ProducerState
+{
+    private bool _emitted;
+
+    public override Task ProduceAsync(OutputCollector output, ICallContext? ctx, CancellationToken cancellationToken)
+    {
+        if (_emitted)
+        {
+            output.Finish();
+            return Task.CompletedTask;
+        }
+
+        var indexBuilder = new Int64Array.Builder();
+        var valueBuilder = new Int64Array.Builder();
+        for (var i = 0L; i < rowsPerBatch; i++)
+        {
+            indexBuilder.Append(i);
+            valueBuilder.Append(i * 10);
+        }
+
+        output.Emit(new RecordBatch(ConformanceStreamSchemas.Counter, [indexBuilder.Build(), valueBuilder.Build()], checked((int)rowsPerBatch)));
+        _emitted = true;
+        return Task.CompletedTask;
+    }
+}
+
 /// <summary>Finishes immediately — zero batches. Mirrors <c>EmptyProducerState</c>.</summary>
 public sealed class EmptyProducerState : ProducerState
 {

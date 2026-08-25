@@ -199,7 +199,48 @@ if (options.Http)
         introspectPrincipals = new HashSet<string> { "conformance-introspector" };
     }
 
-    app.MapVgiRpc(server, maxResponseBytes: 65536, authenticate: authenticate, proxyHint: options.ConformanceProxyHint, corsPolicyName: corsEnabled ? CorsPolicyName : null, tokenKey: tokenKey, sticky: sticky, proxyProofRequired: proxyProofRequired, introspectResolver: introspectResolver, introspectPrincipals: introspectPrincipals);
+    // External storage (M13) — a --fake-storage URL wires both directions: server-response
+    // externalization (ServerExternalConfig.Storage) and client-vended upload URLs
+    // (ExternalizationOptions.UploadUrlProvider), so the OPTIONS capabilities response advertises
+    // the full protocol. Mirrors the reference repo's tests/serve_conformance_http.py exactly,
+    // including "max_request_bytes defaults to externalize_threshold when unset" and the
+    // 127.0.0.1-only redirect-hop validator --reject-localhost-redirects installs.
+    ExternalizationOptions? externalization = null;
+    if (options.FakeStorageUrl is { } fakeStorageUrl)
+    {
+        var backend = new FakeStorageBackend(fakeStorageUrl);
+        Action<string>? urlValidator = options.RejectLocalhostRedirects
+            ? url => { if (new Uri(url).Host != "127.0.0.1") throw new ArgumentException("external-security fixture permits only 127.0.0.1"); }
+        : null;
+        var externalConfig = new ServerExternalConfig
+        {
+            Storage = backend,
+            ExternalizeThresholdBytes = options.ExternalizeThresholdBytes,
+            Compression = options.CompressionAlgorithm == "zstd" ? new Compression() : null,
+            FetchConfig = new FetchConfig
+            {
+                MaxFetchBytes = options.MaxFetchBytes ?? new FetchConfig().MaxFetchBytes,
+                MaxDecompressedBytes = options.MaxDecompressedFetchBytes,
+            },
+            UrlValidator = urlValidator,
+        };
+        externalization = new ExternalizationOptions
+        {
+            External = externalConfig,
+            UploadUrlProvider = backend,
+            MaxRequestBytes = options.MaxRequestBytes ?? options.ExternalizeThresholdBytes,
+            MaxUploadBytes = 64 * 1024 * 1024,
+            MaxExternalizedResponseBytes = options.MaxExternalizedResponseBytes,
+        };
+    }
+    else if (options.MaxRequestBytes is { } maxRequestBytesOnly)
+    {
+        // --max-request-bytes without --fake-storage — backs the small_request_cap fixture
+        // (TestHttpResponseCap's 413 enforcement doesn't need externalization wired at all).
+        externalization = new ExternalizationOptions { MaxRequestBytes = maxRequestBytesOnly };
+    }
+
+    app.MapVgiRpc(server, maxResponseBytes: options.MaxResponseBytes ?? 65536, authenticate: authenticate, proxyHint: options.ConformanceProxyHint, corsPolicyName: corsEnabled ? CorsPolicyName : null, tokenKey: tokenKey, sticky: sticky, proxyProofRequired: proxyProofRequired, introspectResolver: introspectResolver, introspectPrincipals: introspectPrincipals, externalization: externalization);
 
     // Test-only admin endpoint — NOT part of MapVgiRpc's real surface. Lets
     // TestSticky::test_drain_rejects_new_opens flip the drain flag over the wire instead of
@@ -299,6 +340,15 @@ internal sealed class CliOptions
     public int ProofSkewSeconds { get; private init; } = 30;
     public bool ProofNoReplayCache { get; private init; }
     public bool Introspect { get; private init; }
+    public string? FakeStorageUrl { get; private init; }
+    public long ExternalizeThresholdBytes { get; private init; } = 4096;
+    public long? MaxRequestBytes { get; private init; }
+    public string CompressionAlgorithm { get; private init; } = "none";
+    public long? MaxFetchBytes { get; private init; }
+    public long? MaxDecompressedFetchBytes { get; private init; }
+    public bool RejectLocalhostRedirects { get; private init; }
+    public long? MaxResponseBytes { get; private init; }
+    public long? MaxExternalizedResponseBytes { get; private init; }
 
     public static CliOptions? Parse(string[] args)
     {
@@ -323,6 +373,15 @@ internal sealed class CliOptions
         var proofSkewSeconds = 30;
         var proofNoReplayCache = false;
         var introspect = false;
+        string? fakeStorageUrl = null;
+        var externalizeThresholdBytes = 4096L;
+        long? maxRequestBytes = null;
+        var compressionAlgorithm = "none";
+        long? maxFetchBytes = null;
+        long? maxDecompressedFetchBytes = null;
+        var rejectLocalhostRedirects = false;
+        long? maxResponseBytesOverride = null;
+        long? maxExternalizedResponseBytes = null;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -426,6 +485,45 @@ internal sealed class CliOptions
                     // X-Conformance-Principal convention --sticky-auth already uses.
                     introspect = true;
                     break;
+                case "--fake-storage":
+                    // Base URL of a vgi_rpc.conformance.fake_storage-compatible HTTP service —
+                    // enables external-location uploads (see docs/roadmap.md M13). An empty-string
+                    // value (as some fixtures pass when composing args conditionally) is treated
+                    // the same as omitting the flag entirely.
+                    fakeStorageUrl = RequireValue(args, ref i, "--fake-storage");
+                    if (fakeStorageUrl.Length == 0)
+                    {
+                        fakeStorageUrl = null;
+                    }
+
+                    break;
+                case "--externalize-threshold":
+                    externalizeThresholdBytes = long.Parse(RequireValue(args, ref i, "--externalize-threshold"));
+                    break;
+                case "--max-request-bytes":
+                    maxRequestBytes = long.Parse(RequireValue(args, ref i, "--max-request-bytes"));
+                    break;
+                case "--compression":
+                    compressionAlgorithm = RequireValue(args, ref i, "--compression");
+                    break;
+                case "--max-fetch-bytes":
+                    maxFetchBytes = long.Parse(RequireValue(args, ref i, "--max-fetch-bytes"));
+                    break;
+                case "--max-decompressed-fetch-bytes":
+                    maxDecompressedFetchBytes = long.Parse(RequireValue(args, ref i, "--max-decompressed-fetch-bytes"));
+                    break;
+                case "--reject-localhost-redirects":
+                    rejectLocalhostRedirects = true;
+                    break;
+                case "--max-response-bytes":
+                    // Overrides this worker's hardcoded 65536-byte default for --http mode — the
+                    // externalized-cap fixture needs this deliberately *generous* (8 MiB) so the
+                    // wire-body cap never fires, only the external-channel cap under test.
+                    maxResponseBytesOverride = long.Parse(RequireValue(args, ref i, "--max-response-bytes"));
+                    break;
+                case "--max-externalized-response-bytes":
+                    maxExternalizedResponseBytes = long.Parse(RequireValue(args, ref i, "--max-externalized-response-bytes"));
+                    break;
                 default:
                     Console.Error.WriteLine($"Unknown argument: {args[i]}");
                     return null;
@@ -464,6 +562,15 @@ internal sealed class CliOptions
             ProofSkewSeconds = proofSkewSeconds,
             ProofNoReplayCache = proofNoReplayCache,
             Introspect = introspect,
+            FakeStorageUrl = fakeStorageUrl,
+            ExternalizeThresholdBytes = externalizeThresholdBytes,
+            MaxRequestBytes = maxRequestBytes,
+            CompressionAlgorithm = compressionAlgorithm,
+            MaxFetchBytes = maxFetchBytes,
+            MaxDecompressedFetchBytes = maxDecompressedFetchBytes,
+            RejectLocalhostRedirects = rejectLocalhostRedirects,
+            MaxResponseBytes = maxResponseBytesOverride,
+            MaxExternalizedResponseBytes = maxExternalizedResponseBytes,
         };
     }
 

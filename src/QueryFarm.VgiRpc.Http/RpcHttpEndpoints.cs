@@ -74,7 +74,7 @@ public static class RpcHttpEndpoints
     /// <param name="compressionLevel">zstd/gzip level applied to compressible response bodies —
     /// matches Python's <c>make_wsgi_app(compression_level=1)</c> default. <see langword="null"/>
     /// disables response compression outright (request decompression is unaffected either way —
-    /// see <see cref="DecompressingRequestBody"/>'s doc comment for why that one isn't optional).</param>
+    /// see the <c>DecompressingRequestBody</c> doc comment for why that one isn't optional).</param>
     /// <param name="tokenKey">AEAD master key sealing stream call-id tokens (see
     /// <see cref="StreamCallRegistry"/>) — <see langword="null"/> (the default) generates a
     /// random 32-byte key per call to this method, matching Python's <c>make_wsgi_app</c>
@@ -135,16 +135,24 @@ public static class RpcHttpEndpoints
     /// at all — introspection layers an allowlist on top of, never instead of, normal auth.</param>
     /// <param name="introspectRateLimitPerSecond">Introspection requests allowed per caller per
     /// second — matches Python's default of 20.</param>
-    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null, long? maxResponseBytes = null, AuthenticateDelegate? authenticate = null, string? proxyHint = null, string? corsPolicyName = null, StickySessionRegistry? sticky = null, bool proxyProofRequired = false, TokenIntrospection.TokenResolver? introspectResolver = null, IReadOnlySet<string>? introspectPrincipals = null, int introspectRateLimitPerSecond = 20)
+    /// <param name="externalization">Enables external-storage pointer batches (see
+    /// <see cref="ExternalLocation"/> and <c>docs/roadmap.md</c> M13) when non-null:
+    /// server-response externalization above <see cref="ServerExternalConfig.ExternalizeThresholdBytes"/>,
+    /// request-side pointer resolution on every dispatch path, <c>max_request_bytes</c>
+    /// enforcement (413), and — when <see cref="ExternalizationOptions.UploadUrlProvider"/> is
+    /// set — the synthetic <c>POST {prefix}/__upload_url__/init</c> route. <see langword="null"/>
+    /// (the default) leaves the wire byte-identical to the pre-M13 framework, matching Python's
+    /// opt-in default.</param>
+    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null, long? maxResponseBytes = null, AuthenticateDelegate? authenticate = null, string? proxyHint = null, string? corsPolicyName = null, StickySessionRegistry? sticky = null, bool proxyProofRequired = false, TokenIntrospection.TokenResolver? introspectResolver = null, IReadOnlySet<string>? introspectPrincipals = null, int introspectRateLimitPerSecond = 20, ExternalizationOptions? externalization = null)
     {
         tokenKey ??= RandomNumberGenerator.GetBytes(32);
         var registry = new StreamCallRegistry();
         var introspectEnabled = introspectResolver is not null;
         var health = endpoints.MapMethods($"{prefix}/health", ["GET", "HEAD"], (HttpContext context) => HandleHealthAsync(server, context, proxyProofRequired));
-        var capabilities = endpoints.MapMethods($"{prefix}/health", ["OPTIONS"], (HttpContext context) => HandleCapabilitiesAsync(context, maxResponseBytes, sticky, proxyProofRequired, introspectEnabled));
-        var unary = endpoints.MapPost($"{prefix}/{{method}}", (string method, HttpContext context) => HandleUnaryAsync(server, method, context, compressionLevel, maxResponseBytes, authenticate, proxyHint, sticky, tokenKey));
-        var init = endpoints.MapPost($"{prefix}/{{method}}/init", (string method, HttpContext context) => HandleStreamInitAsync(server, method, context, compressionLevel, tokenKey, registry, authenticate, proxyHint, sticky));
-        var exchange = endpoints.MapPost($"{prefix}/{{method}}/exchange", (string method, HttpContext context) => HandleStreamExchangeAsync(server, method, context, compressionLevel, tokenKey, registry, maxResponseBytes, authenticate, proxyHint, sticky));
+        var capabilities = endpoints.MapMethods($"{prefix}/health", ["OPTIONS"], (HttpContext context) => HandleCapabilitiesAsync(context, maxResponseBytes, sticky, proxyProofRequired, introspectEnabled, externalization));
+        var unary = endpoints.MapPost($"{prefix}/{{method}}", (string method, HttpContext context) => HandleUnaryAsync(server, method, context, compressionLevel, maxResponseBytes, authenticate, proxyHint, sticky, tokenKey, externalization));
+        var init = endpoints.MapPost($"{prefix}/{{method}}/init", (string method, HttpContext context) => HandleStreamInitAsync(server, method, context, compressionLevel, tokenKey, registry, authenticate, proxyHint, sticky, externalization));
+        var exchange = endpoints.MapPost($"{prefix}/{{method}}/exchange", (string method, HttpContext context) => HandleStreamExchangeAsync(server, method, context, compressionLevel, tokenKey, registry, maxResponseBytes, authenticate, proxyHint, sticky, externalization));
         if (corsPolicyName is not null)
         {
             health.RequireCors(corsPolicyName);
@@ -173,7 +181,133 @@ public static class RpcHttpEndpoints
             introspect.RequireCors(corsPolicyName);
         }
 
+        if (externalization?.UploadUrlProvider is not null)
+        {
+            var uploadUrl = endpoints.MapPost($"{prefix}/__upload_url__/init", (HttpContext context) => HandleUploadUrlAsync(server, context, authenticate, proxyHint, externalization));
+            if (corsPolicyName is not null)
+            {
+                uploadUrl.RequireCors(corsPolicyName);
+            }
+        }
+
         return endpoints;
+    }
+
+    private static readonly Schema s_uploadUrlParamsSchema = new([new Field("count", Apache.Arrow.Types.Int64Type.Default, nullable: false)], metadata: null);
+    private static readonly Schema s_uploadUrlResultSchema = new(
+        [
+            new Field("upload_url", Apache.Arrow.Types.StringType.Default, nullable: false),
+            new Field("download_url", Apache.Arrow.Types.StringType.Default, nullable: false),
+            new Field("expires_at", new Apache.Arrow.Types.TimestampType(Apache.Arrow.Types.TimeUnit.Microsecond, "UTC"), nullable: false),
+        ],
+        metadata: null);
+
+    private const int MaxUploadUrlCount = 64;
+
+    /// <summary><c>POST {prefix}/__upload_url__/init</c> — vends <c>count</c> pre-signed
+    /// upload/download URL pairs so a client can externalize an oversized <i>request</i> out of
+    /// band. Follows the same dispatch shape as unary calls (auth gate, request-cap enforcement,
+    /// standard wire request/response framing) despite the <c>/init</c> suffix — unlike a real
+    /// stream method, this is always answered in one shot; there is no matching <c>/exchange</c>.</summary>
+    private static async Task HandleUploadUrlAsync(RpcServer server, HttpContext context, AuthenticateDelegate? authenticate, string? proxyHint, ExternalizationOptions externalization)
+    {
+        if (await TryRejectUnauthenticatedAsync(context, authenticate, proxyHint).ConfigureAwait(false))
+        {
+            return;
+        }
+
+        var request = context.Request;
+        var cancellationToken = context.RequestAborted;
+        if (request.ContentType != ArrowContentType)
+        {
+            await ErrorResultAsync(server, "__upload_url__", new RpcException("TypeError", $"Expected Content-Type: '{ArrowContentType}', got '{request.ContentType}'."), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, null, false, null).ConfigureAwait(false);
+            return;
+        }
+
+        Stream requestBody;
+        try
+        {
+            requestBody = DecompressingRequestBody(request, RequestCap.Enforce(request, externalization.MaxRequestBytes));
+        }
+        catch (RequestTooLargeException exc)
+        {
+            await Write413Async(context, exc, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        long count = 1;
+        try
+        {
+            using var reader = new WireReader(requestBody);
+            _ = await reader.ReadSchemaAsync(cancellationToken).ConfigureAwait(false);
+            var requestBatch = await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false);
+            if (requestBatch is not null && requestBatch.Batch.Length > 0 && requestBatch.Batch.Schema.GetFieldIndex("count") >= 0)
+            {
+                var args = ValueCodec.ExtractRow(requestBatch.Batch, [typeof(long)]);
+                if (args is [long requestedCount])
+                {
+                    count = requestedCount;
+                }
+            }
+        }
+        catch (RequestTooLargeException exc)
+        {
+            await Write413Async(context, exc, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+        catch (Exception)
+        {
+            // Malformed/absent count defaults to 1, matching Python's tolerant kwargs.get("count", 1).
+        }
+        finally
+        {
+            if (!ReferenceEquals(requestBody, request.Body))
+            {
+                await requestBody.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+
+        count = Math.Clamp(count, 1, MaxUploadUrlCount);
+
+        var uploadUrls = new UploadUrl[count];
+        for (var i = 0; i < count; i++)
+        {
+            uploadUrls[i] = await externalization.UploadUrlProvider!.GenerateUploadUrlAsync(new Schema([], metadata: null), cancellationToken).ConfigureAwait(false);
+        }
+
+        var responseBuffer = new MemoryStream();
+        await using (var writer = new WireWriter(responseBuffer, s_uploadUrlResultSchema))
+        {
+            var uploadArray = new Apache.Arrow.StringArray.Builder();
+            var downloadArray = new Apache.Arrow.StringArray.Builder();
+            // Must match s_uploadUrlResultSchema's declared Microsecond unit exactly — the
+            // builder's own default (Millisecond) silently mismatches the schema's field type,
+            // which corrupts every value by 1000x on read-back (found via manual verification:
+            // an expires_at of "now + 1h" came back as 1970-01-21).
+            var expiresArray = new Apache.Arrow.TimestampArray.Builder(Apache.Arrow.Types.TimeUnit.Microsecond, "UTC");
+            foreach (var u in uploadUrls)
+            {
+                uploadArray.Append(u.UploadUrlValue);
+                downloadArray.Append(u.DownloadUrl);
+                expiresArray.Append(u.ExpiresAt);
+            }
+
+            var resultBatch = new RecordBatch(s_uploadUrlResultSchema, [uploadArray.Build(), downloadArray.Build(), expiresArray.Build()], (int)count);
+            await writer.WriteBatchAsync(new AnnotatedBatch(resultBatch, null), cancellationToken).ConfigureAwait(false);
+        }
+
+        EmitAccessLog(server, "__upload_url__", "unary", "ok", "", "", Stopwatch.GetTimestamp(), StatusCodes.Status200OK);
+        await WriteBytesAsync(context, StatusCodes.Status200OK, responseBuffer.ToArray(), null, false, null, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Writes a genuine HTTP 413 — a real transport-level rejection, distinct from
+    /// every other in-band RPC error this port folds into 200 (see
+    /// <see cref="RequestTooLargeException"/>'s doc comment).</summary>
+    private static async Task Write413Async(HttpContext context, RequestTooLargeException exc, CancellationToken cancellationToken)
+    {
+        context.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+        context.Response.ContentType = "text/plain";
+        await context.Response.WriteAsync(exc.Message, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary><c>POST {prefix}/__introspect_token__</c> — runs the worker's own
@@ -373,7 +507,7 @@ public static class RpcHttpEndpoints
     /// and <c>VGI-Supported-Encodings</c> naming the codecs this server can actually produce for
     /// responses (see <see cref="s_producibleEncodings"/> — gzip only, for now).
     /// </summary>
-    private static Task HandleCapabilitiesAsync(HttpContext context, long? maxResponseBytes, StickySessionRegistry? sticky, bool proxyProofRequired, bool introspectEnabled)
+    private static Task HandleCapabilitiesAsync(HttpContext context, long? maxResponseBytes, StickySessionRegistry? sticky, bool proxyProofRequired, bool introspectEnabled, ExternalizationOptions? externalization)
     {
         var headers = context.Response.Headers;
         if (maxResponseBytes is { } cap)
@@ -381,9 +515,23 @@ public static class RpcHttpEndpoints
             headers["VGI-Max-Response-Bytes"] = cap.ToString();
         }
 
-        headers["VGI-Externalization-Enabled"] = "false";
-        headers["VGI-Upload-URL-Support"] = "false";
+        headers["VGI-Externalization-Enabled"] = externalization?.External?.Storage is not null ? "true" : "false";
+        headers["VGI-Upload-URL-Support"] = externalization?.UploadUrlProvider is not null ? "true" : "false";
         headers["VGI-Supported-Encodings"] = "gzip";
+        if (externalization?.MaxRequestBytes is { } maxRequestBytes)
+        {
+            headers["VGI-Max-Request-Bytes"] = maxRequestBytes.ToString();
+        }
+
+        if (externalization?.MaxUploadBytes is { } maxUploadBytes)
+        {
+            headers["VGI-Max-Upload-Bytes"] = maxUploadBytes.ToString();
+        }
+
+        if (externalization?.MaxExternalizedResponseBytes is { } maxExternalizedResponseBytes)
+        {
+            headers["VGI-Max-Externalized-Response-Bytes"] = maxExternalizedResponseBytes.ToString();
+        }
         if (sticky is not null)
         {
             // Spec §2.3 — advertised on every response when sticky is enabled; OPTIONS /health is
@@ -442,7 +590,7 @@ public static class RpcHttpEndpoints
         return context.Response.Body.WriteAsync(body, context.RequestAborted).AsTask();
     }
 
-    private static async Task HandleUnaryAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky, byte[] tokenKey)
+    private static async Task HandleUnaryAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky, byte[] tokenKey, ExternalizationOptions? externalization)
     {
         if (await TryRejectUnauthenticatedAsync(context, authenticate, proxyHint).ConfigureAwait(false))
         {
@@ -494,11 +642,16 @@ public static class RpcHttpEndpoints
         Stream requestBody;
         try
         {
-            requestBody = DecompressingRequestBody(request);
+            requestBody = DecompressingRequestBody(request, RequestCap.Enforce(request, externalization?.MaxRequestBytes));
         }
         catch (NotSupportedException exc)
         {
             await ErrorResultAsync(server, method, new RpcException("TypeError", exc.Message), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, httpStatusForLog: StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
+            return;
+        }
+        catch (RequestTooLargeException exc)
+        {
+            await Write413Async(context, exc, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -508,6 +661,11 @@ public static class RpcHttpEndpoints
             using var reader = new WireReader(requestBody);
             _ = await reader.ReadSchemaAsync(cancellationToken).ConfigureAwait(false);
             requestBatch = await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (RequestTooLargeException exc)
+        {
+            await Write413Async(context, exc, cancellationToken).ConfigureAwait(false);
+            return;
         }
         catch (Exception exc)
         {
@@ -539,6 +697,23 @@ public static class RpcHttpEndpoints
                 info.ResultSchema,
                 httpStatusForLog: StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
+        }
+
+        if (externalization?.External is not null)
+        {
+            try
+            {
+                var (resolvedBatch, resolvedMetadata) = await ExternalLocation.ResolveAsync(
+                    requestBatch.Batch, requestBatch.Metadata,
+                    new ClientExternalConfig { FetchConfig = externalization.External.FetchConfig, UrlValidator = externalization.External.UrlValidator },
+                    cancellationToken).ConfigureAwait(false);
+                requestBatch = requestBatch with { Batch = resolvedBatch, Metadata = resolvedMetadata };
+            }
+            catch (Exception exc)
+            {
+                await ErrorResultAsync(server, method, exc, StatusCodes.Status500InternalServerError, info.ResultSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
+                return;
+            }
         }
 
         object?[] args;
@@ -591,7 +766,20 @@ public static class RpcHttpEndpoints
                     var resultBatch = info.ResultSchema.FieldsList.Count == 0
                         ? ValueCodec.EmptyRow(info.ResultSchema)
                         : ValueCodec.BuildRow(info.ResultSchema, [result]);
-                    await writer.WriteBatchAsync(new AnnotatedBatch(resultBatch, null), cancellationToken).ConfigureAwait(false);
+
+                    IReadOnlyDictionary<string, string>? resultMetadata = null;
+                    if (externalization?.External is { } externalConfig)
+                    {
+                        var predicted = ExternalLocation.PredictExternalizeBytes(resultBatch, externalConfig);
+                        if (externalization.MaxExternalizedResponseBytes is { } externalCap && predicted > externalCap)
+                        {
+                            throw new RpcException("RuntimeError", $"Externalised payload exceeds max_externalized_response_bytes ({predicted} > {externalCap}) for method '{method}'");
+                        }
+
+                        (resultBatch, resultMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(resultBatch, null, externalConfig, cancellationToken).ConfigureAwait(false);
+                    }
+
+                    await writer.WriteBatchAsync(new AnnotatedBatch(resultBatch, resultMetadata), cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception exc)
                 {
@@ -657,7 +845,7 @@ public static class RpcHttpEndpoints
     /// happens via <see cref="HandleStreamExchangeAsync"/> — which the client's generic init-response
     /// reader handles correctly regardless (it just sees zero data batches this turn).
     /// </summary>
-    private static async Task HandleStreamInitAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky)
+    private static async Task HandleStreamInitAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky, ExternalizationOptions? externalization)
     {
         if (await TryRejectUnauthenticatedAsync(context, authenticate, proxyHint).ConfigureAwait(false))
         {
@@ -691,11 +879,16 @@ public static class RpcHttpEndpoints
         Stream requestBody;
         try
         {
-            requestBody = DecompressingRequestBody(request);
+            requestBody = DecompressingRequestBody(request, RequestCap.Enforce(request, externalization?.MaxRequestBytes));
         }
         catch (NotSupportedException exc)
         {
             await ErrorResultAsync(server, method, new RpcException("TypeError", exc.Message), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+        catch (RequestTooLargeException exc)
+        {
+            await Write413Async(context, exc, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -705,6 +898,11 @@ public static class RpcHttpEndpoints
             using var reader = new WireReader(requestBody);
             _ = await reader.ReadSchemaAsync(cancellationToken).ConfigureAwait(false);
             requestBatch = await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (RequestTooLargeException exc)
+        {
+            await Write413Async(context, exc, cancellationToken).ConfigureAwait(false);
+            return;
         }
         catch (Exception exc)
         {
@@ -730,6 +928,23 @@ public static class RpcHttpEndpoints
         {
             await ErrorResultAsync(server, method, new RpcException("TypeError", $"Method name mismatch: URL path has '{method}' but Arrow IPC custom_metadata 'vgi_rpc.method' has '{ipcMethod}'. These must match."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
+        }
+
+        if (externalization?.External is not null)
+        {
+            try
+            {
+                var (resolvedBatch, resolvedMetadata) = await ExternalLocation.ResolveAsync(
+                    requestBatch.Batch, requestBatch.Metadata,
+                    new ClientExternalConfig { FetchConfig = externalization.External.FetchConfig, UrlValidator = externalization.External.UrlValidator },
+                    cancellationToken).ConfigureAwait(false);
+                requestBatch = requestBatch with { Batch = resolvedBatch, Metadata = resolvedMetadata };
+            }
+            catch (Exception exc)
+            {
+                await ErrorResultAsync(server, method, exc, StatusCodes.Status500InternalServerError, s_emptySchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+                return;
+            }
         }
 
         object?[] args;
@@ -808,6 +1023,60 @@ public static class RpcHttpEndpoints
         }
 
         var outputSchema = stream.OutputSchema;
+        var isProducer = stream.InputSchema is not { FieldsList.Count: > 0 };
+
+        // HTTP folds a producer stream's FIRST tick into /init — mirrors the canonical Python
+        // implementation's _run_http_producer_turn, invoked from the init handler, rather than
+        // deferring every tick to the first /exchange call as this port previously did (found via
+        // TestExternalInputRoutes::test_stream_init_resolves_external_input inspecting the raw
+        // /init response and finding it carried zero data even for a method that emits on its
+        // very first tick). Exchange streams get no such tick here — nothing to produce until the
+        // client sends its first exchange turn with real input.
+        OutputCollector? tickCollector = null;
+        if (isProducer)
+        {
+            tickCollector = new OutputCollector(outputSchema);
+            var tickContext = new StreamHttpCallContext(tickCollector, stickyState);
+            try
+            {
+                await stream.State.ProcessAsync(new AnnotatedBatch(ValueCodec.EmptyRow(s_emptySchema), null), tickCollector, tickContext, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception exc)
+            {
+                registry.Remove(callKey);
+                stickyState?.ReleaseLockIfHeld();
+                var actual = Unwrap(exc);
+                await ErrorResultAsync(server, method, actual, StatusCodes.Status500InternalServerError, outputSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
+                return;
+            }
+        }
+
+        var tickFinished = tickCollector?.Finished ?? false;
+        var tickEmitted = tickCollector?.EmittedBatch;
+        IReadOnlyDictionary<string, string>? tickEmittedMetadata = null;
+        if (externalization?.External is { } externalConfig && tickEmitted is not null)
+        {
+            var predicted = ExternalLocation.PredictExternalizeBytes(tickEmitted, externalConfig);
+            if (externalization.MaxExternalizedResponseBytes is { } externalCap && predicted > externalCap)
+            {
+                registry.Remove(callKey);
+                stickyState?.ReleaseLockIfHeld();
+                var overshoot = new RpcException("RuntimeError", $"Externalised payload exceeds max_externalized_response_bytes ({predicted} > {externalCap}) for method '{method}'");
+                await ErrorResultAsync(server, method, overshoot, StatusCodes.Status500InternalServerError, outputSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
+                return;
+            }
+
+            (tickEmitted, tickEmittedMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(tickEmitted, null, externalConfig, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (isProducer && tickFinished)
+        {
+            // The producer completed on its very first tick — no continuation is possible, so
+            // (matching Python) no token is minted or registered at all; the client's iteration
+            // protocol reads "no continuation token in the /init response" as "already done".
+            registry.Remove(callKey);
+        }
+
         await using (var outputWriter = new WireWriter(responseBuffer, outputSchema))
         {
             if (invokeContext is not null)
@@ -818,12 +1087,35 @@ public static class RpcHttpEndpoints
                 }
             }
 
-            var tokenMetadata = new Dictionary<string, string>
+            if (tickCollector is not null)
             {
-                [MetadataKeys.StreamState] = tokenBase64,
-                [MetadataKeys.CallState] = tokenBase64,
-            };
-            await outputWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), tokenMetadata), cancellationToken).ConfigureAwait(false);
+                foreach (var logMessage in tickCollector.Logs)
+                {
+                    await outputWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), logMessage.AddToMetadata()), cancellationToken).ConfigureAwait(false);
+                }
+
+                if (tickEmitted is not null)
+                {
+                    await outputWriter.WriteBatchAsync(new AnnotatedBatch(tickEmitted, tickEmittedMetadata), cancellationToken).ConfigureAwait(false);
+                }
+            }
+
+            if (!isProducer || !tickFinished)
+            {
+                var tokenMetadata = new Dictionary<string, string>
+                {
+                    [MetadataKeys.StreamState] = tokenBase64,
+                    [MetadataKeys.CallState] = tokenBase64,
+                };
+                await outputWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), tokenMetadata), cancellationToken).ConfigureAwait(false);
+            }
+            else if (tickEmitted is null)
+            {
+                // Finished on the first tick with no data at all — an empty (schema, EOS)
+                // response tells the client's __iter__ the producer is immediately done (mirrors
+                // HandleStreamExchangeAsync's identical fallback for a later finishing turn).
+                await outputWriter.WriteStartAsync(cancellationToken).ConfigureAwait(false);
+            }
         }
 
         EmitAccessLog(server, info.WireName, "stream", "ok", "", "", start, StatusCodes.Status200OK, callKey);
@@ -858,7 +1150,7 @@ public static class RpcHttpEndpoints
     /// (unlike accumulate-until-cap) trivially supporting mid-stream cancel — see
     /// <see cref="StreamCallRegistry"/>'s doc comment for the same simplification's rationale.
     /// </summary>
-    private static async Task HandleStreamExchangeAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky)
+    private static async Task HandleStreamExchangeAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky, ExternalizationOptions? externalization)
     {
         if (await TryRejectUnauthenticatedAsync(context, authenticate, proxyHint).ConfigureAwait(false))
         {
@@ -885,11 +1177,16 @@ public static class RpcHttpEndpoints
         Stream requestBody;
         try
         {
-            requestBody = DecompressingRequestBody(request);
+            requestBody = DecompressingRequestBody(request, RequestCap.Enforce(request, externalization?.MaxRequestBytes));
         }
         catch (NotSupportedException exc)
         {
             await ErrorResultAsync(server, method, new RpcException("TypeError", exc.Message), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+        catch (RequestTooLargeException exc)
+        {
+            await Write413Async(context, exc, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -899,6 +1196,11 @@ public static class RpcHttpEndpoints
             using var reader = new WireReader(requestBody);
             _ = await reader.ReadSchemaAsync(cancellationToken).ConfigureAwait(false);
             requestBatch = await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (RequestTooLargeException exc)
+        {
+            await Write413Async(context, exc, cancellationToken).ConfigureAwait(false);
+            return;
         }
         catch (Exception exc)
         {
@@ -919,6 +1221,10 @@ public static class RpcHttpEndpoints
             return;
         }
 
+        // Extract both tokens before resolution: ExternalLocation.ResolveAsync replaces metadata
+        // with whatever was stored in the fetched external IPC stream, so anything read off
+        // requestBatch.Metadata must be pulled out first (mirrors the canonical Python
+        // implementation's _app_stream.py comment to the same effect).
         var tokenB64 = requestBatch.GetMetadata(MetadataKeys.StreamState);
         if (tokenB64 is null)
         {
@@ -966,6 +1272,24 @@ public static class RpcHttpEndpoints
         }
 
         var turnBatch = requestBatch;
+        if (externalization?.External is not null)
+        {
+            try
+            {
+                var (resolvedBatch, resolvedMetadata) = await ExternalLocation.ResolveAsync(
+                    turnBatch.Batch, turnBatch.Metadata,
+                    new ClientExternalConfig { FetchConfig = externalization.External.FetchConfig, UrlValidator = externalization.External.UrlValidator },
+                    cancellationToken).ConfigureAwait(false);
+                turnBatch = turnBatch with { Batch = resolvedBatch, Metadata = resolvedMetadata };
+            }
+            catch (Exception exc)
+            {
+                registry.Remove(callKey);
+                await ErrorResultAsync(server, method, exc, StatusCodes.Status500InternalServerError, outputSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
+                return;
+            }
+        }
+
         if (!isProducer && stream.InputSchema is { } declaredInputSchema)
         {
             try
@@ -1053,6 +1377,34 @@ public static class RpcHttpEndpoints
             registry.Remove(callKey);
         }
 
+        // Externalize this turn's emitted data batch, if configured — same channel unary results
+        // use, applied here too so TestExternalizedResponseCap's producer case
+        // (test_producer_gets_no_continuation_escape) gets real coverage: max_externalized_
+        // response_bytes has no soft/continuation escape valve for ANY method type (spec: bytes
+        // already uploaded cannot be un-uploaded), unlike max_response_bytes's producer-only soft
+        // cap just above. Predict-then-refuse, exactly like the unary path, so an over-cap upload
+        // is never attempted.
+        var emittedBatch = collector.EmittedBatch;
+        IReadOnlyDictionary<string, string>? emittedBatchMetadata = null;
+        if (externalization?.External is { } externalConfig && emittedBatch is not null)
+        {
+            var predicted = ExternalLocation.PredictExternalizeBytes(emittedBatch, externalConfig);
+            if (externalization.MaxExternalizedResponseBytes is { } externalCap && predicted > externalCap)
+            {
+                registry.Remove(callKey);
+                if (stickyState is not null)
+                {
+                    FinishSticky(context, sticky!, stickyState);
+                }
+
+                var overshoot = new RpcException("RuntimeError", $"Externalised payload exceeds max_externalized_response_bytes ({predicted} > {externalCap}) for method '{method}'");
+                await ErrorResultAsync(server, method, overshoot, StatusCodes.Status500InternalServerError, outputSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
+                return;
+            }
+
+            (emittedBatch, emittedBatchMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(emittedBatch, null, externalConfig, cancellationToken).ConfigureAwait(false);
+        }
+
         var responseBuffer = new MemoryStream();
         await using (var writer = new WireWriter(responseBuffer, outputSchema))
         {
@@ -1063,9 +1415,9 @@ public static class RpcHttpEndpoints
 
             if (isProducer)
             {
-                if (collector.EmittedBatch is not null)
+                if (emittedBatch is not null)
                 {
-                    await writer.WriteBatchAsync(new AnnotatedBatch(collector.EmittedBatch, null), cancellationToken).ConfigureAwait(false);
+                    await writer.WriteBatchAsync(new AnnotatedBatch(emittedBatch, emittedBatchMetadata), cancellationToken).ConfigureAwait(false);
                 }
 
                 if (freshTokenB64 is not null)
@@ -1073,7 +1425,7 @@ public static class RpcHttpEndpoints
                     var sentinelMetadata = new Dictionary<string, string> { [MetadataKeys.StreamState] = freshTokenB64 };
                     await writer.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), sentinelMetadata), cancellationToken).ConfigureAwait(false);
                 }
-                else if (collector.EmittedBatch is null)
+                else if (emittedBatch is null)
                 {
                     // Finished with no data this turn — an empty (schema, EOS) response tells the
                     // client's __iter__/next_with_token the producer is done (mirrors WireStartAsync
@@ -1087,10 +1439,22 @@ public static class RpcHttpEndpoints
                 // separate sentinel — see this method's doc comment. ExchangeState never finishes
                 // server-side (the client ends the exchange by simply stopping calling exchange()),
                 // so freshTokenB64 is always set here in practice.
-                var dataMetadata = freshTokenB64 is not null
-                    ? new Dictionary<string, string> { [MetadataKeys.StreamState] = freshTokenB64 }
-                    : null;
-                var dataBatch = collector.EmittedBatch ?? ValueCodec.EmptyRow(outputSchema);
+                Dictionary<string, string>? dataMetadata = null;
+                if (freshTokenB64 is not null)
+                {
+                    dataMetadata = new Dictionary<string, string> { [MetadataKeys.StreamState] = freshTokenB64 };
+                }
+
+                if (emittedBatchMetadata is not null)
+                {
+                    dataMetadata ??= [];
+                    foreach (var (key, value) in emittedBatchMetadata)
+                    {
+                        dataMetadata[key] = value;
+                    }
+                }
+
+                var dataBatch = emittedBatch ?? ValueCodec.EmptyRow(outputSchema);
                 await writer.WriteBatchAsync(new AnnotatedBatch(dataBatch, dataMetadata), cancellationToken).ConfigureAwait(false);
             }
         }
@@ -1173,14 +1537,20 @@ public static class RpcHttpEndpoints
     /// HTTP can succeed against a real client. Mirrors <c>_CompressionMiddleware</c>'s codec set
     /// (zstd, gzip — no brotli despite it appearing in clients' Accept-Encoding lists).
     /// </summary>
-    private static Stream DecompressingRequestBody(HttpRequest request)
+    private static Stream DecompressingRequestBody(HttpRequest request) => DecompressingRequestBody(request, request.Body);
+
+    /// <summary>Overload taking the raw source stream explicitly, so callers enforcing
+    /// <c>max_request_bytes</c> (see <see cref="RequestCap"/>) can wrap <c>request.Body</c> in a
+    /// capped stream first — the cap applies to the on-wire (pre-decompression) bytes, matching
+    /// Python's semantics.</summary>
+    private static Stream DecompressingRequestBody(HttpRequest request, Stream rawBody)
     {
         var encoding = request.Headers.ContentEncoding.ToString();
         return encoding.ToLowerInvariant() switch
         {
-            "" or "identity" => request.Body,
-            "zstd" => new ZstdSharp.DecompressionStream(request.Body),
-            "gzip" => new GZipStream(request.Body, CompressionMode.Decompress),
+            "" or "identity" => rawBody,
+            "zstd" => new ZstdSharp.DecompressionStream(rawBody),
+            "gzip" => new GZipStream(rawBody, CompressionMode.Decompress),
             _ => throw new NotSupportedException($"Content-Encoding '{encoding}' is not supported by this server."),
         };
     }

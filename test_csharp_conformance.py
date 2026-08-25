@@ -286,6 +286,91 @@ def mtls_worker(worker_binary: Path) -> Iterator[str]:
     yield from _spawn_http_worker(worker_binary, "--conformance-mtls-subject")
 
 
+# M13 (see docs/roadmap.md): external storage. Same import-the-canonical-suite pattern as
+# M10/M11/M12 — TestExternalLocation/TestExternalizedResponseCap (vgi_rpc.conformance._pytest_suite)
+# and TestExternalInputRoutes/TestExternalFetchFailures/TestExternalFetchSecurity/
+# TestExternalStorageUrlPair (vgi_rpc.conformance._external_pytest) are imported below. Every
+# variant needs a fake-storage HTTP service — run in-process on a background thread, mirroring the
+# canonical repo's own conftest.py fixture, so the C# worker subprocess can reach it over loopback.
+@pytest.fixture(scope="session")
+def conformance_fake_storage() -> Iterator[str]:
+    """In-process fake object-storage service (vgi_rpc.conformance.fake_storage) for
+    external-location conformance tests. Yields its base URL."""
+    from vgi_rpc.conformance.fake_storage import serve_in_thread
+
+    base_url, shutdown = serve_in_thread()
+    try:
+        yield base_url
+    finally:
+        shutdown()
+
+
+@pytest.fixture
+def conformance_http_with_storage_port(worker_binary: Path, conformance_fake_storage: str) -> Iterator[int]:
+    """HTTP worker wired against the fake storage, at the worker's own 4 KiB default externalize
+    threshold, so tests can trigger externalization without megabyte payloads."""
+    yield from _spawn_http_worker_port(worker_binary, "--fake-storage", conformance_fake_storage)
+
+
+@pytest.fixture
+def conformance_http_with_zstd_storage_port(worker_binary: Path, conformance_fake_storage: str) -> Iterator[int]:
+    """Same, with zstd compression enabled on externalized batches."""
+    yield from _spawn_http_worker_port(
+        worker_binary, "--fake-storage", conformance_fake_storage, "--compression", "zstd"
+    )
+
+
+@pytest.fixture
+def conformance_http_external_security_port(worker_binary: Path, conformance_fake_storage: str) -> Iterator[int]:
+    """The canonical external-fetch security configuration: independent encoded (4 KiB) and
+    decoded (8 KiB) caps, plus a redirect-hop validator admitting only 127.0.0.1 (so the
+    fixture's own storage URLs work but a redirect to `localhost` is rejected before it's ever
+    fetched)."""
+    yield from _spawn_http_worker_port(
+        worker_binary,
+        "--fake-storage",
+        conformance_fake_storage,
+        "--max-request-bytes",
+        "1048576",
+        "--max-fetch-bytes",
+        "4096",
+        "--max-decompressed-fetch-bytes",
+        "8192",
+        "--reject-localhost-redirects",
+    )
+
+
+# Tight external cap, *generous* request/response body caps: an externalised payload leaves only
+# a pointer batch on the wire, so if the body caps were tight too they'd fail first and
+# TestExternalizedResponseCap would pass while proving nothing about the external channel. Mirrors
+# vgi-rpc-rust/test_rust_conformance.py's own _EXT_CAP_MAX_* constants and _start_rust_http_with_
+# storage(...) call for its "externalized_cap" variant — the closest existing precedent for a
+# single-worker (not two-script) port unifying what the reference repo splits across
+# serve_conformance_http.py / serve_conformance_http_strict.py.
+_EXT_CAP_MAX_EXTERNALIZED_BYTES = 64 * 1024
+_EXT_CAP_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
+
+@pytest.fixture
+def conformance_http_externalized_cap_port(worker_binary: Path, conformance_fake_storage: str) -> Iterator[int]:
+    """A worker whose *external-channel* cap is the one that bites: tight
+    (max_externalized_response_bytes = 64 KiB) while max_request_bytes/max_response_bytes stay
+    generous (8 MiB) so the body caps are never what fails. --externalize-threshold stays at the
+    worker's own 4 KiB default so a modest payload still externalizes, backing the group's
+    under-cap control case."""
+    yield from _spawn_http_worker_port(
+        worker_binary,
+        "--fake-storage",
+        conformance_fake_storage,
+        "--max-request-bytes",
+        str(_EXT_CAP_MAX_RESPONSE_BYTES),
+        "--max-response-bytes",
+        str(_EXT_CAP_MAX_RESPONSE_BYTES),
+        "--max-externalized-response-bytes",
+        str(_EXT_CAP_MAX_EXTERNALIZED_BYTES),
+    )
+
+
 def _make_test_cert(cn: str = "test-client", *, days_valid: int = 365, not_before_offset=None) -> str:
     """Generates a self-signed certificate and returns it URL-encoded PEM, ready to drop straight
     into an X-SSL-Client-Cert header — mirrors the canonical Python repo's
@@ -780,3 +865,18 @@ from vgi_rpc.conformance._pytest_suite import TestProxyProof, TestProxyProofOffM
 # against conformance_http_introspect_port (above) and conformance_http_port (M10's sticky
 # fixture) respectively.
 from vgi_rpc.conformance._pytest_suite import TestTokenIntrospection, TestTokenIntrospectionOffMode  # noqa: E402,F401
+
+# M13: the canonical TestExternalLocation + TestExternalizedResponseCap groups
+# (vgi_rpc.conformance._pytest_suite), collected against conformance_http_with_storage_port /
+# conformance_http_with_zstd_storage_port / conformance_http_externalized_cap_port above.
+from vgi_rpc.conformance._pytest_suite import TestExternalLocation, TestExternalizedResponseCap  # noqa: E402,F401
+
+# M13: the canonical external-fetch groups (vgi_rpc.conformance._external_pytest) — a small
+# raw-HTTP driver separate from _pytest_suite because these tests place external-location pointer
+# batches on inbound request routes directly, which the ordinary RPC proxy deliberately hides.
+from vgi_rpc.conformance._external_pytest import (  # noqa: E402,F401
+    TestExternalFetchFailures,
+    TestExternalFetchSecurity,
+    TestExternalInputRoutes,
+    TestExternalStorageUrlPair,
+)
