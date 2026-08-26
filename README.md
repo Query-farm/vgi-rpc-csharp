@@ -24,8 +24,12 @@ interoperate over pipe/stdio, Unix domain socket, TCP, or HTTP. See
 implementation wrinkle: the stock `Apache.Arrow` NuGet package can't write or read per-batch
 `custom_metadata` (every vgi-rpc protocol semantic — method name, versions, log/error info, stream
 continuation tokens — rides on it), so this repo vendors a small, surgically patched copy of
-`apache/arrow-dotnet` instead of hand-rolling the FlatBuffers framing itself — see
-`third_party/apache-arrow-dotnet/README.md` for exactly what's patched and why.
+`apache/arrow-dotnet` instead of hand-rolling the FlatBuffers framing itself — published as
+`QueryFarm.Arrow`/`QueryFarm.Arrow.Scalars` (a `QueryFarm.VgiRpc` dependency, pulled in
+automatically — no separate install step) rather than the real `Apache.Arrow`/
+`Apache.Arrow.Scalars`, which stay the official, unpatched upstream packages. See
+`third_party/apache-arrow-dotnet/README.md` for exactly what's patched, why, and why the fork
+needed its own distinct package identity.
 
 ## Installation
 
@@ -39,7 +43,12 @@ dotnet add package QueryFarm.VgiRpc.OpenTelemetry  # tracing/metrics instrumenta
 dotnet add package QueryFarm.VgiRpc.Sentry         # error-capture instrumentation
 ```
 
-Requires the .NET 10 SDK.
+Requires the .NET 10 SDK. As of 0.4.0, `QueryFarm.VgiRpc` correctly resolves its patched-Arrow
+dependency (`QueryFarm.Arrow`) from nuget.org on its own — versions before 0.4.0 declared a
+broken transitive dependency on the real, unpatched, years-old official `Apache.Arrow` package and
+would not build for a consumer without also vendoring this repo's own patched source (see
+`third_party/apache-arrow-dotnet/README.md`'s "Published as QueryFarm.Arrow" section); upgrade if
+you're on an earlier version.
 
 ## Quick Start
 

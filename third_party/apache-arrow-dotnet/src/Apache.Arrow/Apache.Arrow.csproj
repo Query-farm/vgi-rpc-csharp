@@ -4,8 +4,45 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <DefineConstants>$(DefineConstants);UNSAFE_BYTEBUFFER;ENABLE_SPAN_T</DefineConstants>
     <IsAotCompatible>true</IsAotCompatible>
-    <Description>Apache Arrow is a cross-language development platform for in-memory data. It specifies a standardized language-independent columnar memory format for flat and hierarchical data, organized for efficient analytic operations on modern hardware.</Description>
+    <Description>Query Farm's patched fork of Apache Arrow for .NET — adds per-batch RecordBatch custom_metadata support (three commits cherry-picked from apache/arrow-dotnet#283, applied on top of the v23.0.0 release tag), needed by QueryFarm.VgiRpc's wire protocol until an equivalent lands upstream. See https://github.com/Query-farm/vgi-rpc-csharp/blob/main/third_party/apache-arrow-dotnet/README.md for exactly what's patched and why. Not affiliated with or endorsed by the Apache Software Foundation; distributed under the same Apache-2.0 license as the upstream project (see LICENSE.txt/NOTICE.txt in this package).</Description>
   </PropertyGroup>
+
+  <!-- Distinct PackageId (does not collide with the official "Apache.Arrow" package on
+       nuget.org) while keeping the default AssemblyName/RootNamespace ("Apache.Arrow", from the
+       .csproj filename) unchanged, so every file in this repo that does `using Apache.Arrow;`
+       keeps compiling completely unmodified. This mirrors vgi-go's equivalent fork
+       (github.com/Query-farm/arrow-go, referenced via a go.mod `replace` directive) — .NET has no
+       replace-directive equivalent, so here the split is: NuGet resolves a unique, correctly
+       versioned package identity ("QueryFarm.Arrow"), while the assembly inside it keeps its
+       original name/namespace for source compatibility. Overrides third_party/Directory.Build.props's
+       repo-wide IsPackable=false — this one vendored project (plus its own Apache.Arrow.Scalars
+       reference) is deliberately published; nothing else under third_party/ is.
+       Version mirrors the upstream tag this fork is based on (v23.0.0) with a distinguishing
+       prerelease suffix, so it can never collide with any real official Apache.Arrow release
+       (present or future) regardless of package id. -->
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <PackageId>QueryFarm.Arrow</PackageId>
+    <Version>23.0.0-queryfarm.1</Version>
+    <Authors>The Apache Software Foundation; Query Farm LLC</Authors>
+    <Company>Query Farm LLC</Company>
+    <Copyright>Copyright 2018-2025 The Apache Software Foundation. Modifications copyright Query Farm LLC.</Copyright>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/Query-farm/vgi-rpc-csharp</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)../../LICENSE.txt" Pack="true" PackagePath="LICENSE.txt" Visible="false" />
+    <None Include="$(MSBuildThisFileDirectory)../../NOTICE.txt" Pack="true" PackagePath="NOTICE.txt" Visible="false" />
+    <None Include="$(MSBuildThisFileDirectory)../../README.md" Pack="true" PackagePath="README.md" Visible="false" />
+  </ItemGroup>
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>

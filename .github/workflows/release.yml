@@ -33,7 +33,10 @@ jobs:
       # passing every src/*.csproj as separate arguments (the previous form of this line) fails
       # with MSB1008 "Only one project can be specified" — packing the whole repo instead relies
       # on IsPackable (false for test/conformance/benchmark, true for src/, see the per-folder
-      # Directory.Build.props files) to select exactly the 7 publishable packages.
+      # Directory.Build.props files) to select exactly the 9 publishable packages — the original
+      # 7 QueryFarm.VgiRpc* packages plus QueryFarm.Arrow/QueryFarm.Arrow.Scalars (the vendored,
+      # patched Apache.Arrow fork — see third_party/apache-arrow-dotnet/README.md), versioned
+      # independently of the rest of this repo.
       - run: dotnet pack -c Release --no-build -o ./artifacts/nupkg
 
       # Trusted Publishing (https://learn.microsoft.com/nuget/nuget-org/trusted-publishing):

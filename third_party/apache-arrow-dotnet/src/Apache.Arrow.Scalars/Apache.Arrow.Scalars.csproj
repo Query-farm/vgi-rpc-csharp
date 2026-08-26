@@ -4,7 +4,34 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <TargetFramework>net10.0</TargetFramework>
     <IsAotCompatible>true</IsAotCompatible>
-    <Description>Apache Arrow scalar types, including Parquet-compatible variants. Provides readers, writers, and object model for the Parquet Variant binary format for semi-structured data.</Description>
+    <Description>Apache Arrow scalar types, including Parquet-compatible variants (vendored alongside Query Farm's patched QueryFarm.Arrow fork — see that package's description). Unmodified from apache/arrow-dotnet's v23.0.0 release tag; packaged under a distinct id purely because it's a ProjectReference dependency of QueryFarm.Arrow, not because it carries any patch of its own.</Description>
   </PropertyGroup>
+
+  <!-- See Apache.Arrow.csproj's matching comment: distinct PackageId (no collision with the
+       official "Apache.Arrow.Scalars" package), default AssemblyName/RootNamespace unchanged.
+       Overrides third_party/Directory.Build.props's repo-wide IsPackable=false. -->
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <PackageId>QueryFarm.Arrow.Scalars</PackageId>
+    <Version>23.0.0-queryfarm.1</Version>
+    <Authors>The Apache Software Foundation; Query Farm LLC</Authors>
+    <Company>Query Farm LLC</Company>
+    <Copyright>Copyright 2018-2025 The Apache Software Foundation. Modifications copyright Query Farm LLC.</Copyright>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/Query-farm/vgi-rpc-csharp</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)../../LICENSE.txt" Pack="true" PackagePath="LICENSE.txt" Visible="false" />
+    <None Include="$(MSBuildThisFileDirectory)../../NOTICE.txt" Pack="true" PackagePath="NOTICE.txt" Visible="false" />
+    <None Include="$(MSBuildThisFileDirectory)../../README.md" Pack="true" PackagePath="README.md" Visible="false" />
+  </ItemGroup>
 
 </Project>
