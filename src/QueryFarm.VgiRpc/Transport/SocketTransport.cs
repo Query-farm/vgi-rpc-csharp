@@ -40,8 +40,14 @@ public sealed class SocketTransport : IRpcTransport, IDisposable
     /// <summary>Listens on a Unix domain socket at <paramref name="path"/>, invoking
     /// <paramref name="handleConnection"/> once per accepted connection until
     /// <paramref name="cancellationToken"/> is cancelled. Removes any stale socket file first —
-    /// binding to an existing path otherwise fails.</summary>
-    public static async Task ServeUnixAsync(string path, Func<IRpcTransport, CancellationToken, Task> handleConnection, CancellationToken cancellationToken)
+    /// binding to an existing path otherwise fails — and unlinks it (best-effort) once the accept
+    /// loop ends, matching the AF_UNIX launcher protocol's worker-shutdown contract (see
+    /// docs/launcher-protocol.md in the canonical Python repo: "unlink &lt;hash&gt;.sock
+    /// (best-effort; not a correctness requirement)"). <paramref name="onBound"/>, if given, is
+    /// invoked once immediately after the socket is bound and listening — the launcher protocol
+    /// requires the worker to emit its <c>UNIX:&lt;path&gt;</c> discovery line at exactly this
+    /// point, before accepting any connection.</summary>
+    public static async Task ServeUnixAsync(string path, Func<IRpcTransport, CancellationToken, Task> handleConnection, CancellationToken cancellationToken, Action? onBound = null)
     {
         if (File.Exists(path))
         {
@@ -51,7 +57,23 @@ public sealed class SocketTransport : IRpcTransport, IDisposable
         using var listener = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
         listener.Bind(new UnixDomainSocketEndPoint(path));
         listener.Listen();
-        await AcceptLoopAsync(listener, handleConnection, cancellationToken).ConfigureAwait(false);
+        onBound?.Invoke();
+        try
+        {
+            await AcceptLoopAsync(listener, handleConnection, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            try
+            {
+                File.Delete(path);
+            }
+            catch
+            {
+                // Best-effort per the launcher protocol — a launcher whose next spawn finds a
+                // stale socket file unlinks it itself before binding (connect-probe-then-unlink).
+            }
+        }
     }
 
     /// <summary>Listens on TCP <paramref name="host"/>:<paramref name="port"/> (port 0 picks an

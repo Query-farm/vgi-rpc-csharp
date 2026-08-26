@@ -251,12 +251,15 @@ namespace Apache.Arrow.Ipc
                     Flatbuf.FixedSizeList fixedSizeListMetadata = field.Type<Flatbuf.FixedSizeList>().Value;
                     return new Types.FixedSizeListType(childFields[0], fixedSizeListMetadata.ListSize);
                 case Flatbuf.Type.Struct_:
-                    Debug.Assert(childFields != null);
-                    return new Types.StructType(childFields);
+                    // childFields is null (not empty) when the FlatBuffers children vector is
+                    // absent — always true for a genuinely zero-field struct<>, a normal and
+                    // common wire shape (e.g. a "no arguments" marker). See the vendoring
+                    // README's "Fourth patch" for why the upstream Debug.Assert here was wrong
+                    // rather than just a missing null-check like every sibling case below it.
+                    return new Types.StructType(childFields ?? System.Array.Empty<Field>());
                 case Flatbuf.Type.Union:
-                    Debug.Assert(childFields != null);
                     Flatbuf.Union unionMetadata = field.Type<Flatbuf.Union>().Value;
-                    return new Types.UnionType(childFields, unionMetadata.GetTypeIdsArray(), unionMetadata.Mode.ToArrow());
+                    return new Types.UnionType(childFields ?? System.Array.Empty<Field>(), unionMetadata.GetTypeIdsArray(), unionMetadata.Mode.ToArrow());
                 case Flatbuf.Type.Map:
                     if (childFields == null || childFields.Length != 1)
                     {

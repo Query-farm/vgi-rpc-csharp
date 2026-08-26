@@ -29,8 +29,15 @@ public abstract class ProducerState : StreamState
 {
     public abstract Task ProduceAsync(OutputCollector output, ICallContext? ctx, CancellationToken cancellationToken);
 
-    public sealed override Task ProcessAsync(AnnotatedBatch input, OutputCollector output, ICallContext? ctx, CancellationToken cancellationToken) =>
-        ProduceAsync(output, ctx, cancellationToken);
+    public sealed override Task ProcessAsync(AnnotatedBatch input, OutputCollector output, ICallContext? ctx, CancellationToken cancellationToken)
+    {
+        // A producer stream's own tick batches carry no application data, but they can still
+        // carry custom_metadata (e.g. VGI's dynamic Top-N filter tightening) — expose it via the
+        // collector since ProduceAsync's signature has no other way to see it. See
+        // OutputCollector.InputMetadata.
+        output.InputMetadata = input.Metadata;
+        return ProduceAsync(output, ctx, cancellationToken);
+    }
 }
 
 /// <summary>

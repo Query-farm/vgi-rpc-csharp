@@ -822,7 +822,7 @@ namespace Apache.Arrow.Ipc
 
             if (!HasWrittenDictionaryBatch)
             {
-                DictionaryCollector.Collect(recordBatch, ref _dictionaryMemo);
+                DictionaryCollector.Collect(Schema, recordBatch, ref _dictionaryMemo);
                 WriteDictionaries(_dictionaryMemo);
                 HasWrittenDictionaryBatch = true;
             }
@@ -878,7 +878,7 @@ namespace Apache.Arrow.Ipc
 
             if (!HasWrittenDictionaryBatch)
             {
-                DictionaryCollector.Collect(recordBatch, ref _dictionaryMemo);
+                DictionaryCollector.Collect(Schema, recordBatch, ref _dictionaryMemo);
                 await WriteDictionariesAsync(_dictionaryMemo, cancellationToken).ConfigureAwait(false);
                 HasWrittenDictionaryBatch = true;
             }
@@ -1547,12 +1547,30 @@ namespace Apache.Arrow.Ipc
 
     internal static class DictionaryCollector
     {
-        internal static void Collect(RecordBatch recordBatch, ref DictionaryMemo dictionaryMemo)
+        // Walks `canonicalSchema` — NOT `recordBatch.Schema` — for field identity at every
+        // nesting level, matching `ArrowStreamWriter.WriteSchema`'s own recursive
+        // GetDictionaryOffset(field) walk (which always starts from `this.Schema`, the writer's
+        // one canonical schema for the whole IPC stream). `recordBatch`'s arrays supply the
+        // actual DATA (dictionary values) at each position, matched up structurally by index —
+        // but `DictionaryMemo`'s `_fieldToId` is keyed by `Field` REFERENCE identity (`Field` has
+        // no value-equality override), so if this walk used `recordBatch.Schema`'s own Field
+        // objects instead, a batch whose schema was independently constructed elsewhere (e.g. one
+        // just decoded off an incoming wire stream and being echoed straight back out — see
+        // QueryFarm.Vgi's table-in-out `echo` fixture) would get BRAND NEW dictionary ids
+        // allocated here, out of sync with whatever id `WriteSchema` already put in the schema
+        // message the reader received. The reader then looks for a dictionary batch tagged with
+        // the id its schema promised and never finds one — "Dictionary with id N not found" — or
+        // silently receives the wrong dictionary's data. This surfaced specifically for a
+        // dictionary-encoded (ENUM) column NESTED INSIDE A STRUCT (a top-level dictionary column
+        // usually happens to still work, since the top-level Schema/RecordBatch.Schema field
+        // objects are more often literally the same instance in practice) — see
+        // ~/Development/vgi-csharp's session notes on `table_in_out/echo/{all_types,
+        // nested_type_combinations,projection_filters,pushdown_witness}.test`.
+        internal static void Collect(Schema canonicalSchema, RecordBatch recordBatch, ref DictionaryMemo dictionaryMemo)
         {
-            Schema schema = recordBatch.Schema;
-            for (int i = 0; i < schema.FieldsList.Count; i++)
+            for (int i = 0; i < canonicalSchema.FieldsList.Count; i++)
             {
-                Field field = schema.GetFieldByIndex(i);
+                Field field = canonicalSchema.GetFieldByIndex(i);
                 IArrowArray array = recordBatch.Column(i);
 
                 CollectDictionary(field, array.Data, ref dictionaryMemo);
@@ -1571,7 +1589,7 @@ namespace Apache.Arrow.Ipc
                 arrayData.Dictionary.EnsureDataType(dictionaryType.ValueType.TypeId);
 
                 IArrowArray dictionary = ArrowArrayFactory.BuildArray(arrayData.Dictionary);
-                WalkChildren(dictionary.Data, ref dictionaryMemo);
+                WalkChildren(field, dictionary.Data, ref dictionaryMemo);
 
                 dictionaryMemo ??= new DictionaryMemo();
                 long id = dictionaryMemo.GetOrAssignId(field);
@@ -1580,11 +1598,11 @@ namespace Apache.Arrow.Ipc
             }
             else
             {
-                WalkChildren(arrayData, ref dictionaryMemo);
+                WalkChildren(field, arrayData, ref dictionaryMemo);
             }
         }
 
-        private static void WalkChildren(ArrayData arrayData, ref DictionaryMemo dictionaryMemo)
+        private static void WalkChildren(Field field, ArrayData arrayData, ref DictionaryMemo dictionaryMemo)
         {
             ArrayData[] children = arrayData.Children;
 
@@ -1593,11 +1611,15 @@ namespace Apache.Arrow.Ipc
                 return;
             }
 
-            IArrowType walkType = arrayData.DataType is ExtensionType ext ? ext.StorageType : arrayData.DataType;
+            IArrowType walkType = field.DataType is ExtensionType ext ? ext.StorageType : field.DataType;
             if (walkType is NestedType nestedType)
             {
                 for (int i = 0; i < nestedType.Fields.Count; i++)
                 {
+                    // From the CANONICAL schema's own nested type (matching WriteSchema's own
+                    // recursive walk) — not from arrayData.DataType, which belongs to whatever
+                    // batch happens to be getting written this call and may be a structurally
+                    // parallel but reference-distinct type tree. See this class's doc comment.
                     Field childField = nestedType.Fields[i];
                     ArrayData child = children[i];
 

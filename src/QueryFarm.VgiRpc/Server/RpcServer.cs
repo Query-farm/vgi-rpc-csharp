@@ -24,6 +24,7 @@ public sealed class RpcServer
     private readonly string _serverId;
     private readonly IAccessLogSink? _accessLog;
     private readonly IRpcDispatchHook? _dispatchHook;
+    private readonly string? _expectedProtocolVersion;
 
     /// <summary>The service interface's simple name — the access log's <c>protocol</c> field.</summary>
     public string ProtocolName { get; }
@@ -75,12 +76,25 @@ public sealed class RpcServer
     /// <see cref="CompositeDispatchHook"/>. Empty/<see langword="null"/> (the default) means no
     /// hooks at all, matching every other optional-observability feature's opt-in-by-default
     /// posture in this port.</param>
-    public RpcServer(Type serviceInterface, object implementation, string? serverId = null, IAccessLogSink? accessLog = null, IReadOnlyList<IRpcDispatchHook>? dispatchHooks = null)
+    /// <param name="expectedProtocolVersion">When non-<see langword="null"/>, every request's
+    /// <c>vgi_rpc.protocol_version</c> custom_metadata (canonical semver <c>MAJOR.MINOR.PATCH</c>)
+    /// is required to share this value's major AND minor components — an application-level
+    /// protocol contract layered on top of this transport, matching the canonical Python
+    /// implementation's <c>_check_protocol_version</c> (patch is deliberately ignored). A missing
+    /// or malformed client value, or a major/minor mismatch, is refused with a
+    /// <see cref="ProtocolVersionException"/> before dispatch. <see langword="null"/> (the
+    /// default) disables the check entirely — this transport layer is protocol-agnostic and most
+    /// callers (including this repo's own test suite, whose <c>RpcConnection</c> client never
+    /// sends this key) have no such application-level version to enforce.</param>
+    public RpcServer(
+        Type serviceInterface, object implementation, string? serverId = null, IAccessLogSink? accessLog = null,
+        IReadOnlyList<IRpcDispatchHook>? dispatchHooks = null, string? expectedProtocolVersion = null)
     {
         _methods = ServiceRegistry.GetMethods(serviceInterface);
         _implementation = implementation;
         _serverId = serverId ?? Guid.NewGuid().ToString("n");
         _accessLog = accessLog;
+        _expectedProtocolVersion = expectedProtocolVersion;
         _dispatchHook = dispatchHooks is { Count: > 0 } ? new CompositeDispatchHook(dispatchHooks) : null;
         ProtocolName = serviceInterface.Name;
         ProtocolHash = ComputeProtocolHash(_methods);
@@ -196,6 +210,12 @@ public sealed class RpcServer
                 s_emptySchema,
                 new VersionException(nameof(VersionException), $"Unsupported request_version '{requestVersion}' (expected '{MetadataKeys.CurrentRequestVersion}')."),
                 cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+
+        if (_expectedProtocolVersion is not null && CheckProtocolVersion(request, _expectedProtocolVersion) is { } protocolMismatch)
+        {
+            await WriteErrorStreamAsync(transport.Output, s_emptySchema, protocolMismatch, cancellationToken).ConfigureAwait(false);
             return true;
         }
 
@@ -511,10 +531,10 @@ public sealed class RpcServer
             if (collector.EmittedBatch is not null)
             {
                 var emitted = collector.EmittedBatch;
-                IReadOnlyDictionary<string, string>? emittedMetadata = null;
+                var emittedMetadata = collector.EmittedMetadata;
                 if (ownedShm is not null)
                 {
-                    (emitted, emittedMetadata) = await ShmPointerBatch.MaybeWriteAsync(emitted, null, ownedShm, cancellationToken).ConfigureAwait(false);
+                    (emitted, emittedMetadata) = await ShmPointerBatch.MaybeWriteAsync(emitted, emittedMetadata, ownedShm, cancellationToken).ConfigureAwait(false);
                 }
 
                 await outputWriter.WriteBatchAsync(new AnnotatedBatch(emitted, emittedMetadata), cancellationToken).ConfigureAwait(false);
@@ -679,6 +699,70 @@ public sealed class RpcServer
     /// can't be attached. Never throws — matches Python's <c>_maybe_attach_shm</c>: a caller that
     /// advertises a bad segment just gets treated as if it advertised none at all, since SHM is
     /// purely the caller's own optimization, never a contract this port enforces.</summary>
+    /// <summary>The application-level protocol-version guard — see the constructor's
+    /// <c>expectedProtocolVersion</c> doc comment. Returns <see langword="null"/> when the
+    /// request's declared version shares its major AND minor with <paramref name="serverVersion"/>
+    /// (patch is deliberately ignored), else a populated <see cref="ProtocolVersionException"/>
+    /// ready to write back on the wire. Mirrors the canonical Python <c>_check_protocol_version</c>
+    /// message shape exactly, including its four distinct "direction" phrasings, so cross-language
+    /// error text stays recognizable regardless of which side authored the mismatch.</summary>
+    private static ProtocolVersionException? CheckProtocolVersion(AnnotatedBatch request, string serverVersion)
+    {
+        var clientVersion = request.GetMetadata(MetadataKeys.ProtocolVersion);
+        if (clientVersion is null)
+        {
+            return new ProtocolVersionException(FormatProtocolMismatch(
+                null, serverVersion,
+                "the client did not send a vgi_rpc.protocol_version metadata key. This is either a " +
+                "vgi-rpc framework bug or a non-VGI client connecting to a VGI worker."));
+        }
+
+        if (TryParseSemver(clientVersion) is not { } clientParts)
+        {
+            return new ProtocolVersionException(FormatProtocolMismatch(
+                clientVersion, serverVersion,
+                "client sent a malformed protocol_version. Expected canonical semver MAJOR.MINOR.PATCH."));
+        }
+
+        // A malformed server-declared version is this process's own misconfiguration, not
+        // something a client sent — that deserves a hard failure, not a wire-level RPC error.
+        var serverParts = TryParseSemver(serverVersion)
+            ?? throw new InvalidOperationException($"expectedProtocolVersion '{serverVersion}' is not valid semver.");
+
+        if (clientParts.Major == serverParts.Major && clientParts.Minor == serverParts.Minor)
+        {
+            return null;
+        }
+
+        var clientIsOlder = clientParts.Major < serverParts.Major
+            || (clientParts.Major == serverParts.Major && clientParts.Minor < serverParts.Minor);
+        var direction = clientIsOlder
+            ? $"client is too old; upgrade the VGI extension/client to a version supporting protocol_version {serverVersion}."
+            : $"server is too old; upgrade the VGI worker to a version supporting protocol_version {clientVersion}.";
+
+        return new ProtocolVersionException(FormatProtocolMismatch(clientVersion, serverVersion, direction));
+    }
+
+    private static string FormatProtocolMismatch(string? clientVersion, string serverVersion, string direction) =>
+        $"VGI client/worker protocol_version mismatch.\n" +
+        $"  Client: {clientVersion ?? "<not declared>"}\n" +
+        $"  Server: {serverVersion}\n" +
+        $"  Direction: {direction}";
+
+    private static (int Major, int Minor, int Patch)? TryParseSemver(string version)
+    {
+        var parts = version.Split('.');
+        if (parts.Length != 3
+            || !int.TryParse(parts[0], out var major)
+            || !int.TryParse(parts[1], out var minor)
+            || !int.TryParse(parts[2], out var patch))
+        {
+            return null;
+        }
+
+        return (major, minor, patch);
+    }
+
     private static ShmSegment? TryAttachShm(AnnotatedBatch request)
     {
         var name = request.GetMetadata(MetadataKeys.ShmSegmentName);
