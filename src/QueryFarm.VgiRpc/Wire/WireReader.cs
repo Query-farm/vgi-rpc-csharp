@@ -34,6 +34,7 @@ public sealed class WireReader : IDisposable
     /// <summary>
     /// Reads the next record-batch message, or <see langword="null"/> once the EOS marker is
     /// reached. Callers must have consumed the schema (via <see cref="ReadSchemaAsync"/>) first.
+    /// The caller owns a non-null result and must dispose its <see cref="AnnotatedBatch.Batch"/>.
     ///
     /// Throws <see cref="PayloadTooLargeException"/> — rather than letting
     /// <see cref="ArrowIpcBodyTooLargeException"/> propagate directly — for a message whose
@@ -74,9 +75,9 @@ public sealed class WireReader : IDisposable
     /// </summary>
     public async Task DrainRemainingBatchesAsync(CancellationToken cancellationToken = default)
     {
-        while (await ReadNextAsync(cancellationToken).ConfigureAwait(false) is not null)
+        while (await ReadNextAsync(cancellationToken).ConfigureAwait(false) is { } batch)
         {
-            // discard
+            batch.Batch.Dispose();
         }
     }
 

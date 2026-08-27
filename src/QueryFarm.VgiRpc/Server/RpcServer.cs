@@ -195,6 +195,8 @@ public sealed class RpcServer
             return false;
         }
 
+        using var requestOwner = new RecordBatchOwner(request.Batch);
+
         var methodName = request.GetMetadata(MetadataKeys.Method);
         if (methodName is null)
         {
@@ -236,7 +238,7 @@ public sealed class RpcServer
                 [MetadataKeys.RequestVersion] = MetadataKeys.CurrentRequestVersion,
             };
             await using var transportWriter = new WireWriter(transport.Output, s_emptySchema);
-            await transportWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(s_emptySchema), responseMetadata), cancellationToken).ConfigureAwait(false);
+            await transportWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(s_emptySchema), responseMetadata, cancellationToken).ConfigureAwait(false);
             return true;
         }
 
@@ -266,6 +268,7 @@ public sealed class RpcServer
             try
             {
                 var (resolvedBatch, resolvedMetadata, release) = await ShmPointerBatch.ResolveAsync(request.Batch, request.Metadata, shm, cancellationToken).ConfigureAwait(false);
+                requestOwner.Replace(resolvedBatch);
                 request = request with { Batch = resolvedBatch, Metadata = resolvedMetadata };
                 release?.Invoke();
             }
@@ -280,7 +283,7 @@ public sealed class RpcServer
         object?[] args;
         try
         {
-            args = ValueCodec.ExtractRow(request.Batch, info.Parameters.Select(p => p.ParameterType).ToArray());
+            args = ValueCodec.ExtractRow(request.Batch, info.ParameterTypes);
         }
         catch (Exception exc)
         {
@@ -315,7 +318,7 @@ public sealed class RpcServer
             {
                 foreach (var logMessage in context.Buffered)
                 {
-                    await writer.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(info.ResultSchema), logMessage.AddToMetadata()), cancellationToken).ConfigureAwait(false);
+                    await writer.WriteOwnedBatchAsync(ValueCodec.EmptyRow(info.ResultSchema), logMessage.AddToMetadata(), cancellationToken).ConfigureAwait(false);
                 }
             }
 
@@ -323,10 +326,12 @@ public sealed class RpcServer
                 ? ValueCodec.EmptyRow(info.ResultSchema)
                 : ValueCodec.BuildRow(info.ResultSchema, [result]);
             IReadOnlyDictionary<string, string>? resultMetadata = null;
+            using var resultOwner = new RecordBatchOwner(resultBatch);
             if (shmForUnary is not null)
             {
                 (resultBatch, resultMetadata) = await ShmPointerBatch.MaybeWriteAsync(resultBatch, null, shmForUnary, cancellationToken).ConfigureAwait(false);
             }
+            resultOwner.Replace(resultBatch);
 
             await writer.WriteBatchAsync(new AnnotatedBatch(resultBatch, resultMetadata), cancellationToken).ConfigureAwait(false);
         }
@@ -338,7 +343,7 @@ public sealed class RpcServer
             errorMessage = actual.Message;
             hookError = actual;
             var metadata = LogMessage.FromException(actual).AddToMetadata();
-            await writer.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(info.ResultSchema), metadata), cancellationToken).ConfigureAwait(false);
+            await writer.WriteOwnedBatchAsync(ValueCodec.EmptyRow(info.ResultSchema), metadata, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -408,12 +413,13 @@ public sealed class RpcServer
                 .Select(f => headerType.GetProperty(ValueCodec.FindClrPropertyName(headerType, f))!.GetValue(stream.Header))
                 .ToList();
             var headerBatch = ValueCodec.BuildRow(headerSchema, headerValues);
+            using var headerBatchOwner = new RecordBatchOwner(headerBatch);
             await using var headerWriter = new WireWriter(transport.Output, headerSchema);
             if (invokeContext is not null)
             {
                 foreach (var logMessage in invokeContext.Buffered)
                 {
-                    await headerWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(headerSchema), logMessage.AddToMetadata()), cancellationToken).ConfigureAwait(false);
+                    await headerWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(headerSchema), logMessage.AddToMetadata(), cancellationToken).ConfigureAwait(false);
                 }
 
                 invokeContext.Buffered.Clear();
@@ -432,7 +438,7 @@ public sealed class RpcServer
         {
             foreach (var logMessage in invokeContext.Buffered)
             {
-                await outputWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), logMessage.AddToMetadata()), cancellationToken).ConfigureAwait(false);
+                await outputWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outputSchema), logMessage.AddToMetadata(), cancellationToken).ConfigureAwait(false);
             }
         }
 
@@ -478,13 +484,15 @@ public sealed class RpcServer
                 break; // client closed its input stream (EOS) — the normal way an exchange ends
             }
 
+            using var inputBatchOwner = new RecordBatchOwner(inputBatch.Batch);
+
             if (inputBatch.GetMetadata(MetadataKeys.Cancel) is not null)
             {
                 stream.State.OnCancel(invokeContext);
                 break;
             }
 
-            var collector = new OutputCollector(outputSchema);
+            using var collector = new OutputCollector(outputSchema);
             // Always construct a per-turn context — unlike invokeContext above (which mirrors
             // whether the RPC method that RETURNED the stream declared a ctx parameter, since
             // that gates a reflection-invoke arg count), StreamState.ProcessAsync's own signature
@@ -501,12 +509,15 @@ public sealed class RpcServer
                 {
                     var (resolvedBatch, resolvedMetadata, release) = await ShmPointerBatch.ResolveAsync(inputBatch.Batch, inputBatch.Metadata, ownedShm, cancellationToken).ConfigureAwait(false);
                     inputBatch = inputBatch with { Batch = resolvedBatch, Metadata = resolvedMetadata };
+                    inputBatchOwner.Replace(resolvedBatch);
                     release?.Invoke();
                 }
 
                 if (stream.InputSchema is { FieldsList.Count: > 0 } declaredInputSchema)
                 {
-                    inputBatch = inputBatch with { Batch = ValueCodec.CoerceBatch(inputBatch.Batch, declaredInputSchema) };
+                    var coercedBatch = ValueCodec.CoerceBatch(inputBatch.Batch, declaredInputSchema);
+                    inputBatchOwner.ReplaceShared(coercedBatch);
+                    inputBatch = inputBatch with { Batch = coercedBatch };
                 }
 
                 await stream.State.ProcessAsync(inputBatch, collector, turnContext, cancellationToken).ConfigureAwait(false);
@@ -519,26 +530,33 @@ public sealed class RpcServer
                 streamErrorMessage = actual.Message;
                 streamHookError = actual;
                 var metadata = LogMessage.FromException(actual).AddToMetadata();
-                await outputWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), metadata), cancellationToken).ConfigureAwait(false);
+                await outputWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outputSchema), metadata, cancellationToken).ConfigureAwait(false);
                 break;
             }
 
             foreach (var logMessage in collector.Logs)
             {
-                await outputWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), logMessage.AddToMetadata()), cancellationToken).ConfigureAwait(false);
+                await outputWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outputSchema), logMessage.AddToMetadata(), cancellationToken).ConfigureAwait(false);
             }
 
-            if (collector.EmittedBatch is not null)
+            var emitted = collector.DetachEmittedBatch();
+            if (emitted is not null)
             {
-                var emitted = collector.EmittedBatch;
+                using var emittedOwner = new RecordBatchOwner(emitted);
                 var emittedMetadata = collector.EmittedMetadata;
                 if (ownedShm is not null)
                 {
                     (emitted, emittedMetadata) = await ShmPointerBatch.MaybeWriteAsync(emitted, emittedMetadata, ownedShm, cancellationToken).ConfigureAwait(false);
+                    emittedOwner.Replace(emitted);
                 }
 
                 await outputWriter.WriteBatchAsync(new AnnotatedBatch(emitted, emittedMetadata), cancellationToken).ConfigureAwait(false);
             }
+
+            // A streaming turn has no EOS marker, so buffered transports need an explicit
+            // visibility boundary before the server waits for the client's next input turn.
+            await outputWriter.FlushAsync(cancellationToken).ConfigureAwait(false);
+
 
             if (collector.Finished)
             {
@@ -791,6 +809,6 @@ public sealed class RpcServer
     {
         var metadata = LogMessage.FromException(exception).AddToMetadata();
         await using var writer = new WireWriter(output, schema);
-        await writer.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(schema), metadata), cancellationToken).ConfigureAwait(false);
+        await writer.WriteOwnedBatchAsync(ValueCodec.EmptyRow(schema), metadata, cancellationToken).ConfigureAwait(false);
     }
 }

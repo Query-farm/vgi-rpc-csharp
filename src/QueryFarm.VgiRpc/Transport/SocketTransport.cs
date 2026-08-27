@@ -9,6 +9,8 @@ namespace QueryFarm.VgiRpc.Transport;
 /// </summary>
 public sealed class SocketTransport : IRpcTransport, IDisposable
 {
+    private const int UnixSocketBufferBytes = 1 << 20;
+
     private readonly Socket _socket;
     private readonly NetworkStream _readStream;
     private readonly NetworkStream _writeStream;
@@ -97,6 +99,14 @@ public sealed class SocketTransport : IRpcTransport, IDisposable
             try
             {
                 accepted = await listener.AcceptAsync(cancellationToken).ConfigureAwait(false);
+                if (accepted.AddressFamily == AddressFamily.Unix)
+                {
+                    WidenUnixSocketBuffers(accepted);
+                }
+                else if (accepted.SocketType == SocketType.Stream)
+                {
+                    accepted.NoDelay = true;
+                }
             }
             catch (OperationCanceledException)
             {
@@ -125,6 +135,7 @@ public sealed class SocketTransport : IRpcTransport, IDisposable
     {
         var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
         await socket.ConnectAsync(new UnixDomainSocketEndPoint(path), cancellationToken).ConfigureAwait(false);
+        WidenUnixSocketBuffers(socket);
         return new SocketTransport(socket);
     }
 
@@ -132,7 +143,29 @@ public sealed class SocketTransport : IRpcTransport, IDisposable
     public static async Task<IRpcTransport> ConnectTcpAsync(string host, int port, CancellationToken cancellationToken = default)
     {
         var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        socket.NoDelay = true;
         await socket.ConnectAsync(host, port, cancellationToken).ConfigureAwait(false);
         return new SocketTransport(socket);
+    }
+
+    private static void WidenUnixSocketBuffers(Socket socket)
+    {
+        try
+        {
+            socket.SendBufferSize = UnixSocketBufferBytes;
+        }
+        catch (SocketException)
+        {
+            // Best effort: kernels may clamp or refuse the requested size.
+        }
+
+        try
+        {
+            socket.ReceiveBufferSize = UnixSocketBufferBytes;
+        }
+        catch (SocketException)
+        {
+            // Best effort: the transport remains correct with platform defaults.
+        }
     }
 }

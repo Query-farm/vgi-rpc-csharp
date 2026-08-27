@@ -24,7 +24,7 @@ public sealed class RpcConnection<T>(IRpcTransport transport)
     /// <summary>Performs one unary call and returns the decoded result (<see langword="null"/> for a void method).</summary>
     public async Task<object?> CallUnaryAsync(RpcMethodInfo info, object?[] args, CancellationToken cancellationToken)
     {
-        var requestBatch = ValueCodec.BuildRow(info.ParamsSchema, args);
+        using var requestBatch = ValueCodec.BuildRow(info.ParamsSchema, args);
         var requestMetadata = new Dictionary<string, string>
         {
             [MetadataKeys.Method] = info.WireName,
@@ -40,39 +40,53 @@ public sealed class RpcConnection<T>(IRpcTransport transport)
         await reader.ReadSchemaAsync(cancellationToken).ConfigureAwait(false);
 
         AnnotatedBatch? terminal = null;
-        while (true)
+        try
         {
-            var batch = await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false);
-            if (batch is null)
+            while (true)
             {
-                break;
+                var batch = await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false);
+                if (batch is null)
+                {
+                    break;
+                }
+
+                var level = batch.GetMetadata(MetadataKeys.LogLevel);
+                if (level is null)
+                {
+                    terminal?.Batch.Dispose();
+                    terminal = batch;
+                }
+                else if (level == "EXCEPTION")
+                {
+                    var exception = BuildException(batch);
+                    batch.Batch.Dispose();
+                    throw exception;
+                }
+                else
+                {
+                    batch.Batch.Dispose();
+                }
+
+                // Non-exception log batches (INFO/WARN/etc.) are silently dropped for now — client
+                // log callback wiring is a later milestone (see docs/roadmap.md).
             }
 
-            var level = batch.GetMetadata(MetadataKeys.LogLevel);
-            if (level is null)
+            if (info.ResultSchema.FieldsList.Count == 0)
             {
-                terminal = batch;
-            }
-            else if (level == "EXCEPTION")
-            {
-                throw BuildException(batch);
+                return null;
             }
 
-            // Non-exception log batches (INFO/WARN/etc.) are silently dropped for now — client
-            // log callback wiring is a later milestone (see docs/roadmap.md).
-        }
+            if (terminal is null)
+            {
+                throw new RpcException("RpcException", $"Server closed the connection without returning a result for '{info.WireName}'.");
+            }
 
-        if (info.ResultSchema.FieldsList.Count == 0)
+            return ValueCodec.ExtractRow(terminal.Batch, [info.ResultClrType])[0];
+        }
+        finally
         {
-            return null;
+            terminal?.Batch.Dispose();
         }
-
-        if (terminal is null)
-        {
-            throw new RpcException("RpcException", $"Server closed the connection without returning a result for '{info.WireName}'.");
-        }
-
-        return ValueCodec.ExtractRow(terminal.Batch, [info.ResultClrType])[0];
     }
 
     private static RpcException BuildException(AnnotatedBatch batch)

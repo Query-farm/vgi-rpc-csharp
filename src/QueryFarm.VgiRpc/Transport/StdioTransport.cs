@@ -7,12 +7,14 @@ namespace QueryFarm.VgiRpc.Transport;
 /// </summary>
 public sealed class StdioTransport : IRpcTransport
 {
+    private const int BufferSize = 1 << 20;
+
     public Stream Input { get; }
     public Stream Output { get; }
 
     public StdioTransport()
     {
-        Input = Console.OpenStandardInput();
-        Output = Console.OpenStandardOutput();
+        Input = new BufferedStream(Console.OpenStandardInput(), BufferSize);
+        Output = new BufferedStream(Console.OpenStandardOutput(), BufferSize);
     }
 }

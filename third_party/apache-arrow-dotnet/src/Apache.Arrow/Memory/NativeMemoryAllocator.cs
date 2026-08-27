@@ -15,39 +15,128 @@
 
 using System;
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace Apache.Arrow.Memory
 {
     public class NativeMemoryAllocator : MemoryAllocator
     {
+        // GC.AddMemoryPressure is intended for significant unmanaged allocations. Calling it for
+        // every tiny Arrow validity/value/offset buffer causes excessive full-GC scheduling in
+        // high-rate RPC workloads. Small buffers are short-lived and deterministically disposed;
+        // continue tracking large allocations so the GC remains informed about material native use.
+        private const int MemoryPressureThreshold = 64 * 1024;
+        private const int MaximumPooledAllocationBytes = MemoryPressureThreshold / 2;
+        private const long MaximumPooledBytes = 32L * 1024 * 1024;
+
         internal static readonly INativeAllocationOwner ExclusiveOwner = new NativeAllocationOwner();
+        private static readonly ConcurrentDictionary<int, PooledNativeAllocationOwner> s_owners = new();
+        private static long s_pooledBytes;
+
+        private readonly PooledNativeAllocationOwner _owner;
 
         public NativeMemoryAllocator(int alignment = DefaultAlignment)
-            : base(alignment) { }
+            : base(alignment)
+        {
+            _owner = s_owners.GetOrAdd(alignment, static value => new PooledNativeAllocationOwner(value));
+        }
 
         protected override IMemoryOwner<byte> AllocateInternal(int length, out int bytesAllocated)
         {
-            // TODO: Ensure memory is released if exception occurs.
+            int size = AllocationSize(length, Alignment);
+            IntPtr ptr = _owner.Rent(size);
+            if (ptr == IntPtr.Zero)
+            {
+                ptr = Marshal.AllocHGlobal(size);
+                if (size >= MemoryPressureThreshold)
+                {
+                    GC.AddMemoryPressure(size);
+                }
+            }
 
-            // TODO: Optimize storage overhead; native memory manager stores a pointer
-            // to allocated memory, offset, and the allocation size. 
-
-            // TODO: Should the allocation be moved to NativeMemory?
-
-            int size = length + Alignment;
-            IntPtr ptr = Marshal.AllocHGlobal(size);
             int offset = (int)(Alignment - (ptr.ToInt64() & (Alignment - 1)));
-            var manager = new NativeMemoryManager(ptr, offset, length);
+            NativeMemoryManager manager;
+            try
+            {
+                manager = new NativeMemoryManager(_owner, ptr, offset, length);
+            }
+            catch
+            {
+                _owner.Release(ptr, offset, length);
+                throw;
+            }
 
-            bytesAllocated = (length + Alignment);
+            bytesAllocated = size;
+            try
+            {
+                // Arrow builders assume newly allocated validity/value buffers are zero-initialized.
+                manager.Memory.Span.Clear();
+                return manager;
+            }
+            catch
+            {
+                ((IDisposable)manager).Dispose();
+                throw;
+            }
+        }
 
-            GC.AddMemoryPressure(bytesAllocated);
+        private static int AllocationSize(int length, int alignment)
+        {
+            int requested = checked(length + alignment);
+            if (requested > MaximumPooledAllocationBytes)
+            {
+                return requested;
+            }
 
-            // Ensure all allocated memory is zeroed.
-            manager.Memory.Span.Fill(0);
+            int bucket = 128;
+            while (bucket < requested)
+            {
+                bucket <<= 1;
+            }
 
-            return manager;
+            return bucket;
+        }
+
+        private sealed class PooledNativeAllocationOwner(int alignment) : INativeAllocationOwner
+        {
+            private readonly ConcurrentDictionary<int, ConcurrentStack<IntPtr>> _pools = new();
+
+            public IntPtr Rent(int size)
+            {
+                if (size <= MaximumPooledAllocationBytes
+                    && _pools.TryGetValue(size, out var pool)
+                    && pool.TryPop(out var ptr))
+                {
+                    Interlocked.Add(ref s_pooledBytes, -size);
+                    return ptr;
+                }
+
+                return IntPtr.Zero;
+            }
+
+            public void Release(IntPtr ptr, int offset, int length)
+            {
+                int size = AllocationSize(length, alignment);
+                if (size <= MaximumPooledAllocationBytes)
+                {
+                    long pooledBytes = Interlocked.Add(ref s_pooledBytes, size);
+                    if (pooledBytes <= MaximumPooledBytes)
+                    {
+                        _pools.GetOrAdd(size, static _ => new ConcurrentStack<IntPtr>()).Push(ptr);
+                        return;
+                    }
+
+                    Interlocked.Add(ref s_pooledBytes, -size);
+                }
+
+                Marshal.FreeHGlobal(ptr);
+                if (size >= MemoryPressureThreshold)
+                {
+                    GC.RemoveMemoryPressure(size);
+                }
+            }
         }
 
         private sealed class NativeAllocationOwner : INativeAllocationOwner
@@ -55,7 +144,6 @@ namespace Apache.Arrow.Memory
             public void Release(IntPtr ptr, int offset, int length)
             {
                 Marshal.FreeHGlobal(ptr);
-                GC.RemoveMemoryPressure(length + DefaultAlignment); // See https://github.com/apache/arrow-dotnet/issues/50
             }
         }
     }

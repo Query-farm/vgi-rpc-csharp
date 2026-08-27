@@ -225,6 +225,7 @@ public static class RpcHttpEndpoints
             using var reader = new WireReader(requestBody);
             _ = await reader.ReadSchemaAsync(cancellationToken).ConfigureAwait(false);
             var requestBatch = await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false);
+            using var requestBatchOwner = requestBatch is null ? null : new RecordBatchOwner(requestBatch.Batch);
             if (requestBatch is not null && requestBatch.Batch.Length > 0 && requestBatch.Batch.Schema.GetFieldIndex("count") >= 0)
             {
                 var args = ValueCodec.ExtractRow(requestBatch.Batch, [typeof(long)]);
@@ -277,7 +278,7 @@ public static class RpcHttpEndpoints
             }
 
             var resultBatch = new RecordBatch(s_uploadUrlResultSchema, [uploadArray.Build(), downloadArray.Build(), expiresArray.Build()], (int)count);
-            await writer.WriteBatchAsync(new AnnotatedBatch(resultBatch, null), cancellationToken).ConfigureAwait(false);
+            await writer.WriteOwnedBatchAsync(resultBatch, null, cancellationToken).ConfigureAwait(false);
         }
 
         EmitAccessLog(server, "__upload_url__", "unary", "ok", "", "", Stopwatch.GetTimestamp(), StatusCodes.Status200OK);
@@ -670,6 +671,8 @@ public static class RpcHttpEndpoints
             return;
         }
 
+        using var requestBatchOwner = new RecordBatchOwner(requestBatch.Batch);
+
         var ipcMethod = requestBatch.GetMetadata(MetadataKeys.Method);
         if (ipcMethod != method)
         {
@@ -691,6 +694,7 @@ public static class RpcHttpEndpoints
                     requestBatch.Batch, requestBatch.Metadata,
                     new ClientExternalConfig { FetchConfig = externalization.External.FetchConfig, UrlValidator = externalization.External.UrlValidator },
                     cancellationToken).ConfigureAwait(false);
+                requestBatchOwner.Replace(resolvedBatch);
                 requestBatch = requestBatch with { Batch = resolvedBatch, Metadata = resolvedMetadata };
             }
             catch (Exception exc)
@@ -703,7 +707,7 @@ public static class RpcHttpEndpoints
         object?[] args;
         try
         {
-            args = ValueCodec.ExtractRow(requestBatch.Batch, info.Parameters.Select(p => p.ParameterType).ToArray());
+            args = ValueCodec.ExtractRow(requestBatch.Batch, info.ParameterTypes);
         }
         catch (Exception exc)
         {
@@ -743,7 +747,7 @@ public static class RpcHttpEndpoints
                     {
                         foreach (var logMessage in callContext.Buffered)
                         {
-                            await writer.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(info.ResultSchema), logMessage.AddToMetadata()), cancellationToken).ConfigureAwait(false);
+                            await writer.WriteOwnedBatchAsync(ValueCodec.EmptyRow(info.ResultSchema), logMessage.AddToMetadata(), cancellationToken).ConfigureAwait(false);
                         }
                     }
 
@@ -751,6 +755,7 @@ public static class RpcHttpEndpoints
                         ? ValueCodec.EmptyRow(info.ResultSchema)
                         : ValueCodec.BuildRow(info.ResultSchema, [result]);
 
+                    using var resultBatchOwner = new RecordBatchOwner(resultBatch);
                     IReadOnlyDictionary<string, string>? resultMetadata = null;
                     if (externalization?.External is { } externalConfig)
                     {
@@ -762,6 +767,7 @@ public static class RpcHttpEndpoints
 
                         (resultBatch, resultMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(resultBatch, null, externalConfig, cancellationToken).ConfigureAwait(false);
                     }
+                    resultBatchOwner.Replace(resultBatch);
 
                     await writer.WriteBatchAsync(new AnnotatedBatch(resultBatch, resultMetadata), cancellationToken).ConfigureAwait(false);
                 }
@@ -772,7 +778,7 @@ public static class RpcHttpEndpoints
                     errorType = actual.GetType().Name;
                     errorMessage = actual.Message;
                     var metadata = LogMessage.FromException(actual).AddToMetadata();
-                    await writer.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(info.ResultSchema), metadata), cancellationToken).ConfigureAwait(false);
+                    await writer.WriteOwnedBatchAsync(ValueCodec.EmptyRow(info.ResultSchema), metadata, cancellationToken).ConfigureAwait(false);
                 }
             }
         }
@@ -796,7 +802,7 @@ public static class RpcHttpEndpoints
             responseBuffer = new MemoryStream();
             await using var errWriter = new WireWriter(responseBuffer, info.ResultSchema);
             var errMetadata = LogMessage.FromException(overshoot).AddToMetadata();
-            await errWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(info.ResultSchema), errMetadata), cancellationToken).ConfigureAwait(false);
+            await errWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(info.ResultSchema), errMetadata, cancellationToken).ConfigureAwait(false);
         }
 
         // status=error still answers HTTP 200 — the body carries a real in-band error batch, and
@@ -907,6 +913,8 @@ public static class RpcHttpEndpoints
             return;
         }
 
+        using var requestBatchOwner = new RecordBatchOwner(requestBatch.Batch);
+
         var ipcMethod = requestBatch.GetMetadata(MetadataKeys.Method);
         if (ipcMethod != method)
         {
@@ -922,6 +930,7 @@ public static class RpcHttpEndpoints
                     requestBatch.Batch, requestBatch.Metadata,
                     new ClientExternalConfig { FetchConfig = externalization.External.FetchConfig, UrlValidator = externalization.External.UrlValidator },
                     cancellationToken).ConfigureAwait(false);
+                requestBatchOwner.Replace(resolvedBatch);
                 requestBatch = requestBatch with { Batch = resolvedBatch, Metadata = resolvedMetadata };
             }
             catch (Exception exc)
@@ -934,7 +943,7 @@ public static class RpcHttpEndpoints
         object?[] args;
         try
         {
-            args = ValueCodec.ExtractRow(requestBatch.Batch, info.Parameters.Select(p => p.ParameterType).ToArray());
+            args = ValueCodec.ExtractRow(requestBatch.Batch, info.ParameterTypes);
         }
         catch (Exception exc)
         {
@@ -990,13 +999,14 @@ public static class RpcHttpEndpoints
                 .Select(f => headerType.GetProperty(ValueCodec.FindClrPropertyName(headerType, f))!.GetValue(stream.Header))
                 .ToList();
             var headerBatch = ValueCodec.BuildRow(headerSchema, headerValues);
+            using var headerBatchOwner = new RecordBatchOwner(headerBatch);
             await using (var headerWriter = new WireWriter(responseBuffer, headerSchema))
             {
                 if (invokeContext is not null)
                 {
                     foreach (var logMessage in invokeContext.Buffered)
                     {
-                        await headerWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(headerSchema), logMessage.AddToMetadata()), cancellationToken).ConfigureAwait(false);
+                        await headerWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(headerSchema), logMessage.AddToMetadata(), cancellationToken).ConfigureAwait(false);
                     }
 
                     invokeContext.Buffered.Clear();
@@ -1016,14 +1026,14 @@ public static class RpcHttpEndpoints
         // /init response and finding it carried zero data even for a method that emits on its
         // very first tick). Exchange streams get no such tick here — nothing to produce until the
         // client sends its first exchange turn with real input.
-        OutputCollector? tickCollector = null;
+        using OutputCollector? tickCollector = isProducer ? new OutputCollector(outputSchema) : null;
         if (isProducer)
         {
-            tickCollector = new OutputCollector(outputSchema);
-            var tickContext = new StreamHttpCallContext(tickCollector, stickyState);
+            var tickContext = new StreamHttpCallContext(tickCollector!, stickyState);
             try
             {
-                await stream.State.ProcessAsync(new AnnotatedBatch(ValueCodec.EmptyRow(s_emptySchema), null), tickCollector, tickContext, cancellationToken).ConfigureAwait(false);
+                using var tickBatch = ValueCodec.EmptyRow(s_emptySchema);
+                await stream.State.ProcessAsync(new AnnotatedBatch(tickBatch, null), tickCollector!, tickContext, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception exc)
             {
@@ -1036,7 +1046,8 @@ public static class RpcHttpEndpoints
         }
 
         var tickFinished = tickCollector?.Finished ?? false;
-        var tickEmitted = tickCollector?.EmittedBatch;
+        var tickEmitted = tickCollector?.DetachEmittedBatch();
+        using var tickEmittedOwner = tickEmitted is null ? null : new RecordBatchOwner(tickEmitted);
         IReadOnlyDictionary<string, string>? tickEmittedMetadata = null;
         if (externalization?.External is { } externalConfig && tickEmitted is not null)
         {
@@ -1051,6 +1062,7 @@ public static class RpcHttpEndpoints
             }
 
             (tickEmitted, tickEmittedMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(tickEmitted, null, externalConfig, cancellationToken).ConfigureAwait(false);
+            tickEmittedOwner!.Replace(tickEmitted);
         }
 
         if (isProducer && tickFinished)
@@ -1067,7 +1079,7 @@ public static class RpcHttpEndpoints
             {
                 foreach (var logMessage in invokeContext.Buffered)
                 {
-                    await outputWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), logMessage.AddToMetadata()), cancellationToken).ConfigureAwait(false);
+                    await outputWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outputSchema), logMessage.AddToMetadata(), cancellationToken).ConfigureAwait(false);
                 }
             }
 
@@ -1075,7 +1087,7 @@ public static class RpcHttpEndpoints
             {
                 foreach (var logMessage in tickCollector.Logs)
                 {
-                    await outputWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), logMessage.AddToMetadata()), cancellationToken).ConfigureAwait(false);
+                    await outputWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outputSchema), logMessage.AddToMetadata(), cancellationToken).ConfigureAwait(false);
                 }
 
                 if (tickEmitted is not null)
@@ -1091,7 +1103,7 @@ public static class RpcHttpEndpoints
                     [MetadataKeys.StreamState] = tokenBase64,
                     [MetadataKeys.CallState] = tokenBase64,
                 };
-                await outputWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), tokenMetadata), cancellationToken).ConfigureAwait(false);
+                await outputWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outputSchema), tokenMetadata, cancellationToken).ConfigureAwait(false);
             }
             else if (tickEmitted is null)
             {
@@ -1205,6 +1217,7 @@ public static class RpcHttpEndpoints
             return;
         }
 
+        using var requestBatchOwner = new RecordBatchOwner(requestBatch.Batch);
         // Extract both tokens before resolution: ExternalLocation.ResolveAsync replaces metadata
         // with whatever was stored in the fetched external IPC stream, so anything read off
         // requestBatch.Metadata must be pulled out first (mirrors the canonical Python
@@ -1264,6 +1277,7 @@ public static class RpcHttpEndpoints
                     turnBatch.Batch, turnBatch.Metadata,
                     new ClientExternalConfig { FetchConfig = externalization.External.FetchConfig, UrlValidator = externalization.External.UrlValidator },
                     cancellationToken).ConfigureAwait(false);
+                requestBatchOwner.Replace(resolvedBatch);
                 turnBatch = turnBatch with { Batch = resolvedBatch, Metadata = resolvedMetadata };
             }
             catch (Exception exc)
@@ -1278,7 +1292,9 @@ public static class RpcHttpEndpoints
         {
             try
             {
-                turnBatch = turnBatch with { Batch = ValueCodec.CoerceBatch(turnBatch.Batch, declaredInputSchema) };
+                var coercedBatch = ValueCodec.CoerceBatch(turnBatch.Batch, declaredInputSchema);
+                requestBatchOwner.ReplaceShared(coercedBatch);
+                turnBatch = turnBatch with { Batch = coercedBatch };
             }
             catch (Exception exc)
             {
@@ -1307,7 +1323,7 @@ public static class RpcHttpEndpoints
             await stickyResolution.Value.Entry.Lock.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        var collector = new OutputCollector(outputSchema);
+        using var collector = new OutputCollector(outputSchema);
         // Always construct a per-turn context, not gated on info.HasContextParameter (that flag
         // reflects whether the RPC method that RETURNED the stream declared a ctx parameter —
         // relevant only to that method's own reflection-invoke arg count, in HandleStreamInitAsync
@@ -1368,7 +1384,8 @@ public static class RpcHttpEndpoints
         // already uploaded cannot be un-uploaded), unlike max_response_bytes's producer-only soft
         // cap just above. Predict-then-refuse, exactly like the unary path, so an over-cap upload
         // is never attempted.
-        var emittedBatch = collector.EmittedBatch;
+        var emittedBatch = collector.DetachEmittedBatch();
+        using var emittedBatchOwner = emittedBatch is null ? null : new RecordBatchOwner(emittedBatch);
         IReadOnlyDictionary<string, string>? emittedBatchMetadata = null;
         if (externalization?.External is { } externalConfig && emittedBatch is not null)
         {
@@ -1387,6 +1404,7 @@ public static class RpcHttpEndpoints
             }
 
             (emittedBatch, emittedBatchMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(emittedBatch, null, externalConfig, cancellationToken).ConfigureAwait(false);
+            emittedBatchOwner!.Replace(emittedBatch);
         }
 
         var responseBuffer = new MemoryStream();
@@ -1394,7 +1412,7 @@ public static class RpcHttpEndpoints
         {
             foreach (var logMessage in collector.Logs)
             {
-                await writer.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), logMessage.AddToMetadata()), cancellationToken).ConfigureAwait(false);
+                await writer.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outputSchema), logMessage.AddToMetadata(), cancellationToken).ConfigureAwait(false);
             }
 
             if (isProducer)
@@ -1407,7 +1425,7 @@ public static class RpcHttpEndpoints
                 if (freshTokenB64 is not null)
                 {
                     var sentinelMetadata = new Dictionary<string, string> { [MetadataKeys.StreamState] = freshTokenB64 };
-                    await writer.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), sentinelMetadata), cancellationToken).ConfigureAwait(false);
+                    await writer.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outputSchema), sentinelMetadata, cancellationToken).ConfigureAwait(false);
                 }
                 else if (emittedBatch is null)
                 {
@@ -1438,8 +1456,14 @@ public static class RpcHttpEndpoints
                     }
                 }
 
-                var dataBatch = emittedBatch ?? ValueCodec.EmptyRow(outputSchema);
-                await writer.WriteBatchAsync(new AnnotatedBatch(dataBatch, dataMetadata), cancellationToken).ConfigureAwait(false);
+                if (emittedBatch is null)
+                {
+                    await writer.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outputSchema), dataMetadata, cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    await writer.WriteBatchAsync(new AnnotatedBatch(emittedBatch, dataMetadata), cancellationToken).ConfigureAwait(false);
+                }
             }
         }
 
@@ -1454,7 +1478,7 @@ public static class RpcHttpEndpoints
             await using (var errWriter = new WireWriter(responseBuffer, outputSchema))
             {
                 var errMetadata = LogMessage.FromException(overshoot).AddToMetadata();
-                await errWriter.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(outputSchema), errMetadata), cancellationToken).ConfigureAwait(false);
+                await errWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outputSchema), errMetadata, cancellationToken).ConfigureAwait(false);
             }
 
             EmitAccessLog(server, info.WireName, "stream", "error", "RuntimeError", overshoot.Message, start, StatusCodes.Status200OK, callKey);
@@ -1495,7 +1519,7 @@ public static class RpcHttpEndpoints
         await using (var writer = new WireWriter(buffer, schema))
         {
             var metadata = LogMessage.FromException(exception).AddToMetadata();
-            await writer.WriteBatchAsync(new AnnotatedBatch(ValueCodec.EmptyRow(schema), metadata)).ConfigureAwait(false);
+            await writer.WriteOwnedBatchAsync(ValueCodec.EmptyRow(schema), metadata).ConfigureAwait(false);
         }
 
         EmitAccessLog(server, method, methodType, "error", exception.GetType().Name, exception.Message, start, httpStatusForLog, streamId);

@@ -81,7 +81,7 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       `large_payload.echo_binary_4mib`/`echo_large_binary`.
 - [~] **M4 — Non-HTTP transports + CLI (in progress).** `SocketTransport` (Unix domain socket +
       TCP, both server accept-loop and client dial) plus the conformance worker's `--unix`/
-      `--tcp [host:]port` CLI flags (printing the `UNIX:<path>`/`PORT:<port>` discovery lines
+      `--tcp [host:]port` CLI flags (printing the `UNIX:<path>`/`TCP:<host>:<port>` discovery lines
       the porting guide's contract expects) and SIGTERM/SIGINT graceful shutdown. Unary calls
       are confirmed working over both transports against the real `vgi-rpc-test` tool (verified
       manually — not yet in the automated gate, which still targets stdio only) and covered by

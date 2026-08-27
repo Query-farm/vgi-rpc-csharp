@@ -11,6 +11,10 @@ namespace QueryFarm.VgiRpc.Reflection;
 /// </summary>
 public sealed class RpcMethodInfo
 {
+    private readonly Func<object, object?[], object?> _invoke;
+    private readonly Func<object, object?>? _getAwaitedResult;
+    private readonly Func<object, Task>? _valueTaskAsTask;
+
     public string WireName { get; }
     public MethodInfo Method { get; }
     public RpcMethodKind Kind { get; }
@@ -25,6 +29,9 @@ public sealed class RpcMethodInfo
     /// <see cref="ParamsSchema"/> field order — i.e. everything except a trailing
     /// <see cref="ICallContext"/> parameter, if the method declares one.</summary>
     public IReadOnlyList<ParameterInfo> Parameters { get; }
+
+    /// <summary>The wire parameter CLR types, cached once instead of allocated per dispatch.</summary>
+    public IReadOnlyList<Type> ParameterTypes { get; }
 
     /// <summary>True if the method's last parameter is an <see cref="ICallContext"/> the server
     /// must inject at invocation time (not a wire field — see <see cref="ICallContext"/>).</summary>
@@ -46,6 +53,7 @@ public sealed class RpcMethodInfo
         var allParams = method.GetParameters();
         HasContextParameter = allParams.Length > 0 && typeof(ICallContext).IsAssignableFrom(allParams[^1].ParameterType);
         Parameters = HasContextParameter ? allParams[..^1] : allParams;
+        ParameterTypes = Parameters.Select(p => p.ParameterType).ToArray();
 
         var paramFields = Parameters
             .Select(p => SchemaDerivation.FieldForParameter(WireNaming.ForParameter(p), p))
@@ -53,6 +61,21 @@ public sealed class RpcMethodInfo
         ParamsSchema = new Schema(paramFields, metadata: null);
 
         (ResultClrType, IsAsync) = UnwrapReturnType(method.ReturnType);
+        _invoke = CompileInvoker(method);
+        if (method.ReturnType.IsGenericType)
+        {
+            var returnDefinition = method.ReturnType.GetGenericTypeDefinition();
+            if (returnDefinition == typeof(Task<>))
+            {
+                _getAwaitedResult = CompileResultGetter(method.ReturnType);
+            }
+            else if (returnDefinition == typeof(ValueTask<>))
+            {
+                _valueTaskAsTask = CompileValueTaskAsTask(method.ReturnType);
+                _getAwaitedResult = CompileResultGetter(typeof(Task<>).MakeGenericType(ResultClrType));
+            }
+        }
+
 
         if (typeof(IRpcStream).IsAssignableFrom(ResultClrType))
         {
@@ -66,6 +89,55 @@ public sealed class RpcMethodInfo
                 ? new Schema([], metadata: null)
                 : new Schema([SchemaDerivation.FieldFor("result", ResultClrType, method.ReturnParameter.IsDefined(typeof(LargeWidthAttribute)))], metadata: null);
         }
+    }
+
+    private static Func<object, object?[], object?> CompileInvoker(MethodInfo method)
+    {
+        var implementation = System.Linq.Expressions.Expression.Parameter(typeof(object), "implementation");
+        var arguments = System.Linq.Expressions.Expression.Parameter(typeof(object[]), "arguments");
+        var parameters = method.GetParameters();
+        var callArguments = parameters
+            .Select((parameter, index) =>
+                System.Linq.Expressions.Expression.Convert(
+                    System.Linq.Expressions.Expression.ArrayIndex(arguments, System.Linq.Expressions.Expression.Constant(index)),
+                    parameter.ParameterType))
+            .ToArray();
+        var instance = method.IsStatic
+            ? null
+            : System.Linq.Expressions.Expression.Convert(implementation, method.DeclaringType!);
+        var call = System.Linq.Expressions.Expression.Call(instance, method, callArguments);
+        System.Linq.Expressions.Expression body = method.ReturnType == typeof(void)
+            ? System.Linq.Expressions.Expression.Block(call, System.Linq.Expressions.Expression.Constant(null, typeof(object)))
+            : System.Linq.Expressions.Expression.Convert(call, typeof(object));
+        return System.Linq.Expressions.Expression
+            .Lambda<Func<object, object?[], object?>>(body, implementation, arguments)
+            .Compile();
+    }
+
+    private static Func<object, object?> CompileResultGetter(Type taskType)
+    {
+        var task = System.Linq.Expressions.Expression.Parameter(typeof(object), "task");
+        var result = System.Linq.Expressions.Expression.Property(
+            System.Linq.Expressions.Expression.Convert(task, taskType),
+            "Result");
+        return System.Linq.Expressions.Expression
+            .Lambda<Func<object, object?>>(
+                System.Linq.Expressions.Expression.Convert(result, typeof(object)),
+                task)
+            .Compile();
+    }
+
+    private static Func<object, Task> CompileValueTaskAsTask(Type valueTaskType)
+    {
+        var valueTask = System.Linq.Expressions.Expression.Parameter(typeof(object), "valueTask");
+        var asTask = System.Linq.Expressions.Expression.Call(
+            System.Linq.Expressions.Expression.Convert(valueTask, valueTaskType),
+            valueTaskType.GetMethod("AsTask")!);
+        return System.Linq.Expressions.Expression
+            .Lambda<Func<object, Task>>(
+                System.Linq.Expressions.Expression.Convert(asTask, typeof(Task)),
+                valueTask)
+            .Compile();
     }
 
     private static (Type ClrType, bool IsAsync) UnwrapReturnType(Type returnType)
@@ -97,7 +169,7 @@ public sealed class RpcMethodInfo
     public async Task<object?> InvokeAsync(object implementation, object?[] wireArgs, ICallContext? context = null)
     {
         var args = HasContextParameter ? [.. wireArgs, context] : wireArgs;
-        var raw = Method.Invoke(implementation, args);
+        var raw = _invoke(implementation, args);
         if (!IsAsync)
         {
             return raw;
@@ -107,18 +179,18 @@ public sealed class RpcMethodInfo
         {
             case Task task:
                 await task.ConfigureAwait(false);
-                return ResultClrType == typeof(void) ? null : task.GetType().GetProperty("Result")!.GetValue(task);
+                return _getAwaitedResult?.Invoke(task);
             case ValueTask valueTask:
                 await valueTask.ConfigureAwait(false);
                 return null;
             default:
-                // A ValueTask<T> is a struct — `raw` is already boxed as `object`, so it can't be
-                // pattern-matched by static type above. Reflect for `AsTask()`/`.Result` instead.
-                if (raw is not null && raw.GetType().IsGenericType && raw.GetType().GetGenericTypeDefinition() == typeof(ValueTask<>))
+                // ValueTask<T> is boxed as object; use the delegate compiled for the declared
+                // return type rather than rediscovering AsTask()/Result through reflection.
+                if (raw is not null && _valueTaskAsTask is not null)
                 {
-                    var asTask = (Task)raw.GetType().GetMethod("AsTask")!.Invoke(raw, null)!;
+                    var asTask = _valueTaskAsTask(raw);
                     await asTask.ConfigureAwait(false);
-                    return asTask.GetType().GetProperty("Result")!.GetValue(asTask);
+                    return _getAwaitedResult!(asTask);
                 }
 
                 return raw;

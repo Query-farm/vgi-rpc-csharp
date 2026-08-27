@@ -474,17 +474,17 @@ def _spawn_tcp_worker(worker_binary: Path, *extra_args: str) -> Iterator[str]:
     try:
         assert proc.stdout is not None
         deadline = time.monotonic() + 10
-        port_line = ""
+        discovery_line = ""
         while time.monotonic() < deadline:
             line = proc.stdout.readline()
             if not line:
                 break
-            if line.startswith("PORT:"):
-                port_line = line
+            if line.startswith("TCP:"):
+                discovery_line = line
                 break
-        match = re.match(r"PORT:(\d+)", port_line)
-        assert match, f"Worker did not print a PORT:<port> discovery line within 10s (got: {port_line!r})"
-        yield f"127.0.0.1:{match.group(1)}"
+        match = re.fullmatch(r"TCP:(.+):(\d+)\s*", discovery_line)
+        assert match, f"Worker did not print a TCP:<host>:<port> discovery line within 10s (got: {discovery_line!r})"
+        yield f"{match.group(1)}:{match.group(2)}"
     finally:
         proc.terminate()
         try:

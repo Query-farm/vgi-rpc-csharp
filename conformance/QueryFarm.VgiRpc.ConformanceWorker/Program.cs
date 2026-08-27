@@ -49,7 +49,7 @@ if (options.Tcp is { } tcp)
         cts.Token,
         onBound: boundPort =>
         {
-            Console.WriteLine($"PORT:{boundPort}");
+            Console.WriteLine($"TCP:{tcp.Host}:{boundPort}");
             Console.Out.Flush();
         });
     return 0;

@@ -168,44 +168,57 @@ public static class ExternalLocation
         using var reader = new WireReader(new MemoryStream(data));
         _ = await reader.ReadSchemaAsync(cancellationToken).ConfigureAwait(false);
         var dataBatches = new List<AnnotatedBatch>();
-        while (await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false) is { } fetched)
+        try
         {
-            if (fetched.Metadata?.ContainsKey(MetadataKeys.Location) == true)
+            while (await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false) is { } fetched)
             {
-                throw new Errors.RpcException("RuntimeError", $"Redirect loop detected: fetched batch from {ExternalFetch.RedactUrl(url)} contains vgi_rpc.location");
+                if (fetched.Metadata?.ContainsKey(MetadataKeys.Location) == true)
+                {
+                    fetched.Batch.Dispose();
+                    throw new Errors.RpcException("RuntimeError", $"Redirect loop detected: fetched batch from {ExternalFetch.RedactUrl(url)} contains vgi_rpc.location");
+                }
+
+                // Log/error batches in the fetched stream are discarded here — this port has no
+                // on_log plumbing threaded through resolution yet (see the class doc comment on scope).
+                if (fetched.Batch.Length == 0 && fetched.Metadata?.ContainsKey(MetadataKeys.LogLevel) == true)
+                {
+                    fetched.Batch.Dispose();
+                    continue;
+                }
+
+                dataBatches.Add(fetched);
             }
 
-            // Log/error batches in the fetched stream are discarded here — this port has no
-            // on_log plumbing threaded through resolution yet (see the class doc comment on scope).
-            if (fetched.Batch.Length == 0 && fetched.Metadata?.ContainsKey(MetadataKeys.LogLevel) == true)
+            if (dataBatches.Count == 0)
             {
-                continue;
+                throw new Errors.RpcException("RuntimeError", $"No data batch found in ExternalLocation stream from {ExternalFetch.RedactUrl(url)}");
             }
 
-            dataBatches.Add(fetched);
-        }
+            if (dataBatches.Count > 1)
+            {
+                throw new Errors.RpcException("RuntimeError", $"Multiple data batches ({dataBatches.Count}) found in ExternalLocation stream from {ExternalFetch.RedactUrl(url)}");
+            }
 
-        if (dataBatches.Count == 0)
+            var resolved = dataBatches[0];
+            // Schema (Apache.Arrow) never overrides object.Equals — it's reference equality by
+            // default, which would always fail here since the fetched schema is a distinct instance
+            // from the original pointer's schema even when structurally identical. Use the same
+            // structural (name/type-id) comparison ValueCodec.CoerceBatch's own fast path uses.
+            if (!Reflection.ValueCodec.SchemasEqual(resolved.Batch.Schema, batch.Schema))
+            {
+                throw new Errors.RpcException("ValueError", $"Schema mismatch in ExternalLocation: expected {batch.Schema}, got {resolved.Batch.Schema}");
+            }
+
+            dataBatches.Clear(); // ownership transfers to the caller
+            return (resolved.Batch, resolved.Metadata);
+        }
+        finally
         {
-            throw new Errors.RpcException("RuntimeError", $"No data batch found in ExternalLocation stream from {ExternalFetch.RedactUrl(url)}");
+            foreach (var unclaimed in dataBatches)
+            {
+                unclaimed.Batch.Dispose();
+            }
         }
-
-        if (dataBatches.Count > 1)
-        {
-            throw new Errors.RpcException("RuntimeError", $"Multiple data batches ({dataBatches.Count}) found in ExternalLocation stream from {ExternalFetch.RedactUrl(url)}");
-        }
-
-        var resolved = dataBatches[0];
-        // Schema (Apache.Arrow) never overrides object.Equals — it's reference equality by
-        // default, which would always fail here since the fetched schema is a distinct instance
-        // from the original pointer's schema even when structurally identical. Use the same
-        // structural (name/type-id) comparison ValueCodec.CoerceBatch's own fast path uses.
-        if (!Reflection.ValueCodec.SchemasEqual(resolved.Batch.Schema, batch.Schema))
-        {
-            throw new Errors.RpcException("ValueError", $"Schema mismatch in ExternalLocation: expected {batch.Schema}, got {resolved.Batch.Schema}");
-        }
-
-        return (resolved.Batch, resolved.Metadata);
     }
 }
 

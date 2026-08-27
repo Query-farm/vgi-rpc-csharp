@@ -27,12 +27,24 @@ public static class ValueCodec
     public static RecordBatch BuildRow(Schema schema, IReadOnlyList<object?> values)
     {
         var arrays = new IArrowArray[schema.FieldsList.Count];
-        for (var i = 0; i < arrays.Length; i++)
+        try
         {
-            arrays[i] = BuildSingleValueArray(schema.GetFieldByIndex(i), values[i]);
-        }
+            for (var i = 0; i < arrays.Length; i++)
+            {
+                arrays[i] = BuildSingleValueArray(schema.GetFieldByIndex(i), values[i]);
+            }
 
-        return new RecordBatch(schema, arrays, length: 1);
+            return new RecordBatch(schema, arrays, length: 1);
+        }
+        catch
+        {
+            foreach (var array in arrays)
+            {
+                array?.Dispose();
+            }
+
+            throw;
+        }
     }
 
     /// <summary>

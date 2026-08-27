@@ -8,7 +8,7 @@ namespace QueryFarm.VgiRpc.Streaming;
 /// <see cref="StreamState.ProcessAsync"/> call emits for one lockstep turn. Mirrors Python's
 /// <c>OutputCollector</c>.
 /// </summary>
-public sealed class OutputCollector(Schema outputSchema)
+public sealed class OutputCollector(Schema outputSchema) : IDisposable
 {
     private readonly List<LogMessage> _logs = [];
 
@@ -31,7 +31,8 @@ public sealed class OutputCollector(Schema outputSchema)
     public IReadOnlyDictionary<string, string>? InputMetadata { get; set; }
 
     /// <summary>The batch emitted this turn, or <see langword="null"/> if <see cref="Emit(RecordBatch)"/>
-    /// wasn't called.</summary>
+    /// wasn't called. Calling <see cref="Emit(RecordBatch)"/> transfers ownership to the collector;
+    /// callers must not dispose the batch afterwards.</summary>
     public RecordBatch? EmittedBatch { get; private set; }
 
     /// <summary>The custom_metadata to carry on <see cref="EmittedBatch"/>'s IPC Message wrapper
@@ -56,6 +57,7 @@ public sealed class OutputCollector(Schema outputSchema)
     /// call per turn.</summary>
     public void Emit(RecordBatch batch, IReadOnlyDictionary<string, string>? metadata)
     {
+        ArgumentNullException.ThrowIfNull(batch);
         if (EmittedBatch is not null)
         {
             throw new InvalidOperationException("OutputCollector.Emit() was called more than once in a single turn — a stream turn emits at most one data batch.");
@@ -65,10 +67,24 @@ public sealed class OutputCollector(Schema outputSchema)
         EmittedMetadata = metadata;
     }
 
+    /// <summary>Transfers ownership of the emitted batch to the framework's wire layer.</summary>
+    internal RecordBatch? DetachEmittedBatch()
+    {
+        var batch = EmittedBatch;
+        EmittedBatch = null;
+        return batch;
+    }
+
     /// <summary>Emits a log message to the client, interleaved with this turn's data batch (log batches first).</summary>
     public void ClientLog(VgiLogLevel level, string message, IReadOnlyDictionary<string, object?>? extra = null) =>
         _logs.Add(new LogMessage(level, message, extra));
 
     /// <summary>Ends the stream after this turn (producer streams only — see <see cref="ProducerState"/>).</summary>
     public void Finish() => Finished = true;
+
+    public void Dispose()
+    {
+        EmittedBatch?.Dispose();
+        EmittedBatch = null;
+    }
 }
