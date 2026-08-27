@@ -205,7 +205,10 @@ public sealed class ShmAllocator
             _header.WriteArray(HeaderFixedSize, buffer, 0, buffer.Length);
         }
 
-        _header.Flush();
+        // This header coordinates live processes through one shared mapping; it is not durable
+        // state. MAP_SHARED/page-file mappings are coherent without flushing dirty pages to the
+        // backing store. Flushing every allocation/free adds a fixed msync-style cost to each
+        // SHM RPC and is especially visible for mid-sized batches.
     }
 
     private static void WarnIfNearLimit(int count)
