@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://vgi-rpc-python.query.farm/assets/logo-shield.png" alt="Vector Gateway Interface logo" width="280">
+  <img src="https://raw.githubusercontent.com/Query-farm/vgi-rpc-csharp/main/assets/vgi-logo.png" alt="Vector Gateway Interface logo" width="320">
 </p>
 
 <h1 align="center">vgi-rpc for .NET</h1>
