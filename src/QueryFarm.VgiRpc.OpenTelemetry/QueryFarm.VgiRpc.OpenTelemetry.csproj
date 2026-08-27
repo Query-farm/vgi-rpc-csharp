@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <Description>OpenTelemetry tracing/metrics instrumentation for vgi-rpc via ActivitySource/Meter (M16). See docs/roadmap.md.</Description>
+    <Description>OpenTelemetry-compatible tracing and metrics for vgi-rpc server dispatch using .NET ActivitySource and Meter instrumentation.</Description>
     <RootNamespace>QueryFarm.VgiRpc.OpenTelemetry</RootNamespace>
   </PropertyGroup>
 

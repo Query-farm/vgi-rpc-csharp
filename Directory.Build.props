@@ -13,9 +13,9 @@
     <InvariantGlobalization>false</InvariantGlobalization>
   </PropertyGroup>
 
-  <!-- Single version for every package in this repo; see docs/versioning.md -->
+  <!-- Single version for every first-party package in this repo. -->
   <PropertyGroup>
-    <Version>0.4.0</Version>
+    <Version>0.5.0</Version>
   </PropertyGroup>
 
   <PropertyGroup>
@@ -23,6 +23,8 @@
     <Company>Query Farm LLC</Company>
     <Copyright>Copyright © Query Farm LLC</Copyright>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/Query-farm/vgi-rpc-csharp</PackageProjectUrl>
+    <PackageTags>rpc;apache-arrow;arrow-ipc;serialization;cross-language</PackageTags>
     <RepositoryUrl>https://github.com/Query-farm/vgi-rpc-csharp</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>

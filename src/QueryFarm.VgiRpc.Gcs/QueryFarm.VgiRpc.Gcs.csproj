@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <Description>GCS-backed IExternalStorage/IUploadUrlProvider implementation for vgi-rpc large-payload externalization. See Milestone 19 in docs/roadmap.md.</Description>
+    <Description>Google Cloud Storage integration for vgi-rpc, with server-managed uploads and V4 signed upload/download URLs for large payloads.</Description>
     <RootNamespace>QueryFarm.VgiRpc.Gcs</RootNamespace>
   </PropertyGroup>
 

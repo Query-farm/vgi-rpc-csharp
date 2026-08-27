@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <Description>ASP.NET Core (Kestrel) HTTP transport, auth, sticky sessions, and proxy-proof for vgi-rpc. (Scaffold only — see Milestone 6+ in docs/roadmap.md.)</Description>
+    <Description>ASP.NET Core HTTP transport for vgi-rpc, with authentication, CORS, compression, sticky sessions, proxy proof, and external payload support.</Description>
     <RootNamespace>QueryFarm.VgiRpc.Http</RootNamespace>
   </PropertyGroup>
 

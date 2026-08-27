@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <Description>Sentry error-capture and performance instrumentation for vgi-rpc (M16). See docs/roadmap.md.</Description>
+    <Description>Sentry error reporting and optional performance transactions for vgi-rpc server dispatch.</Description>
     <RootNamespace>QueryFarm.VgiRpc.Sentry</RootNamespace>
   </PropertyGroup>
 

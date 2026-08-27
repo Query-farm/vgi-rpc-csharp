@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <Description>S3-backed IExternalStorage/IUploadUrlProvider implementation for vgi-rpc large-payload externalization. See Milestone 19 in docs/roadmap.md.</Description>
+    <Description>Amazon S3 and S3-compatible external storage for vgi-rpc, with server-managed uploads and presigned upload/download URLs for large payloads.</Description>
     <RootNamespace>QueryFarm.VgiRpc.S3</RootNamespace>
   </PropertyGroup>
 

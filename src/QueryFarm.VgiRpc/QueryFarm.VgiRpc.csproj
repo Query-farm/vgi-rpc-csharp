@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <Description>Core wire protocol, reflection-based RPC engine, and pipe/stdio/Unix/TCP/SHM transports for vgi-rpc.</Description>
+    <Description>Transport-agnostic RPC framework for .NET using Apache Arrow IPC, with reflection-based service contracts, streaming, and pipe, stdio, Unix socket, TCP, and shared-memory transports.</Description>
     <RootNamespace>QueryFarm.VgiRpc</RootNamespace>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>

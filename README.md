@@ -1,82 +1,84 @@
-<!-- markdownlint-disable MD041 -->
-# vgi-rpc-csharp
+<p align="center">
+  <img src="https://vgi-rpc-python.query.farm/assets/logo-shield.png" alt="Vector Gateway Interface logo" width="280">
+</p>
 
-[![CI](https://github.com/Query-farm/vgi-rpc-csharp/actions/workflows/ci.yml/badge.svg)](https://github.com/Query-farm/vgi-rpc-csharp/actions/workflows/ci.yml)
-[![NuGet](https://img.shields.io/nuget/v/QueryFarm.VgiRpc.svg)](https://www.nuget.org/packages/QueryFarm.VgiRpc)
+<h1 align="center">vgi-rpc for .NET</h1>
 
-A C# port of [vgi-rpc](https://github.com/Query-farm/vgi-rpc) — a transport-agnostic RPC framework
-that uses Apache Arrow's IPC Streaming Format as its wire protocol, with no IDL/codegen step:
-services are plain interfaces, and Arrow schemas are derived from them by reflection. This port
-targets **.NET 10** and runs on **Windows and Linux**.
+<p align="center">
+  Transport-agnostic RPC framework built on <a href="https://arrow.apache.org/">Apache Arrow</a> IPC serialization.<br>
+  Built by <a href="https://query.farm">🚜 Query.Farm</a>
+</p>
 
-> **Status: feature-complete.** Every transport, auth mode, and optional subsystem is implemented
-> and passing the real cross-language conformance suite, including real streaming
-> (producer/exchange) calls over every transport (pipe, Unix domain socket, TCP, HTTP). Published
-> to NuGet.org — see **Installation** below. (Implementation history and design rationale live in
-> [`docs/roadmap.md`](docs/roadmap.md) for anyone digging deeper.)
+<p align="center">
+  <a href="https://github.com/Query-farm/vgi-rpc-csharp/actions/workflows/ci.yml"><img src="https://github.com/Query-farm/vgi-rpc-csharp/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://www.nuget.org/packages/QueryFarm.VgiRpc"><img src="https://img.shields.io/nuget/v/QueryFarm.VgiRpc" alt="NuGet"></a>
+  <a href="https://www.nuget.org/packages/QueryFarm.VgiRpc"><img src="https://img.shields.io/nuget/dt/QueryFarm.VgiRpc" alt="NuGet downloads"></a>
+  <a href="https://github.com/Query-farm/vgi-rpc-csharp/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Query-farm/vgi-rpc-csharp" alt="License"></a>
+</p>
 
-## Wire compatibility
+Define RPC contracts as ordinary C# interfaces. vgi-rpc derives Apache Arrow schemas from those
+interfaces and provides reflection-based server dispatch and typed unary client proxies. There
+are no `.proto` files or code-generation steps, and structured data remains in Arrow's columnar
+format instead of being converted to JSON.
 
-vgi-rpc-csharp implements the same byte-level wire protocol as the canonical Python implementation
-and its other ports (Go, Rust, TypeScript, Java), so peers written in any of those languages can
-interoperate over pipe/stdio, Unix domain socket, TCP, or HTTP. See
-[`docs/wire-protocol.md`](docs/wire-protocol.md) for the protocol summary and the one C#-specific
-implementation wrinkle: the stock `Apache.Arrow` NuGet package can't write or read per-batch
-`custom_metadata` (every vgi-rpc protocol semantic — method name, versions, log/error info, stream
-continuation tokens — rides on it), so this repo vendors a small, surgically patched copy of
-`apache/arrow-dotnet` instead of hand-rolling the FlatBuffers framing itself — published as
-`QueryFarm.Arrow`/`QueryFarm.Arrow.Scalars` (a `QueryFarm.VgiRpc` dependency, pulled in
-automatically — no separate install step) rather than the real `Apache.Arrow`/
-`Apache.Arrow.Scalars`, which stay the official, unpatched upstream packages. See
-`third_party/apache-arrow-dotnet/README.md` for exactly what's patched, why, and why the fork
-needed its own distinct package identity.
+This implementation is wire-compatible with the canonical Python implementation and the other
+vgi-rpc ports, allowing clients and servers written in different supported languages to
+interoperate.
+
+**Key features:**
+
+- **Interface-based contracts** — define services with standard C# interfaces and async methods
+- **Apache Arrow IPC wire format** — efficient serialization for structured and batch-oriented data
+- **Cross-language interoperability** — compatible with the Python, Go, Rust, TypeScript, and Java implementations
+- **Unary and streaming dispatch** — producer and exchange streaming patterns are supported server-side
+- **Multiple transports** — in-process pipes, stdio, Unix domain sockets, TCP, shared memory, and HTTP
+- **Automatic schema inference** — CLR primitives, collections, enums, POCOs, and Arrow record batches map to Arrow types
+- **HTTP security** — bearer authentication, mTLS, JWT/JWKS validation, OAuth 2.0 PKCE, CORS, and proxy proof
+- **Large-payload offload** — transparent externalization to Amazon S3, S3-compatible stores, or Google Cloud Storage
+- **Observability** — access logs, OpenTelemetry-compatible tracing and metrics, and Sentry instrumentation
 
 ## Installation
 
+Install the core package:
+
 ```bash
-dotnet add package QueryFarm.VgiRpc               # core: wire framing, dispatch, transports
-dotnet add package QueryFarm.VgiRpc.Http           # HTTP transport, sticky sessions, proxy-proof, auth
-dotnet add package QueryFarm.VgiRpc.Http.OAuth     # JWT/JWKS validation, OAuth2/PKCE
-dotnet add package QueryFarm.VgiRpc.S3             # S3-backed external storage
-dotnet add package QueryFarm.VgiRpc.Gcs            # GCS-backed external storage
-dotnet add package QueryFarm.VgiRpc.OpenTelemetry  # tracing/metrics instrumentation
-dotnet add package QueryFarm.VgiRpc.Sentry         # error-capture instrumentation
+dotnet add package QueryFarm.VgiRpc
 ```
 
-Requires the .NET 10 SDK. As of 0.4.0, `QueryFarm.VgiRpc` correctly resolves its patched-Arrow
-dependency (`QueryFarm.Arrow`) from nuget.org on its own — versions before 0.4.0 declared a
-broken transitive dependency on the real, unpatched, years-old official `Apache.Arrow` package and
-would not build for a consumer without also vendoring this repo's own patched source (see
-`third_party/apache-arrow-dotnet/README.md`'s "Published as QueryFarm.Arrow" section); upgrade if
-you're on an earlier version.
+Add integrations as needed:
 
-## Quick Start
+| Package | Purpose |
+|---|---|
+| [`QueryFarm.VgiRpc`](https://www.nuget.org/packages/QueryFarm.VgiRpc) | Core wire protocol, reflection-based dispatch, streaming, and pipe, stdio, Unix socket, TCP, and shared-memory transports |
+| [`QueryFarm.VgiRpc.Http`](https://www.nuget.org/packages/QueryFarm.VgiRpc.Http) | ASP.NET Core HTTP transport, authentication, sticky sessions, proxy proof, compression, and external payload support |
+| [`QueryFarm.VgiRpc.Http.OAuth`](https://www.nuget.org/packages/QueryFarm.VgiRpc.Http.OAuth) | JWT/JWKS validation and OAuth 2.0 PKCE authentication |
+| [`QueryFarm.VgiRpc.S3`](https://www.nuget.org/packages/QueryFarm.VgiRpc.S3) | Amazon S3 and S3-compatible external storage with presigned URLs |
+| [`QueryFarm.VgiRpc.Gcs`](https://www.nuget.org/packages/QueryFarm.VgiRpc.Gcs) | Google Cloud Storage external storage with V4 signed URLs |
+| [`QueryFarm.VgiRpc.OpenTelemetry`](https://www.nuget.org/packages/QueryFarm.VgiRpc.OpenTelemetry) | OpenTelemetry-compatible server tracing and metrics |
+| [`QueryFarm.VgiRpc.Sentry`](https://www.nuget.org/packages/QueryFarm.VgiRpc.Sentry) | Sentry error reporting and optional performance transactions |
 
-The quickest way to get started: define a service interface, implement it, and call it in-process
-over an in-memory pipe — no subprocess or network needed.
+The packages target .NET 10 and require the .NET 10 SDK to build from source.
+
+## Quick start
+
+Define a service, implement it, and connect a typed client to the server over an in-process pipe:
 
 ```csharp
 using QueryFarm.VgiRpc.Client;
 using QueryFarm.VgiRpc.Server;
 using QueryFarm.VgiRpc.Transport;
 
-// 1. Define the service interface. Methods must return Task/Task<T>. The wire
-//    method name is derived from the C# name with "Async" stripped and
-//    converted to snake_case (GreetAsync -> "greet"); override with
-//    [RpcName("...")] when needed.
 public interface IGreeter
 {
     Task<string> GreetAsync(string name);
 }
 
-// 2. Implement it.
 public sealed class Greeter : IGreeter
 {
-    public Task<string> GreetAsync(string name) => Task.FromResult($"Hello, {name}!");
+    public Task<string> GreetAsync(string name) =>
+        Task.FromResult($"Hello, {name}!");
 }
 
-// 3. Wire up a transport, start the server, and call methods through a
-//    typed client proxy.
 var (clientTransport, serverTransport) = PipeTransport.CreatePair();
 
 var server = new RpcServer(typeof(IGreeter), new Greeter());
@@ -91,112 +93,75 @@ clientTransport.Output.Close();
 await serveTask;
 ```
 
-See [`examples/01-hello-world`](examples/01-hello-world) for the full runnable version, and the
-**Examples** table below for more.
+Methods must return `Task` or `Task<T>`. By default, method names are converted to `snake_case`
+on the wire and a trailing `Async` suffix is removed, so `GreetAsync` becomes `greet`. Use
+`[RpcName("...")]` to override a method, parameter, or property name.
 
-## Modules
+See the complete
+[`01-hello-world`](https://github.com/Query-farm/vgi-rpc-csharp/tree/main/examples/01-hello-world)
+example for a runnable project.
 
-| Package | Purpose |
-|---|---|
-| `QueryFarm.VgiRpc` | Core: wire framing, reflection-based dispatch, streaming, pipe/stdio/Unix/TCP/SHM transports, access log |
-| `QueryFarm.VgiRpc.Http` | ASP.NET Core (Kestrel) HTTP transport, sticky sessions, proxy-proof, bearer/mTLS auth |
-| `QueryFarm.VgiRpc.Http.OAuth` | JWT/JWKS validation, OAuth2/PKCE browser flow |
-| `QueryFarm.VgiRpc.S3` | S3-backed external storage for large-payload offload |
-| `QueryFarm.VgiRpc.Gcs` | GCS-backed external storage for large-payload offload |
-| `QueryFarm.VgiRpc.OpenTelemetry` | Tracing/metrics instrumentation |
-| `QueryFarm.VgiRpc.Sentry` | Error-capture instrumentation |
+## Service contracts
 
-## Defining Services
-
-A service is a plain C# interface. Methods must return `Task` or `Task<TResult>` — the idiomatic
-async shape the client proxy (built on `System.Reflection.DispatchProxy`) requires; `ValueTask`
-isn't supported client-side yet. A method may declare a trailing
-[`ICallContext`](src/QueryFarm.VgiRpc/Server/ICallContext.cs) parameter (with a `= null` default,
-so client call sites can omit it) to get server-injected access to client-directed logging and
-(on HTTP) sticky sessions — it's excluded from the wire schema entirely:
-
-```csharp
-public interface IGreeter
-{
-    Task<string> EchoWithLogAsync(string value, ICallContext? ctx = null);
-}
-
-public sealed class Greeter : IGreeter
-{
-    public Task<string> EchoWithLogAsync(string value, ICallContext? ctx = null)
-    {
-        ctx!.EmitLog(VgiLogLevel.Info, "processing", new Dictionary<string, object?> { ["value"] = value });
-        return Task.FromResult(value);
-    }
-}
-```
-
-Parameters and return types can be any plain C# class with a parameterless constructor and public
-settable properties — its properties map to Arrow struct fields automatically, including nested
-structs. See [`examples/02-structured-types`](examples/02-structured-types).
-
-### Supported types
+Parameters and return values may use CLR primitives, common generic collections, enums, Arrow
+record batches, or POCOs with a parameterless constructor and public settable properties. Nested
+POCOs map to nested Arrow structs.
 
 | C# type | Arrow type |
 |---|---|
 | `string` | `utf8` |
 | `byte[]` | `binary` |
-| `sbyte`/`short`/`int`/`long` | `int8`/`int16`/`int32`/`int64` (and unsigned counterparts) |
-| `float`/`double` | `float32`/`float64` |
-| `bool` | `bool_` |
+| `sbyte` / `short` / `int` / `long` | `int8` / `int16` / `int32` / `int64` |
+| `byte` / `ushort` / `uint` / `ulong` | `uint8` / `uint16` / `uint32` / `uint64` |
+| `float` / `double` | `float32` / `float64` |
+| `bool` | `bool` |
 | `List<T>` | `list<T>` |
 | `Dictionary<K, V>` | `map<K, V>` |
 | `HashSet<T>` | `list<T>` |
 | `enum` | `dictionary(int16, utf8)` |
-| `T?` / nullable reference type | nullable `T` |
-| plain class (parameterless ctor + settable properties) | `struct` |
-| `Apache.Arrow.RecordBatch` | `binary` (embedded Arrow IPC stream) |
-| `[LargeWidth]`-annotated `string`/`byte[]` | `large_utf8`/`large_binary` (64-bit offsets) |
+| `T?` | nullable `T` |
+| POCO | `struct` |
+| `Apache.Arrow.RecordBatch` | `binary` containing an Arrow IPC stream |
+| `[LargeWidth] string` / `[LargeWidth] byte[]` | `large_utf8` / `large_binary` |
 
-Wire names (method, parameter, and property names) default to a deterministic PascalCase/
-camelCase → snake_case conversion; override any of them with
-[`[RpcName("...")]`](src/QueryFarm.VgiRpc/Attributes/RpcNameAttribute.cs) when you need a specific
-wire name. See `docs/wire-protocol.md`.
+A service method may also declare a trailing optional `ICallContext` parameter. The server
+injects it for access to request-scoped logging and HTTP sticky-session state; it is excluded from
+the wire schema.
 
 ## Transports
 
-| Transport | Server-side | Client-side |
+| Transport | Server API | C# client API |
 |---|---|---|
-| Pipe (in-process) | `PipeTransport.CreatePair()` | built-in |
-| Subprocess (stdio) | `new StdioTransport()` | hand-rolled (no built-in helper yet — see below) |
-| Unix domain socket | `SocketTransport.ServeUnixAsync(...)` | wrap a connected `Socket` in `SocketTransport` |
-| TCP | `SocketTransport.ServeTcpAsync(...)` | wrap a connected `Socket` in `SocketTransport` |
-| HTTP | `app.MapVgiRpc(server, ...)` (`QueryFarm.VgiRpc.Http`) | raw wire over `HttpClient` (no typed client yet — see below) |
-| Shared memory | `System.IO.MemoryMappedFiles`-backed, rides alongside pipe/socket | same |
+| In-process pipe | `PipeTransport.CreatePair()` | Typed unary proxy |
+| Standard input/output | `StdioTransport` | Custom `IRpcTransport` wrapper |
+| Unix domain socket | `SocketTransport.ServeUnixAsync(...)` | Connected `SocketTransport` |
+| TCP | `SocketTransport.ServeTcpAsync(...)` | Connected `SocketTransport` |
+| HTTP | `MapVgiRpc(...)` from `QueryFarm.VgiRpc.Http` | `WireReader` / `WireWriter` over `HttpClient` |
+| Shared memory | Negotiated alongside pipe or socket transport | Built in |
 
-Every transport implements the small [`IRpcTransport`](src/QueryFarm.VgiRpc/Transport/IRpcTransport.cs)
-interface (`Stream Input`/`Stream Output`), so writing a new one is straightforward.
-
-**Two client-side gaps to know about before you build on this:** this port doesn't ship a
-client-side subprocess-spawning transport, and doesn't ship a typed streaming or HTTP client
-proxy yet. [`examples/03-subprocess`](examples/03-subprocess) and
-[`examples/04-http`](examples/04-http) show the small amount of code needed to fill each gap
-today (a ~30-line `IRpcTransport` wrapping `System.Diagnostics.Process`, and a direct
-`WireWriter`/`WireReader` call over `HttpClient`, respectively) — both are natural things to
-promote into the library later. A C# client isn't the only option, though: because every vgi-rpc
-port speaks the same wire protocol, a **server built with this package can be driven by any other
-port's client** (Python, Go, Rust, TypeScript, Java) with zero changes on the server side — that's
-the actual point of a shared wire format, not a workaround. The cross-language conformance suite
-this repo is held to (see `CLAUDE.md`) already drives every one of this port's transports,
-including streaming, from the canonical Python client.
+The typed C# proxy currently supports unary calls over an already-connected `IRpcTransport`.
+Typed streaming consumption, subprocess launching, and a typed HTTP client are not yet part of
+the public client API. The
+[`03-subprocess`](https://github.com/Query-farm/vgi-rpc-csharp/tree/main/examples/03-subprocess)
+and [`04-http`](https://github.com/Query-farm/vgi-rpc-csharp/tree/main/examples/04-http) examples
+show the corresponding lower-level client integrations. Servers remain interoperable with typed
+clients from the other vgi-rpc implementations.
 
 ## Streaming
 
-Streaming methods return `RpcStream<TState>`, where `TState` is a `ProducerState` or
-`ExchangeState` subclass whose `ProduceAsync`/`ExchangeAsync` override is called once per
-iteration:
+Streaming service methods return `RpcStream<TState>`, where `TState` derives from
+`ProducerState` or `ExchangeState`. The server invokes `ProduceAsync` or `ExchangeAsync` for each
+stream iteration:
 
 ```csharp
 public sealed class CounterState(long count) : ProducerState
 {
     private long _current;
 
-    public override Task ProduceAsync(OutputCollector output, ICallContext? ctx, CancellationToken cancellationToken)
+    public override Task ProduceAsync(
+        OutputCollector output,
+        ICallContext? context,
+        CancellationToken cancellationToken)
     {
         if (_current >= count)
         {
@@ -204,8 +169,7 @@ public sealed class CounterState(long count) : ProducerState
             return Task.CompletedTask;
         }
 
-        output.Emit(ValueCodec.BuildRow(CounterSchema.Output, [_current]));
-        _current++;
+        output.Emit(ValueCodec.BuildRow(CounterSchema.Output, [_current++]));
         return Task.CompletedTask;
     }
 }
@@ -216,55 +180,23 @@ public interface ICounterService
 }
 ```
 
-Server-side streaming dispatch (`RpcServer.ServeStreamAsync`) is fully implemented and
-conformance-tested across every transport (pipe, Unix domain socket, TCP, HTTP). What this port
-doesn't have yet is a typed C# **client** for consuming a stream — `RpcClientProxy<T>`
-only supports unary calls today. A C# client is one option among several here, not the only path:
-a stream server built with this package is already fully consumable today by any other vgi-rpc
-port's client (the conformance suite drives exactly this, over every transport, via the Python
-reference client). From C# itself, a stream is reachable at the wire level in the meantime
-(`WireWriter`/`WireReader`, the same primitives `examples/04-http/Client` uses for its unary
-call).
+Producer and exchange streaming are conformance-tested over pipe, Unix socket, TCP, and HTTP
+transports.
 
-## Error Handling
+## HTTP and authentication
 
-Server exceptions are propagated to the client as `RpcException`:
+`QueryFarm.VgiRpc.Http` integrates with ASP.NET Core through `MapVgiRpc(...)`. Its authentication
+delegate can validate bearer tokens, client certificates, or application-specific credentials
+before dispatch. `QueryFarm.VgiRpc.Http.OAuth` adds JWT/JWKS validation, protected-resource
+metadata, and an OAuth 2.0 PKCE browser flow.
 
-```csharp
-using QueryFarm.VgiRpc.Errors;
+The HTTP package also includes CORS handling, request and response size limits, zstd content
+encoding, sticky sessions, token introspection, and proxy-proof validation.
 
-try
-{
-    await client.FailingMethodAsync();
-}
-catch (RpcException e)
-{
-    Console.WriteLine(e.ErrorType);        // e.g. "InvalidOperationException"
-    Console.WriteLine(e.ErrorMessage);     // e.g. "something went wrong"
-    Console.WriteLine(e.RemoteTraceback);  // full server-side traceback
-}
-```
+## External storage
 
-Errors are transmitted as zero-row batches carrying `EXCEPTION`-level log metadata. The transport
-remains usable afterward — a single failed call does not poison the connection. Well-known error
-conditions surface as typed subclasses (`MethodNotImplementedException`,
-`ProtocolVersionException`, `SessionLostException`, `ServerDrainingException`,
-`PayloadTooLargeException`), each with a stable `ErrorKind` token.
-
-## Authentication
-
-`QueryFarm.VgiRpc.Http`'s `MapVgiRpc(...)` accepts an `AuthenticateDelegate` (`Task
-Authenticate(HttpContext context)`) — throw an `RpcException` (or let ASP.NET Core's own
-short-circuiting apply) to reject a request before it reaches the service implementation. Bearer
-tokens and mTLS client certificates are both driven through this seam; `QueryFarm.VgiRpc.Http.OAuth`
-layers JWT/JWKS validation and an OAuth2/PKCE browser flow on top. See
-`test/QueryFarm.VgiRpc.Http.Tests` and `test/QueryFarm.VgiRpc.Http.OAuth.Tests` for real usage.
-
-## External Storage
-
-When a response batch exceeds a configurable size threshold, it can be transparently uploaded to
-S3 or GCS and replaced with a lightweight pointer batch that the client resolves automatically via
-parallel range-request fetching:
+Large Arrow batches can be uploaded to object storage and replaced on the wire with an external
+location descriptor. The receiving peer resolves the descriptor with parallel range requests.
 
 ```csharp
 using QueryFarm.VgiRpc.Http;
@@ -280,38 +212,69 @@ var externalization = new ExternalizationOptions
     External = new ServerExternalConfig
     {
         Storage = storage,
-        ExternalizeThresholdBytes = 1_048_576, // 1 MiB (default)
-        Compression = new Compression(),        // zstd level 3 by default
+        ExternalizeThresholdBytes = 1_048_576,
+        Compression = new Compression(),
     },
 };
 
 app.MapVgiRpc(server, externalization: externalization);
 ```
 
-`QueryFarm.VgiRpc.Gcs`'s `GcsStorage` has the equivalent builder for Google Cloud Storage. See
-`test/QueryFarm.VgiRpc.S3.Tests`/`.Gcs.Tests` for real integration tests (run against real
-S3/GCS-compatible servers via Testcontainers, not mocks).
+`S3Storage` supports Amazon S3 and configurable S3-compatible endpoints. `GcsStorage` provides
+the equivalent integration for Google Cloud Storage. Both implementations support server-managed
+uploads and signed upload/download URL pairs.
+
+## Error handling
+
+Remote errors surface as `RpcException` and include a stable error kind, the remote exception
+type, message, and traceback. A failed call does not invalidate an otherwise healthy persistent
+connection. Common protocol conditions have typed exceptions, including
+`MethodNotImplementedException`, `ProtocolVersionException`, `SessionLostException`,
+`ServerDrainingException`, and `PayloadTooLargeException`.
 
 ## Examples
 
-The [`examples/`](examples/) directory contains runnable projects demonstrating key features:
-
 | Example | Description |
 |---|---|
-| [`01-hello-world`](examples/01-hello-world) | Minimal quickstart with in-process pipe transport |
-| [`02-structured-types`](examples/02-structured-types) | POCO parameters with enums, lists, and maps |
-| [`03-subprocess`](examples/03-subprocess) | Worker + client over stdio, including a hand-rolled subprocess transport and remote-error handling |
-| [`04-http`](examples/04-http) | HTTP server (ASP.NET Core / Kestrel) + a raw-wire HTTP client |
-
-Run any of them with `dotnet run --project examples/<name>` (for `03-subprocess` and `04-http`,
-run the `Worker`/`Server` sub-project first — each example's own `Program.cs` has the exact
-commands).
+| [`01-hello-world`](https://github.com/Query-farm/vgi-rpc-csharp/tree/main/examples/01-hello-world) | Minimal typed unary call over an in-process pipe |
+| [`02-structured-types`](https://github.com/Query-farm/vgi-rpc-csharp/tree/main/examples/02-structured-types) | POCO parameters with enums, lists, and maps |
+| [`03-subprocess`](https://github.com/Query-farm/vgi-rpc-csharp/tree/main/examples/03-subprocess) | Worker and client over stdio, including remote error handling |
+| [`04-http`](https://github.com/Query-farm/vgi-rpc-csharp/tree/main/examples/04-http) | ASP.NET Core server and a wire-level `HttpClient` client |
 
 ## Development
 
-See [`CLAUDE.md`](CLAUDE.md) for build/test commands, the conformance-testing workflow, and
-cross-language wire-alignment notes.
+The SDK version is pinned in `global.json`.
+
+```bash
+dotnet restore
+dotnet build -c Release
+dotnet test -c Release
+dotnet format --verify-no-changes --exclude third_party
+```
+
+Run the cross-language conformance suite with:
+
+```bash
+./run_tests.sh
+```
+
+The suite uses the canonical Python implementation and covers all supported transports and wire
+features. See
+[`docs/wire-protocol.md`](https://github.com/Query-farm/vgi-rpc-csharp/blob/main/docs/wire-protocol.md)
+for the wire format and
+[`third_party/apache-arrow-dotnet/README.md`](https://github.com/Query-farm/vgi-rpc-csharp/blob/main/third_party/apache-arrow-dotnet/README.md)
+for details about the narrowly patched Arrow dependency.
+
+## Related projects
+
+- [`vgi-rpc`](https://github.com/Query-farm/vgi-rpc) — canonical Python implementation and conformance suite
+- [`vgi-rpc-go`](https://github.com/Query-farm/vgi-rpc-go) — Go implementation
+- [`vgi-rpc-rust`](https://github.com/Query-farm/vgi-rpc-rust) — Rust implementation
+- [`vgi-rpc-typescript`](https://github.com/Query-farm/vgi-rpc-typescript) — TypeScript implementation
+- [`vgi-rpc-java`](https://github.com/Query-farm/vgi-rpc-java) — Java implementation
 
 ## License
 
-Apache License 2.0 — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
+Apache License 2.0 — see
+[`LICENSE`](https://github.com/Query-farm/vgi-rpc-csharp/blob/main/LICENSE) and
+[`NOTICE`](https://github.com/Query-farm/vgi-rpc-csharp/blob/main/NOTICE).
