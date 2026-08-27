@@ -302,6 +302,7 @@ public sealed class RpcServer
             return await ServeStreamAsync(transport, info, args, start, shm, cancellationToken).ConfigureAwait(false);
         }
 
+        using var ownedLargeBytesArguments = new LargeBytesBufferArgumentsOwner(args);
         using var shmForUnary = shm;
         await using var writer = new WireWriter(transport.Output, info.ResultSchema);
         var context = info.HasContextParameter ? new BufferedCallContext() : null;
@@ -314,6 +315,7 @@ public sealed class RpcServer
         try
         {
             var result = await info.InvokeAsync(_implementation, args, context).ConfigureAwait(false);
+            using var ownedLargeBytesResult = result as LargeBytesBuffer;
             if (context is not null)
             {
                 foreach (var logMessage in context.Buffered)
@@ -389,10 +391,12 @@ public sealed class RpcServer
 
         var invokeContext = info.HasContextParameter ? new BufferedCallContext() : null;
         IRpcStream stream;
+        using var ownedLargeBytesArguments = new LargeBytesBufferArgumentsOwner(args);
         try
         {
             var raw = await info.InvokeAsync(_implementation, args, invokeContext).ConfigureAwait(false);
             stream = (IRpcStream)raw!;
+            ownedLargeBytesArguments.Dispose();
         }
         catch (Exception exc)
         {

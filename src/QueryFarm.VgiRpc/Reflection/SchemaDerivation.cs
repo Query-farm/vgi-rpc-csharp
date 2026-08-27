@@ -11,8 +11,9 @@ namespace QueryFarm.VgiRpc.Reflection;
 /// schema, exactly as in every other vgi-rpc port. See the type-mapping table in
 /// WIRE_PROTOCOL.md §4 and docs/wire-protocol.md.
 ///
-/// Type mapping: string→utf8, byte[]→binary, bool→bool, integer widths→matching Arrow int
-/// width, float/double→float32/float64, enum→dictionary(int16,utf8) by member name (see
+/// Type mapping: string→utf8, byte[]→binary, <see cref="LargeBytesBuffer"/>→large_binary,
+/// bool→bool, integer widths→matching Arrow int width, float/double→float32/float64,
+/// enum→dictionary(int16,utf8) by member name (see
 /// <see cref="WireNaming.ForEnumMember"/>), List&lt;T&gt;/T[]/HashSet&lt;T&gt;→list (including a
 /// list of enum/struct — see <see cref="ValueCodec"/>'s hand-built array helpers for why those
 /// two element kinds can't use the normal builder factory), Dictionary&lt;K,V&gt;→map(K,V)
@@ -101,6 +102,11 @@ public static class SchemaDerivation
         if (type == typeof(byte[]))
         {
             return largeWidth ? LargeBinaryType.Default : BinaryType.Default;
+        }
+
+        if (type == typeof(LargeBytesBuffer))
+        {
+            return LargeBinaryType.Default;
         }
 
         if (type == typeof(bool))

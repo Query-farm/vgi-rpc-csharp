@@ -137,15 +137,9 @@ public interface IConformanceService
 
     // -- Large payload (M17) --------------------------------------------------
 
-    /// <summary>Echoes <paramref name="value"/> — wire-typed <c>large_binary</c> (64-bit offsets,
-    /// via <see cref="LargeWidthAttribute"/>), matching the reference's
-    /// <c>Annotated[bytes, ArrowType(pa.large_binary())]</c>. Backs both the mandatory
-    /// <c>large_payload.echo_binary_over_int32_max</c> conformance test (2^31+1 bytes — a size no
-    /// managed <c>byte[]</c> can represent on any CLR, so this port answers with a typed refusal;
-    /// see <see cref="Reflection.ValueCodec"/>'s <c>ExtractLargeBinaryValue</c>) and the smaller
-    /// <c>echo_binary_4mib</c> short-write regression check.</summary>
-    [return: LargeWidth]
-    Task<byte[]> EchoLargeBinaryAsync([LargeWidth] byte[] value);
+    /// <summary>Zero-copy <c>large_binary</c> echo matching the reference's
+    /// <c>Annotated[bytes, ArrowType(pa.large_binary())]</c>.</summary>
+    Task<LargeBytesBuffer> EchoLargeBinaryAsync(LargeBytesBuffer value);
 
     // -- Multi-param & defaults ---------------------------------------------
 

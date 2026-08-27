@@ -23,7 +23,7 @@
   <PropertyGroup>
     <IsPackable>true</IsPackable>
     <PackageId>QueryFarm.Arrow</PackageId>
-    <Version>23.0.0-queryfarm.1</Version>
+    <Version>23.0.0-queryfarm.2</Version>
     <Authors>The Apache Software Foundation; Query Farm LLC</Authors>
     <Company>Query Farm LLC</Company>
     <Copyright>Copyright 2018-2025 The Apache Software Foundation. Modifications copyright Query Farm LLC.</Copyright>

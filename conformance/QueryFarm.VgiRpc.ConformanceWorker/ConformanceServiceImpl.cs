@@ -116,7 +116,7 @@ public sealed class ConformanceServiceImpl : IConformanceService
 
     public Task<string> EchoLargeStringAsync(string value) => Task.FromResult(value);
 
-    public Task<byte[]> EchoLargeBinaryAsync(byte[] value) => Task.FromResult(value);
+    public Task<LargeBytesBuffer> EchoLargeBinaryAsync(LargeBytesBuffer value) => Task.FromResult(value);
 
     public Task<double> AddFloatsAsync(double a, double b) => Task.FromResult(a + b);
 

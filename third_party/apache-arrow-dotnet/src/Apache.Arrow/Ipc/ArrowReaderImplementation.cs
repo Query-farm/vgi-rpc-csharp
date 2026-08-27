@@ -143,7 +143,10 @@ namespace Apache.Arrow.Ipc
                 case Flatbuf.MessageHeader.DictionaryBatch:
                     Flatbuf.DictionaryBatch dictionaryBatch = message.Header<Flatbuf.DictionaryBatch>().Value;
                     ReadDictionaryBatch(message.Version, dictionaryBatch, bodyByteBuffer, memoryOwner);
-                    break;
+                    // ReadDictionaryBatch transfers the message-body owner into the dictionary
+                    // buffers. Do not dispose the raw owner again below and bypass their shared
+                    // reference count.
+                    return null;
                 case Flatbuf.MessageHeader.RecordBatch:
                     Flatbuf.RecordBatch rb = message.Header<Flatbuf.RecordBatch>().Value;
                     if (rb.Length < 0 || rb.Length > int.MaxValue)
@@ -152,14 +155,16 @@ namespace Apache.Arrow.Ipc
                             $"Cannot read batch. Message body of {rb.Length} rows is out of range.");
                     }
 
-                    List<IArrowArray> arrays = BuildArrays(message.Version, Schema, bodyByteBuffer, rb);
+                    List<IArrowArray> arrays = BuildArrays(message.Version, Schema, bodyByteBuffer, rb, memoryOwner);
                     LastBatchCustomMetadata = ReadMessageCustomMetadata(message);
-                    return new RecordBatch(Schema, memoryOwner, arrays, (int)rb.Length);
+                    return new RecordBatch(Schema, arrays, (int)rb.Length);
                 default:
                     // NOTE: Skip unsupported message type
                     Debug.WriteLine($"Skipping unsupported message type '{message.HeaderType}'");
                     break;
             }
+
+            memoryOwner?.Dispose();
 
             return null;
         }
@@ -203,7 +208,7 @@ namespace Apache.Arrow.Ipc
 
             Field valueField = new Field("dummy", valueType, true);
             var schema = new Schema(new[] { valueField }, default);
-            IList<IArrowArray> arrays = BuildArrays(version, schema, bodyByteBuffer, recordBatch.Value);
+            IList<IArrowArray> arrays = BuildArrays(version, schema, bodyByteBuffer, recordBatch.Value, memoryOwner);
 
             if (arrays.Count != 1)
             {
@@ -224,16 +229,17 @@ namespace Apache.Arrow.Ipc
             MetadataVersion version,
             Schema schema,
             ByteBuffer messageBuffer,
-            Flatbuf.RecordBatch recordBatchMessage)
+            Flatbuf.RecordBatch recordBatchMessage,
+            IMemoryOwner<byte> messageBodyOwner = null)
         {
             var arrays = new List<IArrowArray>(recordBatchMessage.NodesLength);
+            using var bufferCreator = GetBufferCreator(recordBatchMessage.Compression, messageBodyOwner);
 
             if (recordBatchMessage.NodesLength == 0)
             {
                 return arrays;
             }
 
-            using var bufferCreator = GetBufferCreator(recordBatchMessage.Compression);
             var recordBatchEnumerator = new RecordBatchEnumerator(in recordBatchMessage);
             int schemaFieldIndex = 0;
             do
@@ -249,11 +255,13 @@ namespace Apache.Arrow.Ipc
             return arrays;
         }
 
-        private IBufferCreator GetBufferCreator(BodyCompression? compression)
+        private IBufferCreator GetBufferCreator(BodyCompression? compression, IMemoryOwner<byte> messageBodyOwner)
         {
             if (!compression.HasValue)
             {
-                return NoOpBufferCreator.Instance;
+                return messageBodyOwner == null
+                    ? NoOpBufferCreator.Instance
+                    : new OwnedBufferCreator(messageBodyOwner);
             }
 
             var method = compression.Value.Method;
@@ -274,7 +282,7 @@ namespace Apache.Arrow.Ipc
                 Apache.Arrow.Flatbuf.CompressionType.ZSTD => _compressionCodecFactory.CreateCodec(CompressionCodecType.Zstd),
                 _ => throw new NotImplementedException($"Compression codec {codec} is not supported")
             };
-            return new DecompressingBufferCreator(decompressor, _allocator);
+            return new DecompressingBufferCreator(decompressor, _allocator, messageBodyOwner);
         }
 
         private ArrayData LoadField(

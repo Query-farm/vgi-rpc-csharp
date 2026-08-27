@@ -41,10 +41,14 @@ public interface IGreeter
     Task<string> EchoWithLogAsync(string value, ICallContext? ctx = null);
 
     Task<List<PointRecord>> EchoPointsAsync(List<PointRecord> points);
+
+    Task<LargeBytesBuffer> EchoLargeBytesAsync(LargeBytesBuffer value);
 }
 
 public sealed class Greeter : IGreeter
 {
+    public LargeBytesBuffer? LastLargeBytesArgument { get; private set; }
+
     public Task<string> EchoStringAsync(string value) => Task.FromResult(value);
 
     public Task<int> AddAsync(int a, int b) => Task.FromResult(a + b);
@@ -68,6 +72,12 @@ public sealed class Greeter : IGreeter
     }
 
     public Task<List<PointRecord>> EchoPointsAsync(List<PointRecord> points) => Task.FromResult(points);
+
+    public Task<LargeBytesBuffer> EchoLargeBytesAsync(LargeBytesBuffer value)
+    {
+        LastLargeBytesArgument = value;
+        return Task.FromResult(value);
+    }
 }
 
 /// <summary>
@@ -244,5 +254,24 @@ public sealed class RpcServerClientTests
 
         Assert.Equal("hi", result);
         await serveTask;
+    }
+
+    [Fact]
+    public async Task LargeBytesBuffer_RoundTrips_AndServerArgumentIsReleased()
+    {
+        var (clientTransport, serverTransport) = PipeTransport.CreatePair();
+        var service = new Greeter();
+        var server = new RpcServer(typeof(IGreeter), service);
+        var client = new RpcConnection<IGreeter>(clientTransport).CreateProxy();
+        var serveTask = server.ServeOneAsync(serverTransport);
+        using var input = new LargeBytesBuffer(new byte[] { 1, 2, 3, 4 });
+
+        using var result = await client.EchoLargeBytesAsync(input);
+
+        Assert.Equal(new byte[] { 1, 2, 3, 4 }, result.ToArray());
+        Assert.Equal(4, input.Length);
+        Assert.True(await serveTask);
+        Assert.NotNull(service.LastLargeBytesArgument);
+        Assert.Throws<ObjectDisposedException>(() => service.LastLargeBytesArgument!.ToArray());
     }
 }

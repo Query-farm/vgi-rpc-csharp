@@ -172,6 +172,7 @@ public static class ValueCodec
             // (see LargeWidthAttribute) — used for the conformance suite's echo_large_string/
             // echo_large_binary, whose reference declares pa.large_string()/pa.large_binary().
             LargeStringType => new LargeStringArray.Builder().Append((string)value).Build(),
+            LargeBinaryType when value is LargeBytesBuffer largeBuffer => BuildLargeBytesArray(largeBuffer),
             LargeBinaryType when value is byte[] largeBytes => new LargeBinaryArray.Builder().Append(largeBytes).Build(),
             BooleanType => new BooleanArray.Builder().Append((bool)value).Build(),
             Int8Type => new Int8Array.Builder().Append((sbyte)value).Build(),
@@ -799,6 +800,7 @@ public static class ValueCodec
             // LargeBinaryArray must be checked before the plain BinaryArray cases below (it's
             // not one — LargeStringArray/LargeBinaryArray are a distinct hierarchy — but is
             // listed here alongside its string sibling since both back a [LargeWidth] field).
+            LargeBinaryArray a when effectiveType == typeof(LargeBytesBuffer) => LargeBytesBuffer.FromArray(a, index),
             LargeBinaryArray a when effectiveType == typeof(byte[]) => ExtractLargeBinaryValue(a, index),
             BinaryArray a when effectiveType == typeof(byte[]) => a.GetBytes(index).ToArray(),
             BinaryArray a when effectiveType == typeof(RecordBatch) => ExtractRecordBatchFromBinary(a.GetBytes(index).ToArray()),
@@ -831,6 +833,31 @@ public static class ValueCodec
             DictionaryArray a => ExtractEnum(a, index, effectiveType),
             _ => throw NotSupportedYet(array.Data.DataType),
         };
+    }
+
+    private static LargeBinaryArray BuildLargeBytesArray(LargeBytesBuffer value)
+    {
+        var data = value.RetainBuffer();
+        ArrowBuffer offsets = default;
+        try
+        {
+            offsets = new ArrowBuffer.Builder<long>()
+                .Append(0)
+                .Append(data.Length)
+                .Build();
+            return new LargeBinaryArray(
+                LargeBinaryType.Default,
+                length: 1,
+                offsets,
+                data,
+                ArrowBuffer.Empty);
+        }
+        catch
+        {
+            offsets.Dispose();
+            data.Dispose();
+            throw;
+        }
     }
 
     /// <summary>

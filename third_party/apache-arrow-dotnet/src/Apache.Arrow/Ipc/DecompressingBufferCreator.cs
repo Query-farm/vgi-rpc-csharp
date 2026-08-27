@@ -14,6 +14,7 @@
 // limitations under the License.
 
 using System;
+using System.Buffers;
 using System.Buffers.Binary;
 using Apache.Arrow.Memory;
 
@@ -26,11 +27,15 @@ namespace Apache.Arrow.Ipc
     {
         private readonly ICompressionCodec _compressionCodec;
         private readonly MemoryAllocator _allocator;
+        private readonly ArrowBuffer _sourceBody;
+        private readonly bool _hasSourceBody;
 
-        public DecompressingBufferCreator(ICompressionCodec compressionCodec, MemoryAllocator allocator)
+        public DecompressingBufferCreator(ICompressionCodec compressionCodec, MemoryAllocator allocator, IMemoryOwner<byte> sourceBodyOwner = null)
         {
             _compressionCodec = compressionCodec;
             _allocator = allocator;
+            _hasSourceBody = sourceBodyOwner != null;
+            _sourceBody = _hasSourceBody ? new ArrowBuffer(sourceBodyOwner) : default;
         }
 
         public ArrowBuffer CreateBuffer(ReadOnlyMemory<byte> source)
@@ -48,7 +53,9 @@ namespace Apache.Arrow.Ipc
             if (uncompressedLength == -1)
             {
                 // The buffer is not actually compressed
-                return new ArrowBuffer(source.Slice(8));
+                return _hasSourceBody
+                    ? _sourceBody.Share(source.Slice(8))
+                    : new ArrowBuffer(source.Slice(8));
             }
 
             var outputData = _allocator.Allocate(Convert.ToInt32(uncompressedLength));
@@ -64,6 +71,7 @@ namespace Apache.Arrow.Ipc
         public void Dispose()
         {
             _compressionCodec.Dispose();
+            _sourceBody.Dispose();
         }
     }
 }

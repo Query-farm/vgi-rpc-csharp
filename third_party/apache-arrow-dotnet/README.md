@@ -1,8 +1,8 @@
 # Vendored: Apache Arrow .NET (patched for per-batch `custom_metadata`)
 
 This directory vendors `Apache.Arrow` and `Apache.Arrow.Scalars` from
-[apache/arrow-dotnet](https://github.com/apache/arrow-dotnet), **with five small patches applied
-on top of the `v23.0.0` release tag** (one cherry-picked from an upstream PR, four authored directly
+[apache/arrow-dotnet](https://github.com/apache/arrow-dotnet), **with six small patches applied
+on top of the `v23.0.0` release tag** (one cherry-picked from an upstream PR, five authored directly
 in this vendoring — see below for each).
 
 ## Why this exists
@@ -144,6 +144,27 @@ real `Apache.Arrow` package ships — worth reporting upstream to `apache/arrow-
 of this port, since it reproduces with any RecordBatch whose schema wasn't literally derived from
 the same `Schema` object the writer holds, regardless of the custom_metadata patch above.
 
+## Sixth patch: independently owned IPC buffer slices (vgi-rpc-csharp-specific)
+
+The stock stream reader keeps one `IMemoryOwner<byte>` for an IPC message body on the returned
+`RecordBatch`; its individual `ArrowBuffer` values are non-owning `ReadOnlyMemory<byte>` slices.
+That is efficient while the batch is alive, but `ArrowBuffer.Retain()` cannot extend the message
+body's lifetime: retaining a column and then disposing its batch leaves the retained buffer
+pointing at returned pooled/native memory. This prevents a safe C# equivalent of Rust's
+`LargeBytesBuffer`, which retains the incoming Arrow allocation and re-emits the same bytes.
+
+The patched reader wraps an uncompressed message body in a shared owner and gives every decoded
+buffer an independently reference-counted slice. `ArrowBuffer.Slice()` preserves that ownership,
+including the slice bounds. Compressed buffers retain the source body only for buffers marked
+"stored uncompressed" by Arrow IPC; genuinely decompressed buffers continue to own their existing
+allocator output. Dictionary messages use the same ownership transfer and are explicitly not
+double-disposed after entering the reader's dictionary memo. This makes a retained value valid
+after its input batch is disposed without copying it, while ordinary batch disposal remains
+deterministic.
+
+If/when this vendoring is removed, either upstream needs equivalent owned-slice semantics or
+`LargeBytesBuffer` must fall back to copying incoming values before the batch is released.
+
 ## What's NOT vendored
 
 Only `src/Apache.Arrow/` and `src/Apache.Arrow.Scalars/` (Arrow's own dependency of the former).
@@ -193,12 +214,14 @@ This mirrors `vgi-go`'s equivalent fork (`github.com/Query-farm/arrow-go`, subst
 so the split here is: NuGet resolves the correct, unique package identity, while the assembly
 inside keeps its original name for source compatibility.
 
-Version is `23.0.0-queryfarm.1` — the upstream tag this fork is based on (`v23.0.0`), with a
-prerelease suffix that can never collide with any real official Apache.Arrow release (present or
-future), independent of `QueryFarm.VgiRpc`'s own version. Published under Authors "The Apache
-Software Foundation; Query Farm LLC" with `LICENSE.txt`/`NOTICE.txt` (carried over from upstream,
-unmodified) embedded in the package — standard Apache-2.0 redistribution-of-a-modified-work
-practice: same license, original copyright/notice preserved, changes documented (this README).
+`QueryFarm.Arrow` is version `23.0.0-queryfarm.2` — the upstream tag this fork is based on
+(`v23.0.0`), with a prerelease suffix that can never collide with any official Apache.Arrow
+release. `QueryFarm.Arrow.Scalars` remains `23.0.0-queryfarm.1` because its source is unchanged;
+the fork package depends on that existing scalar package. Both are versioned independently of
+`QueryFarm.VgiRpc`. They are published under Authors "The Apache Software Foundation; Query Farm
+LLC" with `LICENSE.txt`/`NOTICE.txt` (carried over from upstream, unmodified) embedded in the
+package — standard Apache-2.0 redistribution-of-a-modified-work practice: same license, original
+copyright/notice preserved, changes documented (this README).
 
 **Practical tradeoff worth knowing about**: because the published assembly keeps the name
 `Apache.Arrow.dll` (for source compatibility, as above), an application that references *both*

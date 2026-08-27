@@ -36,17 +36,16 @@ namespace Apache.Arrow
         internal ArrowBuffer(IMemoryOwner<byte> memoryOwner)
         {
             _handle = new SharedMemoryHandle(new SharedMemoryOwner(memoryOwner));
-            _memory = Memory<byte>.Empty;
+            _memory = _handle.Memory;
         }
 
-        private ArrowBuffer(SharedMemoryHandle handle)
+        private ArrowBuffer(SharedMemoryHandle handle, ReadOnlyMemory<byte> memory)
         {
             _handle = handle;
-            _memory = Memory<byte>.Empty;
+            _memory = memory;
         }
 
-        public ReadOnlyMemory<byte> Memory =>
-            _handle != null ? _handle.Memory : _memory;
+        public ReadOnlyMemory<byte> Memory => _memory;
 
         public bool IsEmpty => Memory.IsEmpty;
 
@@ -66,10 +65,30 @@ namespace Apache.Arrow
         {
             if (_handle != null)
             {
-                return new ArrowBuffer(_handle.Retain());
+                return new ArrowBuffer(_handle.Retain(), _memory);
             }
 
             return new ArrowBuffer(_memory);
+        }
+
+        /// <summary>
+        /// Returns an independently-owned view over a range of this buffer. The returned view
+        /// keeps pooled/native storage alive even after the source array or record batch is
+        /// disposed.
+        /// </summary>
+        public ArrowBuffer Slice(int start, int length)
+        {
+            return Share(_memory.Slice(start, length));
+        }
+
+        /// <summary>
+        /// Creates another owner for a memory view known to refer to this buffer's allocation.
+        /// </summary>
+        internal ArrowBuffer Share(ReadOnlyMemory<byte> memory)
+        {
+            return _handle != null
+                ? new ArrowBuffer(_handle.Retain(), memory)
+                : new ArrowBuffer(memory);
         }
 
         public ArrowBuffer Clone(MemoryAllocator allocator = default)

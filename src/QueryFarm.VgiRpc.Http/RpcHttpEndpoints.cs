@@ -282,7 +282,7 @@ public static class RpcHttpEndpoints
         }
 
         EmitAccessLog(server, "__upload_url__", "unary", "ok", "", "", Stopwatch.GetTimestamp(), StatusCodes.Status200OK);
-        await WriteBytesAsync(context, StatusCodes.Status200OK, responseBuffer.ToArray(), null, false, null, cancellationToken).ConfigureAwait(false);
+        await WriteBytesAsync(context, StatusCodes.Status200OK, WrittenMemory(responseBuffer), null, false, null, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Writes a genuine HTTP 413 — a real transport-level rejection, distinct from
@@ -715,6 +715,7 @@ public static class RpcHttpEndpoints
             return;
         }
 
+        using var ownedLargeBytesArguments = new LargeBytesBufferArgumentsOwner(args);
         var stickyResolution = await TryResolveStickyAsync(sticky, server, method, context, info.ResultSchema, encoding, useCustomHeader, compressionLevel, tokenKey, "unary").ConfigureAwait(false);
         if (stickyResolution is null)
         {
@@ -743,6 +744,7 @@ public static class RpcHttpEndpoints
                 try
                 {
                     var result = await info.InvokeAsync(server.Implementation, args, callContext).ConfigureAwait(false);
+                    using var ownedLargeBytesResult = result as LargeBytesBuffer;
                     if (callContext is not null)
                     {
                         foreach (var logMessage in callContext.Buffered)
@@ -820,7 +822,7 @@ public static class RpcHttpEndpoints
             FinishSticky(context, sticky!, stickyState);
         }
 
-        await WriteBytesAsync(context, StatusCodes.Status200OK, responseBuffer.ToArray(), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
+        await WriteBytesAsync(context, StatusCodes.Status200OK, WrittenMemory(responseBuffer), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -951,6 +953,7 @@ public static class RpcHttpEndpoints
             return;
         }
 
+        using var ownedLargeBytesArguments = new LargeBytesBufferArgumentsOwner(args);
         var stickyResolution = await TryResolveStickyAsync(sticky, server, method, context, s_emptySchema, encoding, useCustomHeader, compressionLevel, tokenKey, "stream").ConfigureAwait(false);
         if (stickyResolution is null)
         {
@@ -973,6 +976,7 @@ public static class RpcHttpEndpoints
         {
             var raw = await info.InvokeAsync(server.Implementation, args, invokeContext).ConfigureAwait(false);
             stream = (IRpcStream)raw!;
+            ownedLargeBytesArguments.Dispose();
         }
         catch (Exception exc)
         {
@@ -1120,7 +1124,7 @@ public static class RpcHttpEndpoints
             FinishSticky(context, sticky!, stickyState);
         }
 
-        await WriteBytesAsync(context, StatusCodes.Status200OK, responseBuffer.ToArray(), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
+        await WriteBytesAsync(context, StatusCodes.Status200OK, WrittenMemory(responseBuffer), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1264,7 +1268,7 @@ public static class RpcHttpEndpoints
                 await cancelWriter.WriteStartAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            await WriteBytesAsync(context, StatusCodes.Status200OK, cancelBuffer.ToArray(), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
+            await WriteBytesAsync(context, StatusCodes.Status200OK, WrittenMemory(cancelBuffer), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -1487,7 +1491,7 @@ public static class RpcHttpEndpoints
                 FinishSticky(context, sticky!, stickyState);
             }
 
-            await WriteBytesAsync(context, StatusCodes.Status200OK, responseBuffer.ToArray(), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
+            await WriteBytesAsync(context, StatusCodes.Status200OK, WrittenMemory(responseBuffer), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -1497,7 +1501,7 @@ public static class RpcHttpEndpoints
             FinishSticky(context, sticky!, stickyState);
         }
 
-        await WriteBytesAsync(context, StatusCodes.Status200OK, responseBuffer.ToArray(), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
+        await WriteBytesAsync(context, StatusCodes.Status200OK, WrittenMemory(responseBuffer), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task ErrorResultAsync(
@@ -1529,11 +1533,11 @@ public static class RpcHttpEndpoints
         if (httpStatusCode == StatusCodes.Status500InternalServerError)
         {
             context.Response.Headers[RpcErrorHeader] = "true";
-            await WriteBytesAsync(context, StatusCodes.Status200OK, buffer.ToArray(), encoding, useCustomHeader, compressionLevel, context.RequestAborted).ConfigureAwait(false);
+            await WriteBytesAsync(context, StatusCodes.Status200OK, WrittenMemory(buffer), encoding, useCustomHeader, compressionLevel, context.RequestAborted).ConfigureAwait(false);
         }
         else
         {
-            await WriteBytesAsync(context, httpStatusCode, buffer.ToArray(), encoding, useCustomHeader, compressionLevel, context.RequestAborted).ConfigureAwait(false);
+            await WriteBytesAsync(context, httpStatusCode, WrittenMemory(buffer), encoding, useCustomHeader, compressionLevel, context.RequestAborted).ConfigureAwait(false);
         }
     }
 
@@ -1583,7 +1587,7 @@ public static class RpcHttpEndpoints
     /// (<c>X-VGI-Content-Encoding</c> when the client's preference came from the custom
     /// <c>X-VGI-Accept-Encoding</c> header, else the standard <c>Content-Encoding</c>).
     /// </summary>
-    private static Task WriteBytesAsync(HttpContext context, int statusCode, byte[] body, ContentEncoding? encoding, bool useCustomHeader, int? compressionLevel, CancellationToken cancellationToken)
+    private static Task WriteBytesAsync(HttpContext context, int statusCode, ReadOnlyMemory<byte> body, ContentEncoding? encoding, bool useCustomHeader, int? compressionLevel, CancellationToken cancellationToken)
     {
         context.Response.StatusCode = statusCode;
         context.Response.ContentType = ArrowContentType;
@@ -1603,12 +1607,12 @@ public static class RpcHttpEndpoints
         return context.Response.Body.WriteAsync(body, cancellationToken).AsTask();
     }
 
-    private static byte[] CompressBody(byte[] body, ContentEncoding encoding, int level)
+    private static byte[] CompressBody(ReadOnlyMemory<byte> body, ContentEncoding encoding, int level)
     {
         if (encoding == ContentEncoding.Zstd)
         {
             using var compressor = new ZstdSharp.Compressor(level);
-            return compressor.Wrap(body).ToArray();
+            return compressor.Wrap(body.Span).ToArray();
         }
 
         // .NET's GZipStream takes System.IO.Compression's four-level CompressionLevel enum, not
@@ -1618,10 +1622,20 @@ public static class RpcHttpEndpoints
         using var output = new MemoryStream();
         using (var gzip = new GZipStream(output, gzipLevel, leaveOpen: true))
         {
-            gzip.Write(body);
+            gzip.Write(body.Span);
         }
 
         return output.ToArray();
+    }
+
+    private static ReadOnlyMemory<byte> WrittenMemory(MemoryStream stream)
+    {
+        if (!stream.TryGetBuffer(out var segment))
+        {
+            throw new InvalidOperationException("The response buffer is not publicly visible.");
+        }
+
+        return segment.AsMemory(0, checked((int)stream.Length));
     }
 
     private static void EmitAccessLog(RpcServer server, string method, string methodType, string status, string errorType, string errorMessage, long startTimestamp, int httpStatus, string? streamId = null)
