@@ -9,9 +9,10 @@ namespace QueryFarm.VgiRpc.Http;
 ///
 /// <para>A <c>Content-Length</c> header check alone is insufficient — a chunked request carries
 /// no declared length at all, so the cap must also be enforced while the body is actually being
-/// read. <see cref="CappedStream"/> does that: it wraps the raw (pre-decompression) request body
-/// and throws <see cref="RequestTooLargeException"/> the moment more than the configured cap has
-/// been read, regardless of whether a length was declared up front.</para>
+/// read. <see cref="CappedStream"/> does that. HTTP dispatch wraps both the raw request stream and,
+/// for compressed requests, the decoded stream so the configured limit applies independently to
+/// bytes received on the wire and bytes produced by decompression. This prevents a small
+/// gzip/zstd body from expanding beyond the advertised allocation limit.</para>
 /// </summary>
 public static class RequestCap
 {
@@ -52,11 +53,13 @@ public sealed class RequestTooLargeException(long actualOrObservedBytes, long ma
 }
 
 /// <summary>A read-only stream wrapper that throws <see cref="RequestTooLargeException"/> once
-/// more than <paramref name="capBytes"/> total bytes have been read from <paramref name="inner"/> —
-/// catches oversized chunked/unknown-length bodies a <c>Content-Length</c> check alone would miss.</summary>
-internal sealed class CappedStream(Stream inner, long capBytes) : Stream
+/// more than <paramref name="capBytes"/> total bytes have been read from <paramref name="inner"/>.
+/// When <paramref name="leaveOpen"/> is false, disposing this wrapper also disposes the wrapped
+/// stream (used by the decoded cap to release its decompressor).</summary>
+internal sealed class CappedStream(Stream inner, long capBytes, bool leaveOpen = true) : Stream
 {
     private long _totalRead;
+    private bool _disposed;
 
     public override bool CanRead => true;
 
@@ -105,4 +108,34 @@ internal sealed class CappedStream(Stream inner, long capBytes) : Stream
     public override void SetLength(long value) => throw new NotSupportedException();
 
     public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (!_disposed)
+        {
+            if (disposing && !leaveOpen)
+            {
+                inner.Dispose();
+            }
+
+            _disposed = true;
+        }
+
+        base.Dispose(disposing);
+    }
+
+    public override async ValueTask DisposeAsync()
+    {
+        if (!_disposed)
+        {
+            if (!leaveOpen)
+            {
+                await inner.DisposeAsync().ConfigureAwait(false);
+            }
+
+            _disposed = true;
+        }
+
+        GC.SuppressFinalize(this);
+    }
 }

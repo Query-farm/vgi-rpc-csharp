@@ -198,8 +198,10 @@ def _spawn_http_worker_port(worker_binary: Path, *extra_args: str) -> Iterator[i
 # supply all three failure-path fixtures).
 @pytest.fixture
 def conformance_http_port(worker_binary: Path) -> Iterator[int]:
-    """A sticky-enabled --http worker — the TestSticky group's main fixture."""
-    yield from _spawn_http_worker_port(worker_binary, "--conformance-sticky")
+    """Primary HTTP worker shared by sticky and compression conformance groups."""
+    yield from _spawn_http_worker_port(
+        worker_binary, "--conformance-sticky", "--max-response-bytes", str(8 * 1024 * 1024)
+    )
 
 
 @pytest.fixture
@@ -279,6 +281,14 @@ def proof_worker_factory(worker_binary: Path):
 def conformance_http_introspect_port(worker_binary: Path) -> Iterator[int]:
     """A worker with token introspection enabled — for TestTokenIntrospection."""
     yield from _spawn_http_worker_port(worker_binary, "--introspect")
+
+
+@pytest.fixture
+def conformance_http_small_request_cap_port(worker_binary: Path) -> Iterator[int]:
+    """Worker used by the canonical encoded/decoded request-cap regression matrix."""
+    yield from _spawn_http_worker_port(
+        worker_binary, "--max-request-bytes", "4096", "--max-response-bytes", str(8 * 1024 * 1024)
+    )
 
 
 _CORS_ALLOWED_ORIGIN = "https://allowed.example.com"
@@ -1039,6 +1049,12 @@ from vgi_rpc.conformance._pytest_suite import TestTokenIntrospection, TestTokenI
 # (vgi_rpc.conformance._pytest_suite), collected against conformance_http_with_storage_port /
 # conformance_http_with_zstd_storage_port / conformance_http_externalized_cap_port above.
 from vgi_rpc.conformance._pytest_suite import TestExternalLocation, TestExternalizedResponseCap  # noqa: E402,F401
+from vgi_rpc.conformance._pytest_suite import TestHttpCompressionNegotiationConformance  # noqa: E402,F401
+
+# Response negotiation and compressed request limits are protocol-level compatibility/security
+# gates. The canonical tests require both zstd and gzip, check VGI-vs-generic header precedence,
+# and prove that a small encoded body cannot expand beyond max_request_bytes.
+from vgi_rpc.conformance._request_limits_pytest import TestCompressedHttpRequestCap  # noqa: E402,F401
 
 # M13: the canonical external-fetch groups (vgi_rpc.conformance._external_pytest) — a small
 # raw-HTTP driver separate from _pytest_suite because these tests place external-location pointer

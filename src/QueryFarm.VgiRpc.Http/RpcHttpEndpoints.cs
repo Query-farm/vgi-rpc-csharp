@@ -43,27 +43,11 @@ public static class RpcHttpEndpoints
 
     private static readonly Schema s_emptySchema = new([], metadata: null);
 
-    // zstd is deliberately excluded from *response* compression (gzip only) — a real,
-    // version-dependent incompatibility in the reference Python client's dependency stack, found
-    // by reproducing a CI-only failure ("Invalid IPC stream: negative continuation token" on
-    // every HTTP unary test) in a Linux x86_64 container: the client advertises zstd support
-    // via `Accept-Encoding` whenever `vgi_rpc._codec.available_encodings()` sees the third-party
-    // `zstandard` package importable — but as of httpx2 2.12, httpx2's own *response*
-    // auto-decompression for zstd no longer uses that package at all; it requires Python 3.14's
-    // stdlib `compression.zstd` or the separate `backports.zstd` package, neither of which
-    // `vgi-rpc[http]` installs. On Python 3.13 (what this repo's CI runs) with only `zstandard`
-    // present, the client claims zstd support it cannot actually exercise: request compression
-    // still works (vgi_rpc's own code calls `zstandard` directly, never touching httpx2's
-    // decoder), but a zstd-compressed *response* comes back to the client still compressed, and
-    // pyarrow fails trying to parse it as a plain IPC stream. This is a pre-existing bug in the
-    // published `vgi-rpc[http]` package's interaction with recent httpx2 versions, not specific
-    // to this port — any server (Python's own reference included) would hit it against this
-    // exact client/Python-version combination. gzip has no such gap: httpx2 auto-decompresses it
-    // unconditionally via stdlib `zlib`. Revisit once the ecosystem's zstd story stabilizes (or
-    // `vgi-rpc[http]` starts installing `backports.zstd` on <3.14). Request decompression
-    // (DecompressingRequestBody) is entirely unaffected by any of this — it doesn't depend on
-    // this set or on the client's HTTP library at all.
-    private static readonly IReadOnlySet<ContentEncoding> s_producibleEncodings = new HashSet<ContentEncoding> { ContentEncoding.Gzip };
+    // Both codecs are mandatory for the canonical conformance worker. Keep zstd first so
+    // capability discovery communicates the same preference as the canonical Python server;
+    // actual response selection still honors the client's explicit order.
+    private static readonly IReadOnlySet<ContentEncoding> s_producibleEncodings =
+        new HashSet<ContentEncoding> { ContentEncoding.Zstd, ContentEncoding.Gzip };
     private static readonly IReadOnlySet<ContentEncoding> s_noEncodings = new HashSet<ContentEncoding>();
 
     /// <summary>Registers <paramref name="server"/>'s routes under <paramref name="prefix"/>
@@ -227,7 +211,7 @@ public static class RpcHttpEndpoints
         Stream requestBody;
         try
         {
-            requestBody = DecompressingRequestBody(request, RequestCap.Enforce(request, externalization.MaxRequestBytes));
+            requestBody = OpenRequestBody(request, externalization.MaxRequestBytes);
         }
         catch (RequestTooLargeException exc)
         {
@@ -505,7 +489,7 @@ public static class RpcHttpEndpoints
     /// when a cap is configured, <c>VGI-Externalization-Enabled: false</c> and
     /// <c>VGI-Upload-URL-Support: false</c> (neither is implemented yet — see docs/roadmap.md M13),
     /// and <c>VGI-Supported-Encodings</c> naming the codecs this server can actually produce for
-    /// responses (see <see cref="s_producibleEncodings"/> — gzip only, for now).
+    /// responses.
     /// </summary>
     private static Task HandleCapabilitiesAsync(HttpContext context, long? maxResponseBytes, StickySessionRegistry? sticky, bool proxyProofRequired, bool introspectEnabled, ExternalizationOptions? externalization)
     {
@@ -517,7 +501,7 @@ public static class RpcHttpEndpoints
 
         headers["VGI-Externalization-Enabled"] = externalization?.External?.Storage is not null ? "true" : "false";
         headers["VGI-Upload-URL-Support"] = externalization?.UploadUrlProvider is not null ? "true" : "false";
-        headers["VGI-Supported-Encodings"] = "gzip";
+        headers["VGI-Supported-Encodings"] = "zstd, gzip";
         if (externalization?.MaxRequestBytes is { } maxRequestBytes)
         {
             headers["VGI-Max-Request-Bytes"] = maxRequestBytes.ToString();
@@ -642,7 +626,7 @@ public static class RpcHttpEndpoints
         Stream requestBody;
         try
         {
-            requestBody = DecompressingRequestBody(request, RequestCap.Enforce(request, externalization?.MaxRequestBytes));
+            requestBody = OpenRequestBody(request, externalization?.MaxRequestBytes);
         }
         catch (NotSupportedException exc)
         {
@@ -879,7 +863,7 @@ public static class RpcHttpEndpoints
         Stream requestBody;
         try
         {
-            requestBody = DecompressingRequestBody(request, RequestCap.Enforce(request, externalization?.MaxRequestBytes));
+            requestBody = OpenRequestBody(request, externalization?.MaxRequestBytes);
         }
         catch (NotSupportedException exc)
         {
@@ -1177,7 +1161,7 @@ public static class RpcHttpEndpoints
         Stream requestBody;
         try
         {
-            requestBody = DecompressingRequestBody(request, RequestCap.Enforce(request, externalization?.MaxRequestBytes));
+            requestBody = OpenRequestBody(request, externalization?.MaxRequestBytes);
         }
         catch (NotSupportedException exc)
         {
@@ -1539,10 +1523,22 @@ public static class RpcHttpEndpoints
     /// </summary>
     private static Stream DecompressingRequestBody(HttpRequest request) => DecompressingRequestBody(request, request.Body);
 
-    /// <summary>Overload taking the raw source stream explicitly, so callers enforcing
-    /// <c>max_request_bytes</c> (see <see cref="RequestCap"/>) can wrap <c>request.Body</c> in a
-    /// capped stream first — the cap applies to the on-wire (pre-decompression) bytes, matching
-    /// Python's semantics.</summary>
+    /// <summary>Applies <c>max_request_bytes</c> independently to the encoded and decoded body.
+    /// The outer wrapper owns the decompressor but ultimately leaves ASP.NET's request stream
+    /// open. Identity bodies need only the raw wrapper because both byte counts are identical.</summary>
+    private static Stream OpenRequestBody(HttpRequest request, long? maxRequestBytes)
+    {
+        var rawBody = RequestCap.Enforce(request, maxRequestBytes);
+        var decodedBody = DecompressingRequestBody(request, rawBody);
+        if (maxRequestBytes is { } cap && !ReferenceEquals(rawBody, decodedBody))
+        {
+            return new CappedStream(decodedBody, cap, leaveOpen: false);
+        }
+
+        return decodedBody;
+    }
+
+    /// <summary>Overload taking the raw source stream explicitly.</summary>
     private static Stream DecompressingRequestBody(HttpRequest request, Stream rawBody)
     {
         var encoding = request.Headers.ContentEncoding.ToString();

@@ -321,10 +321,9 @@ public sealed class ClientExternalConfig
     public Action<string>? UrlValidator { get; init; } = ExternalFetch.HttpsOnlyValidator;
 }
 
-/// <summary>zstd/gzip compression for externalized upload bytes — a separate code path from
-/// response wire-compression negotiation (<see cref="ContentEncoding"/>/M6-M7), so the
-/// httpx2/zstd CI incompatibility documented on <c>RpcHttpEndpoints.s_producibleEncodings</c>
-/// does not apply here: externalized objects are fetched via plain HTTP GET by whatever storage
+/// <summary>zstd/gzip compression for externalized upload bytes. This is a separate code path
+/// from response wire-compression negotiation (<see cref="ContentEncoding"/>/M6-M7):
+/// externalized objects are fetched via plain HTTP GET by whatever storage
 /// client resolves them, never through this port's own response-negotiation path.</summary>
 internal static class ExternalCompression
 {
