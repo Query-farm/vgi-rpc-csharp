@@ -4,6 +4,7 @@
     <Project Path="benchmark/QueryFarm.VgiRpc.BenchmarkWorker/QueryFarm.VgiRpc.BenchmarkWorker.csproj" />
   </Folder>
   <Folder Name="/conformance/">
+    <Project Path="conformance/QueryFarm.VgiRpc.ConformanceClientDriver/QueryFarm.VgiRpc.ConformanceClientDriver.csproj" />
     <Project Path="conformance/QueryFarm.VgiRpc.Conformance/QueryFarm.VgiRpc.Conformance.csproj" />
     <Project Path="conformance/QueryFarm.VgiRpc.ConformanceWorker/QueryFarm.VgiRpc.ConformanceWorker.csproj" />
   </Folder>
@@ -16,6 +17,9 @@
     <Project Path="examples/04-http/Client/HttpClientExample.csproj" />
   </Folder>
   <Folder Name="/src/">
+    <Project Path="src/QueryFarm.VgiRpc.Client/QueryFarm.VgiRpc.Client.csproj" />
+    <Project Path="src/QueryFarm.VgiRpc.Client.Http/QueryFarm.VgiRpc.Client.Http.csproj" />
+    <Project Path="src/QueryFarm.VgiRpc.Client.OAuth/QueryFarm.VgiRpc.Client.OAuth.csproj" />
     <Project Path="src/QueryFarm.VgiRpc.Gcs/QueryFarm.VgiRpc.Gcs.csproj" />
     <Project Path="src/QueryFarm.VgiRpc.Http.OAuth/QueryFarm.VgiRpc.Http.OAuth.csproj" />
     <Project Path="src/QueryFarm.VgiRpc.Http/QueryFarm.VgiRpc.Http.csproj" />

@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>HTTP client for vgi-rpc with zstd/gzip, streaming, external payload, sticky-session, TLS, and mTLS support.</Description>
+    <RootNamespace>QueryFarm.VgiRpc.Client.Http</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ZstdSharp.Port" />
+    <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
+    <ProjectReference Include="..\QueryFarm.VgiRpc.Client\QueryFarm.VgiRpc.Client.csproj" />
+    <ProjectReference Include="..\QueryFarm.VgiRpc.Http\QueryFarm.VgiRpc.Http.csproj" />
+  </ItemGroup>
+
+</Project>

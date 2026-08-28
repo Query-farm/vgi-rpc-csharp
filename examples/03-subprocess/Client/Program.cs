@@ -1,8 +1,6 @@
 // Client that spawns a subprocess server and calls methods on it.
 //
-// Uses the small SubprocessTransport in this project (see
-// SubprocessTransport.cs) to launch the worker as a child process and
-// communicate over its stdin/stdout pipes.
+// Uses the production SubprocessTransport from QueryFarm.VgiRpc.Client.
 //
 // Build the worker first, then run this:
 //
@@ -12,13 +10,11 @@
 using System.Runtime.CompilerServices;
 using QueryFarm.VgiRpc.Client;
 using QueryFarm.VgiRpc.Errors;
-using QueryFarm.VgiRpc.Examples.Subprocess.Client;
 
 var workerDll = args.Length > 0 ? args[0] : FindWorkerDll();
 
-using var transport = new SubprocessTransport("dotnet", workerDll);
-var connection = new RpcConnection<ICalculator>(transport);
-var calc = connection.CreateProxy();
+await using var client = RpcClient.StartSubprocess(["dotnet", workerDll]);
+var calc = client.CreateProxy<ICalculator>();
 
 Console.WriteLine($"add(2, 3)      = {await calc.AddAsync(2, 3)}");
 Console.WriteLine($"multiply(4, 5) = {await calc.MultiplyAsync(4, 5)}");

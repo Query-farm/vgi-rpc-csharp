@@ -45,11 +45,22 @@ Install the core package:
 dotnet add package QueryFarm.VgiRpc
 ```
 
+Install a client package when this process calls a vgi-rpc worker:
+
+```bash
+dotnet add package QueryFarm.VgiRpc.Client
+# For HTTP:
+dotnet add package QueryFarm.VgiRpc.Client.Http
+```
+
 Add integrations as needed:
 
 | Package | Purpose |
 |---|---|
 | [`QueryFarm.VgiRpc`](https://www.nuget.org/packages/QueryFarm.VgiRpc) | Core wire protocol, reflection-based dispatch, streaming, and pipe, stdio, Unix socket, TCP, and shared-memory transports |
+| `QueryFarm.VgiRpc.Client` | Typed and schema-first clients over subprocess, Unix socket, TCP, named pipe, and negotiated shared memory; includes the subprocess worker pool |
+| `QueryFarm.VgiRpc.Client.Http` | Typed and schema-first HTTP client with zstd/gzip, external payloads, sticky sessions, TLS, and mTLS |
+| `QueryFarm.VgiRpc.Client.OAuth` | Native OAuth 2.0 Authorization Code + PKCE and Device Authorization client flows |
 | [`QueryFarm.VgiRpc.Http`](https://www.nuget.org/packages/QueryFarm.VgiRpc.Http) | ASP.NET Core HTTP transport, authentication, sticky sessions, proxy proof, compression, and external payload support |
 | [`QueryFarm.VgiRpc.Http.OAuth`](https://www.nuget.org/packages/QueryFarm.VgiRpc.Http.OAuth) | JWT/JWKS validation and OAuth 2.0 PKCE authentication |
 | [`QueryFarm.VgiRpc.S3`](https://www.nuget.org/packages/QueryFarm.VgiRpc.S3) | Amazon S3 and S3-compatible external storage with presigned URLs |
@@ -58,6 +69,10 @@ Add integrations as needed:
 | [`QueryFarm.VgiRpc.Sentry`](https://www.nuget.org/packages/QueryFarm.VgiRpc.Sentry) | Sentry error reporting and optional performance transactions |
 
 The packages target .NET 10 and require the .NET 10 SDK to build from source.
+
+> **0.8 migration:** client types moved out of `QueryFarm.VgiRpc` into
+> `QueryFarm.VgiRpc.Client`. Add that package and update client-side `using` directives to
+> `QueryFarm.VgiRpc.Client`; server-only applications do not need the new dependency.
 
 ## Quick start
 
@@ -132,20 +147,21 @@ the wire schema.
 
 | Transport | Server API | C# client API |
 |---|---|---|
-| In-process pipe | `PipeTransport.CreatePair()` | Typed unary proxy |
-| Standard input/output | `StdioTransport` | Custom `IRpcTransport` wrapper |
-| Unix domain socket | `SocketTransport.ServeUnixAsync(...)` | Connected `SocketTransport` |
-| TCP | `SocketTransport.ServeTcpAsync(...)` | Connected `SocketTransport` |
-| HTTP | `MapVgiRpc(...)` from `QueryFarm.VgiRpc.Http` | `WireReader` / `WireWriter` over `HttpClient` |
-| Shared memory | Negotiated alongside pipe or socket transport | Built in |
+| In-process pipe | `PipeTransport.CreatePair()` | `new RpcClient(transport)` |
+| Standard input/output | `StdioTransport` | `RpcClient.StartSubprocess(...)` |
+| Unix domain socket | `SocketTransport.ServeUnixAsync(...)` | `RpcClient.ConnectUnixAsync(...)` |
+| TCP | `SocketTransport.ServeTcpAsync(...)` | `RpcClient.ConnectTcpAsync(...)` |
+| Named pipe | Application-owned listener | `RpcClient.ConnectNamedPipeAsync(...)` |
+| HTTP | `MapVgiRpc(...)` | `new HttpRpcClient(baseAddress)` |
+| Shared memory | Negotiated alongside a pipe or socket | Set `RpcClientOptions.SharedMemorySize` |
 
-The typed C# proxy currently supports unary calls over an already-connected `IRpcTransport`.
-Typed streaming consumption, subprocess launching, and a typed HTTP client are not yet part of
-the public client API. The
-[`03-subprocess`](https://github.com/Query-farm/vgi-rpc-csharp/tree/main/examples/03-subprocess)
-and [`04-http`](https://github.com/Query-farm/vgi-rpc-csharp/tree/main/examples/04-http) examples
-show the corresponding lower-level client integrations. Servers remain interoperable with typed
-clients from the other vgi-rpc implementations.
+Both client classes expose exact-schema methods (`CallUnaryAsync`, `OpenProducerAsync`, and
+`OpenExchangeAsync`) and `CreateProxy<TContract>()`. Use `IRpcProducerSession` and
+`RpcExchangeSession<TInput>` in portable typed client contracts; the same contract can then be
+driven over persistent byte streams or stateless HTTP.
+
+`WorkerPool` keeps healthy subprocess connections in a command-keyed LIFO pool, bounds idle
+workers, evicts them after an idle timeout, and exposes borrow/spawn/reuse/discard metrics.
 
 ## Streaming
 
@@ -193,6 +209,10 @@ metadata, and an OAuth 2.0 PKCE browser flow.
 The HTTP package also includes CORS handling, request and response size limits, zstd content
 encoding, sticky sessions, token introspection, and proxy-proof validation.
 
+The separate `QueryFarm.VgiRpc.Client.OAuth` package performs OIDC discovery, Authorization Code
+with PKCE (including constant-time state validation), Device Authorization polling, token refresh,
+and bearer injection through `OAuthBearerHandler`.
+
 ## External storage
 
 Large Arrow batches can be uploaded to object storage and replaced on the wire with an external
@@ -239,7 +259,7 @@ connection. Common protocol conditions have typed exceptions, including
 | [`01-hello-world`](https://github.com/Query-farm/vgi-rpc-csharp/tree/main/examples/01-hello-world) | Minimal typed unary call over an in-process pipe |
 | [`02-structured-types`](https://github.com/Query-farm/vgi-rpc-csharp/tree/main/examples/02-structured-types) | POCO parameters with enums, lists, and maps |
 | [`03-subprocess`](https://github.com/Query-farm/vgi-rpc-csharp/tree/main/examples/03-subprocess) | Worker and client over stdio, including remote error handling |
-| [`04-http`](https://github.com/Query-farm/vgi-rpc-csharp/tree/main/examples/04-http) | ASP.NET Core server and a wire-level `HttpClient` client |
+| [`04-http`](https://github.com/Query-farm/vgi-rpc-csharp/tree/main/examples/04-http) | ASP.NET Core server and HTTP client |
 
 ## Development
 
@@ -259,7 +279,21 @@ Run the cross-language conformance suite with:
 ```
 
 The suite uses the canonical Python implementation and covers all supported transports and wire
-features. See
+features in the server direction. The CI client-conformance lane also reverses the direction:
+the C# client drives canonical Python, Rust, Java, Go, and TypeScript workers. Each lane uses only
+the transports that worker actually implements (including SHM for Python/Rust/Java/Go and
+stdio/HTTP/Unix/TCP for TypeScript). The xUnit port of Python's native-client worker tests also
+validates exact all-null/zero-row/nested schemas, producer continuations, sticky sessions,
+external payloads, verified TLS, and stdio/SHM/Unix/TCP transports.
+Run that focused native-client suite against a Python checkout with:
+
+```bash
+VGI_PYTHON_BIN=/path/to/vgi-rpc/.venv/bin/python \
+  dotnet test test/QueryFarm.VgiRpc.Http.Tests \
+  --filter FullyQualifiedName~PythonClientWorkerTests
+```
+
+See
 [`docs/wire-protocol.md`](https://github.com/Query-farm/vgi-rpc-csharp/blob/main/docs/wire-protocol.md)
 for the wire format and
 [`third_party/apache-arrow-dotnet/README.md`](https://github.com/Query-farm/vgi-rpc-csharp/blob/main/third_party/apache-arrow-dotnet/README.md)

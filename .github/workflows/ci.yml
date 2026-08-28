@@ -63,3 +63,171 @@ jobs:
       - run: pip install "vgi-rpc[conformance,http,external]" pytest cryptography
       # test_csharp_conformance.py's worker_binary fixture builds the worker itself.
       - run: python -m pytest test_csharp_conformance.py -v
+
+  client-conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Query-farm/vgi-rpc-python
+          ref: v0.43.2
+          path: _conformance/vgi-rpc
+      # The cross-language client-role adapter is currently shared by the Rust port. It speaks a
+      # language-neutral JSONL + Arrow IPC driver protocol; this job substitutes the C# driver.
+      - uses: actions/checkout@v4
+        with:
+          repository: Query-farm/vgi-rpc-rust
+          path: _conformance/vgi-rpc-rust
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e "./_conformance/vgi-rpc[conformance,http,external]" pytest cryptography
+      - run: dotnet restore conformance/QueryFarm.VgiRpc.ConformanceClientDriver/QueryFarm.VgiRpc.ConformanceClientDriver.csproj
+      - run: dotnet build conformance/QueryFarm.VgiRpc.ConformanceClientDriver/QueryFarm.VgiRpc.ConformanceClientDriver.csproj -c Release --no-restore
+      - name: Run C# ports of the Python native-client acceptance tests
+        env:
+          VGI_PYTHON_BIN: python
+        run: >-
+          dotnet test test/QueryFarm.VgiRpc.Http.Tests/QueryFarm.VgiRpc.Http.Tests.csproj
+          -c Release
+          --filter FullyQualifiedName~PythonClientWorkerTests
+      - name: Drive canonical servers with the C# client
+        working-directory: _conformance/vgi-rpc-rust
+        env:
+          VGI_CONFORMANCE_ROLE: client
+          VGI_CONFORMANCE_SERVER: python
+          VGI_TRANSPORTS: pipe,subprocess,http,unix,tcp,http_externalize_always,shm_pipe
+          VGI_CLIENT_DRIVER: ${{ github.workspace }}/conformance/QueryFarm.VgiRpc.ConformanceClientDriver/bin/Release/net10.0/QueryFarm.VgiRpc.ConformanceClientDriver
+          VGI_PYTHON_BIN: python
+          VGI_PY_TESTS_DIR: ${{ github.workspace }}/_conformance/vgi-rpc/tests
+          RUST_CONFORMANCE_WORKER: vgi-rpc-conformance
+        run: python -m pytest test_rust_conformance.py -q
+
+  client-worker-conformance:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - worker: rust
+            server: rust
+            transports: pipe,subprocess,http,unix,tcp,http_externalize_always,shm_pipe
+            worker_path: _conformance/vgi-rpc-rust/target/release/vgi-rpc-conformance-rust
+            pytest_args: ""
+          - worker: java
+            server: java
+            transports: pipe,subprocess,http,unix,tcp,shm_pipe
+            worker_path: _conformance/vgi-rpc-java/conformance-worker/build/install/conformance-worker/bin/conformance-worker
+            pytest_args: >-
+              --deselect=test_rust_conformance.py::TestDescribeConformance::test_run_describe_conformance[http]
+              --deselect=test_rust_conformance.py::TestDescribeConformance::test_describe_via_rpc[http]
+          - worker: go
+            server: go
+            transports: pipe,subprocess,http,unix,tcp,shm_pipe
+            worker_path: _conformance/vgi-rpc-conformance-go
+            pytest_args: ""
+          - worker: typescript
+            server: typescript
+            transports: pipe,subprocess,http,unix,tcp
+            worker_path: conformance/typescript-conformance-worker.ts
+            pytest_args: >-
+              --deselect=test_rust_conformance.py::TestDescribeConformance::test_run_describe_conformance[unix]
+              --deselect=test_rust_conformance.py::TestDescribeConformance::test_run_describe_conformance[tcp]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Query-farm/vgi-rpc-python
+          ref: v0.43.2
+          path: _conformance/vgi-rpc
+      # This repository owns the language-neutral client-role pytest adapter used for every
+      # worker. VGI_CLIENT_DRIVER substitutes the C# JSONL + Arrow IPC driver.
+      - uses: actions/checkout@v4
+        with:
+          repository: Query-farm/vgi-rpc-rust
+          path: _conformance/vgi-rpc-rust
+      - uses: actions/checkout@v4
+        if: matrix.worker == 'java'
+        with:
+          repository: Query-farm/vgi-rpc-java
+          path: _conformance/vgi-rpc-java
+      # vgi-go pins the vgi-rpc-go release whose conformance command is built below.
+      - uses: actions/checkout@v4
+        if: matrix.worker == 'go'
+        with:
+          repository: Query-farm/vgi-go
+          path: _conformance/vgi-go
+      # This is the RPC implementation underlying vgi-typescript. Pin the same release used by
+      # that SDK so the cross-test represents a released worker, not an arbitrary main commit.
+      - uses: actions/checkout@v4
+        if: matrix.worker == 'typescript'
+        with:
+          repository: Query-farm/vgi-rpc-typescript
+          ref: v0.22.0
+          path: _conformance/vgi-rpc-typescript
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-java@v4
+        if: matrix.worker == 'java'
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-go@v5
+        if: matrix.worker == 'go'
+        with:
+          go-version: "1.26"
+          cache-dependency-path: _conformance/vgi-go/go.sum
+      - uses: oven-sh/setup-bun@v2
+        if: matrix.worker == 'typescript'
+        with:
+          bun-version: latest
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.worker == 'rust'
+        with:
+          workspaces: _conformance/vgi-rpc-rust
+      - run: pip install -e "./_conformance/vgi-rpc[conformance,http,external]" pytest
+      - run: dotnet restore conformance/QueryFarm.VgiRpc.ConformanceClientDriver/QueryFarm.VgiRpc.ConformanceClientDriver.csproj
+      - run: dotnet build conformance/QueryFarm.VgiRpc.ConformanceClientDriver/QueryFarm.VgiRpc.ConformanceClientDriver.csproj -c Release --no-restore
+      - name: Build Rust worker
+        if: matrix.worker == 'rust'
+        working-directory: _conformance/vgi-rpc-rust
+        run: cargo build --release --package vgi-rpc-conformance-rust
+      - name: Build Java worker
+        if: matrix.worker == 'java'
+        working-directory: _conformance/vgi-rpc-java
+        run: ./gradlew :conformance-worker:installDist --no-daemon
+      - name: Build Go worker
+        if: matrix.worker == 'go'
+        working-directory: _conformance/vgi-go
+        run: |
+          RPC_VERSION="$(go list -m -f '{{.Version}}' github.com/Query-farm/vgi-rpc-go)"
+          GOBIN="${{ github.workspace }}/_conformance" \
+            go install "github.com/Query-farm/vgi-rpc-go/conformance/cmd/vgi-rpc-conformance-go@${RPC_VERSION}"
+      - name: Install TypeScript worker dependencies
+        if: matrix.worker == 'typescript'
+        working-directory: _conformance/vgi-rpc-typescript
+        run: bun install --frozen-lockfile
+      - name: Drive ${{ matrix.worker }} worker with the C# client
+        working-directory: _conformance/vgi-rpc-rust
+        env:
+          VGI_CONFORMANCE_ROLE: client
+          VGI_CONFORMANCE_SERVER: ${{ matrix.server }}
+          VGI_TRANSPORTS: ${{ matrix.transports }}
+          VGI_CLIENT_DRIVER: ${{ github.workspace }}/conformance/QueryFarm.VgiRpc.ConformanceClientDriver/bin/Release/net10.0/QueryFarm.VgiRpc.ConformanceClientDriver
+          VGI_PYTHON_BIN: python
+          VGI_PY_TESTS_DIR: ${{ github.workspace }}/_conformance/vgi-rpc/tests
+          VGI_TYPESCRIPT_RPC_ROOT: ${{ github.workspace }}/_conformance/vgi-rpc-typescript
+          RUST_CONFORMANCE_WORKER: ${{ github.workspace }}/${{ matrix.worker_path }}
+        # Java intentionally gates HTTP __describe__ behind its --introspect worker mode. TypeScript
+        # 0.22.0 has a narrower describe defect: Unix/TCP omit protocol_version from the response
+        # even though ordinary RPC and the remaining describe assertions pass. The matrix values
+        # deselect only those known worker-side cases; all other client/transport coverage remains.
+        run: python -m pytest test_rust_conformance.py -q ${{ matrix.pytest_args }}

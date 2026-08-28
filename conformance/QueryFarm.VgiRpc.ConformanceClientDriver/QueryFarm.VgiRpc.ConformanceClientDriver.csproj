@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <Description>JSONL bridge used by the canonical Python suite to drive the C# vgi-rpc clients.</Description>
+    <RootNamespace>QueryFarm.VgiRpc.ConformanceClientDriver</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\QueryFarm.VgiRpc.Client\QueryFarm.VgiRpc.Client.csproj" />
+    <ProjectReference Include="..\..\src\QueryFarm.VgiRpc.Client.Http\QueryFarm.VgiRpc.Client.Http.csproj" />
+  </ItemGroup>
+
+</Project>

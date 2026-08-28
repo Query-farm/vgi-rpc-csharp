@@ -25,11 +25,15 @@ public sealed class WireWriter : IAsyncDisposable
     public WireWriter(Stream stream, Schema schema)
     {
         _stream = stream;
+        Schema = schema;
         // leaveOpen: true — the underlying transport stream is shared across many WireWriter/
         // WireReader instances over the lifetime of a connection; only *this* IPC stream's
         // framing (schema..EOS) belongs to us.
         _writer = new ArrowStreamWriter(stream, schema, leaveOpen: true);
     }
+
+    /// <summary>The schema used for every record batch in this logical IPC stream.</summary>
+    public Schema Schema { get; }
 
     /// <summary>Writes the schema message. Idempotent; also called implicitly by the first batch write.</summary>
     public async Task WriteStartAsync(CancellationToken cancellationToken = default)

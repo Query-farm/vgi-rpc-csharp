@@ -23,6 +23,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\QueryFarm.VgiRpc.Client.OAuth\QueryFarm.VgiRpc.Client.OAuth.csproj" />
     <ProjectReference Include="..\..\src\QueryFarm.VgiRpc.Http.OAuth\QueryFarm.VgiRpc.Http.OAuth.csproj" />
   </ItemGroup>
 

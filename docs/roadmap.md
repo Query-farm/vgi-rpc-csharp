@@ -1251,5 +1251,29 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       of the four examples run manually with correct output, including the subprocess example's
       remote-error path and the HTTP example's server+client pair over a real Kestrel listener.
 
+- [x] **M22 — Production native clients.** The client gaps identified in M21 are closed in the
+      dedicated `QueryFarm.VgiRpc.Client`, `.Client.Http`, and `.Client.OAuth` packages. A single
+      transport-neutral reflection proxy now serves persistent byte-stream and stateless HTTP
+      clients, while exact-schema APIs remain available for dynamic protocols. Producer and
+      exchange sessions support headers, per-turn metadata, cancellation, error recovery, and
+      connection reuse. Native transports include subprocess stdio, Unix sockets, TCP, Windows
+      named pipes, and negotiated client-owned shared memory. `WorkerPool` provides bounded,
+      command-keyed LIFO subprocess reuse with idle eviction and metrics.
+
+      The HTTP client implements zstd/gzip request and response coding, 413 upload-URL fallback,
+      external response resolution (including embedded logs and headers), stateless continuation
+      tokens, sticky-session nesting/attach/detach/expiry/drain semantics, TLS/mTLS, capability
+      discovery, and typed/raw calls. The OAuth client implements OIDC discovery, Authorization
+      Code + PKCE, Device Authorization polling, refresh, and bearer injection.
+
+      The C# conformance driver was then used as the client under the canonical Python suite. The
+      complete cross-transport run covered stdio, subprocess, Unix, TCP, HTTP, forced external
+      payloads, and shared-memory pipe. After fixing the HTTP/external parsing gaps it finishes
+      with 1,270 passed and 30 capability-gated skips; that full matrix is the release gate for
+      0.8.0. The existing warmed 50,000-call in-process typed unary benchmark on the Linux ARM64
+      EC2 validation host reports 12,843 calls/s, 46.3 μs p50, and 264.9 μs p99 (small-string
+      Arrow round trips; no network), providing a reproducible post-refactor baseline rather than
+      conflating client API overhead with network latency.
+
 Full rationale for each milestone's sequencing lives in the plan this repo was bootstrapped from;
 see `CLAUDE.md` for where cross-language wire-alignment decisions are recorded as they're made.

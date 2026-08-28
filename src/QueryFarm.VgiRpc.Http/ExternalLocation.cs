@@ -139,12 +139,23 @@ public static class ExternalLocation
     /// <paramref name="batch"/>/<paramref name="metadata"/> unchanged if it isn't one (or
     /// <paramref name="config"/> is <see langword="null"/>). Safe to call on any batch.
     /// </summary>
+    /// <param name="batch">The inline data batch or external-location pointer.</param>
+    /// <param name="metadata">Custom metadata associated with <paramref name="batch"/>.</param>
+    /// <param name="config">External fetch policy, or <see langword="null"/> to leave pointers unresolved.</param>
+    /// <param name="cancellationToken">Cancels fetching and Arrow IPC decoding.</param>
+    /// <param name="onLog">Optional callback for log or error batches embedded in the fetched
+    /// IPC stream. The callback must not retain the batch; its lifetime ends when the callback
+    /// returns.</param>
     /// <exception cref="Errors.RpcException">On fetch failure, checksum mismatch, redirect loop, a
     /// fetched stream with no data batch (or more than one), or a schema mismatch — mirrors
     /// Python's <c>resolve_external_location</c> raising <c>RuntimeError</c>/<c>ValueError</c>,
     /// translated to this port's uniform wire-exception type.</exception>
     public static async Task<(RecordBatch Batch, IReadOnlyDictionary<string, string>? Metadata)> ResolveAsync(
-        RecordBatch batch, IReadOnlyDictionary<string, string>? metadata, ClientExternalConfig? config, CancellationToken cancellationToken = default)
+        RecordBatch batch,
+        IReadOnlyDictionary<string, string>? metadata,
+        ClientExternalConfig? config,
+        CancellationToken cancellationToken = default,
+        Action<AnnotatedBatch>? onLog = null)
     {
         if (config is null || !IsExternalLocationBatch(batch, metadata))
         {
@@ -178,11 +189,17 @@ public static class ExternalLocation
                     throw new Errors.RpcException("RuntimeError", $"Redirect loop detected: fetched batch from {ExternalFetch.RedactUrl(url)} contains vgi_rpc.location");
                 }
 
-                // Log/error batches in the fetched stream are discarded here — this port has no
-                // on_log plumbing threaded through resolution yet (see the class doc comment on scope).
                 if (fetched.Batch.Length == 0 && fetched.Metadata?.ContainsKey(MetadataKeys.LogLevel) == true)
                 {
-                    fetched.Batch.Dispose();
+                    try
+                    {
+                        onLog?.Invoke(fetched);
+                    }
+                    finally
+                    {
+                        fetched.Batch.Dispose();
+                    }
+
                     continue;
                 }
 
@@ -323,9 +340,9 @@ public sealed class ServerExternalConfig
 }
 
 /// <summary>
-/// Client-side (in this port: server-acting-as-a-response-consumer, since conformance drives this
-/// port's server, never its own client — see <c>docs/roadmap.md</c> M13) configuration for
-/// resolving ExternalLocation pointer batches embedded in responses. Covers only the fetch side.
+/// Client-side configuration for resolving ExternalLocation pointer batches embedded in
+/// responses. Used by both the native HTTP client and server-side conformance helpers; covers
+/// only the fetch side.
 /// </summary>
 public sealed class ClientExternalConfig
 {

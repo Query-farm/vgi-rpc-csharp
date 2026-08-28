@@ -22,6 +22,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\QueryFarm.VgiRpc.Client\QueryFarm.VgiRpc.Client.csproj" />
     <ProjectReference Include="..\..\src\QueryFarm.VgiRpc\QueryFarm.VgiRpc.csproj" />
   </ItemGroup>
 

@@ -1,8 +1,8 @@
 namespace QueryFarm.VgiRpc.Transport;
 
 /// <summary>
-/// A duplex byte channel an <see cref="Server.RpcServer"/>/<see cref="Client.RpcConnection{T}"/>
-/// speaks the wire protocol over. Modeled as separate read/write streams (rather than one
+/// A duplex byte channel over which an RPC server or client speaks the wire protocol. Modeled as
+/// separate read/write streams (rather than one
 /// bidirectional <see cref="Stream"/>) because that's the natural shape of every concrete
 /// transport this abstraction needs to cover: subprocess stdio, a Unix domain socket wrapped in
 /// a <see cref="System.Net.Sockets.NetworkStream"/> (which IS one bidirectional stream — assign

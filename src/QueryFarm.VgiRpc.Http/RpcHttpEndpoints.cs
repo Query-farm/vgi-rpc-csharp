@@ -177,7 +177,7 @@ public static class RpcHttpEndpoints
         return endpoints;
     }
 
-    private static readonly Schema s_uploadUrlParamsSchema = new([new Field("count", Apache.Arrow.Types.Int64Type.Default, nullable: false)], metadata: null);
+    private static readonly Schema s_uploadUrlParamsSchema = new([new Field("count", Apache.Arrow.Types.Int64Type.Default, nullable: true)], metadata: null);
     private static readonly Schema s_uploadUrlResultSchema = new(
         [
             new Field("upload_url", Apache.Arrow.Types.StringType.Default, nullable: false),

@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>OAuth 2.0/OIDC client helpers for vgi-rpc, including Authorization Code + PKCE and Device Authorization grants.</Description>
+    <RootNamespace>QueryFarm.VgiRpc.Client.OAuth</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
+  </ItemGroup>
+
+</Project>

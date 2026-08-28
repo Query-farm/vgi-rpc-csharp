@@ -7,6 +7,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\QueryFarm.VgiRpc.Client\QueryFarm.VgiRpc.Client.csproj" />
     <ProjectReference Include="..\QueryFarm.VgiRpc.Benchmark\QueryFarm.VgiRpc.Benchmark.csproj" />
   </ItemGroup>
 

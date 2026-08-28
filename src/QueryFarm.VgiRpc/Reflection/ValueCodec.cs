@@ -228,16 +228,53 @@ public static class ValueCodec
             Time64Type time64Type => nullRow ? new Time64Array.Builder(time64Type).AppendNull().Build() : new Time64Array.Builder(time64Type).Build(),
             DurationType durationType => nullRow ? new DurationArray.Builder(durationType).AppendNull().Build() : new DurationArray.Builder(durationType).Build(),
             Decimal128Type decimal128Type => nullRow ? new Decimal128Array.Builder(decimal128Type).AppendNull().Build() : new Decimal128Array.Builder(decimal128Type).Build(),
-            ListType listType => nullRow ? BuildListArray(listType, null) : BuildListArray(listType, System.Array.Empty<object>()),
+            // BuildListArray(empty-enumerable) means one row whose value is an empty list. A
+            // zero-row record batch needs a genuinely zero-length list array instead; confusing
+            // those two shapes produced a RecordBatch declared length=0 with a list column of
+            // length=1, which Arrow .NET permits but every foreign Arrow reader correctly rejects.
+            ListType listType => nullRow ? BuildListArray(listType, null) : BuildZeroRowListArray(listType),
             StructType structType => nullRow ? BuildStructArray(structType, value: null, isEmpty: false) : BuildStructArray(structType, value: null, isEmpty: true),
             DictionaryType dictType => nullRow
                 ? new DictionaryArray(dictType, new Int16Array.Builder().AppendNull().Build(), new StringArray.Builder().Build())
                 : new DictionaryArray(dictType, new Int16Array.Builder().Build(), new StringArray.Builder().Build()),
-            MapType mapType => nullRow ? BuildMapArray(mapType, null) : BuildMapArray(mapType, new System.Collections.Hashtable()),
+            MapType mapType => nullRow ? BuildMapArray(mapType, null) : BuildZeroRowMapArray(mapType),
             var other => throw NotSupportedYet(other),
         };
 
     private static IArrowArray BuildEmptyArray(IArrowType type) => BuildEmptyArrayOrNull(type, nullRow: false);
+
+    private static IArrowArray BuildZeroRowListArray(ListType listType)
+    {
+        var values = BuildEmptyArray(listType.ValueDataType);
+        var offsets = new ArrowBuffer.Builder<int>().Append(0).Build();
+        var data = new ArrayData(
+            listType,
+            length: 0,
+            nullCount: 0,
+            0,
+            [Apache.Arrow.ArrowBuffer.Empty, offsets],
+            [values.Data]);
+        return new ListArray(data);
+    }
+
+    private static IArrowArray BuildZeroRowMapArray(MapType mapType)
+    {
+        var entryType = new StructType([mapType.KeyField, mapType.ValueField]);
+        var entries = new StructArray(
+            entryType,
+            length: 0,
+            [BuildEmptyArray(mapType.KeyField.DataType), BuildEmptyArray(mapType.ValueField.DataType)],
+            Apache.Arrow.ArrowBuffer.Empty);
+        var offsets = new ArrowBuffer.Builder<int>().Append(0).Build();
+        var data = new ArrayData(
+            mapType,
+            length: 0,
+            nullCount: 0,
+            0,
+            [Apache.Arrow.ArrowBuffer.Empty, offsets],
+            [entries.Data]);
+        return new MapArray(data);
+    }
 
     private static IArrowArray BuildListArray(ListType listType, System.Collections.IEnumerable? items)
     {
