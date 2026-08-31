@@ -1,6 +1,6 @@
+using System.IO.Pipes;
 using System.Net;
 using System.Net.Sockets;
-using System.IO.Pipes;
 using System.Text;
 using QueryFarm.VgiRpc.Http;
 using QueryFarm.VgiRpc.Identity;

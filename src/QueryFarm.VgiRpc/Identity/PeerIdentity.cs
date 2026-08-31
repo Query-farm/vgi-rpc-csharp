@@ -268,14 +268,18 @@ public sealed class PeerEvidenceSet
 
     private static string Wire(PeerIdentityStatus value) => value switch
     {
-        PeerIdentityStatus.NotApplicable => "not_applicable", PeerIdentityStatus.PermissionDenied => "permission_denied",
-        PeerIdentityStatus.NoMatch => "no_match", PeerIdentityStatus.UntrustedProxy => "untrusted_proxy",
+        PeerIdentityStatus.NotApplicable => "not_applicable",
+        PeerIdentityStatus.PermissionDenied => "permission_denied",
+        PeerIdentityStatus.NoMatch => "no_match",
+        PeerIdentityStatus.UntrustedProxy => "untrusted_proxy",
         _ => value.ToString().ToLowerInvariant(),
     };
     private static string Wire(IdentityAssurance value) => value switch
     {
-        IdentityAssurance.CryptographicPeer => "cryptographic_peer", IdentityAssurance.LocalDaemon => "local_daemon",
-        IdentityAssurance.ConfiguredProxy => "configured_proxy", _ => throw new ArgumentOutOfRangeException(nameof(value)),
+        IdentityAssurance.CryptographicPeer => "cryptographic_peer",
+        IdentityAssurance.LocalDaemon => "local_daemon",
+        IdentityAssurance.ConfiguredProxy => "configured_proxy",
+        _ => throw new ArgumentOutOfRangeException(nameof(value)),
     };
     private static string Wire(PeerSubjectKind value) => value == PeerSubjectKind.TaggedNode ? "tagged_node" : value.ToString().ToLowerInvariant();
     private static string Wire(SubjectStability value) => value.ToString().ToLowerInvariant();

@@ -1,7 +1,7 @@
+using System.Text.Json;
 using QueryFarm.VgiRpc.Identity;
 using QueryFarm.VgiRpc.Logging;
 using QueryFarm.VgiRpc.Server;
-using System.Text.Json;
 using Xunit;
 
 namespace QueryFarm.VgiRpc.Tests.Identity;

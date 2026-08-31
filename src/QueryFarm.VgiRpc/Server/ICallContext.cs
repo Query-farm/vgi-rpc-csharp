@@ -1,6 +1,6 @@
 using QueryFarm.VgiRpc.Errors;
-using QueryFarm.VgiRpc.Logging;
 using QueryFarm.VgiRpc.Identity;
+using QueryFarm.VgiRpc.Logging;
 
 namespace QueryFarm.VgiRpc.Server;
 

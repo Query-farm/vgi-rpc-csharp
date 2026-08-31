@@ -95,7 +95,8 @@ public sealed class TailscaleLocalApiProvider : IPeerIdentityProvider
         }
         catch (TailscaleLocalApiPermissionException) { return Result(PeerIdentityStatus.PermissionDenied); }
         catch (Exception exception) when (exception is HttpRequestException or IOException
-            or OperationCanceledException) { return Result(PeerIdentityStatus.Unavailable); }
+            or OperationCanceledException)
+        { return Result(PeerIdentityStatus.Unavailable); }
         catch (Exception exception) when (exception is JsonException or ArgumentException)
         { return Result(PeerIdentityStatus.Invalid); }
     }

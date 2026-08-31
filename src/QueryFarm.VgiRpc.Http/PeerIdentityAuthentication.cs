@@ -72,132 +72,132 @@ public static class PeerIdentityAuthentication
         var providerSlots = new SemaphoreSlim(maxProviderConcurrency, maxProviderConcurrency);
         return async context =>
         {
-        AuthFailure? missing = null;
-        if (applicationAuthenticate is not null)
-        {
-            try
+            AuthFailure? missing = null;
+            if (applicationAuthenticate is not null)
             {
-                await applicationAuthenticate(context).ConfigureAwait(false);
+                try
+                {
+                    await applicationAuthenticate(context).ConfigureAwait(false);
+                }
+                catch (AuthFailure failure) when (failure.Reason == AuthReason.MissingCredential)
+                {
+                    missing = failure;
+                }
             }
-            catch (AuthFailure failure) when (failure.Reason == AuthReason.MissingCredential)
-            {
-                missing = failure;
-            }
-        }
 
-        var identity = AuthIdentity.GetFrom(context);
-        var existing = identity is null
-            ? AuthContext.Anonymous
-            : new AuthContext(identity.Domain, identity.Authenticated, identity.Principal);
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
-        deadline.CancelAfter(providerTimeout);
-        var headers = context.Request.Headers.ToDictionary(
-            pair => pair.Key,
-            pair => (IReadOnlyList<string>)Array.AsReadOnly(pair.Value.Select(value => value ?? "").ToArray()),
-            StringComparer.OrdinalIgnoreCase);
-        var physical = context.Items[PhysicalPeerItem] as PhysicalConnection;
-        var resolution = physical is null ? null : new PeerResolutionContext(
-            "http",
-            physical.RemoteAddress,
-            destinationAddress: FormatAddress(physical.LocalAddress, physical.LocalPort),
-            authority: context.Request.Host.Value,
-            serviceName: serviceName,
-            headers: headers,
-            metadata: new Dictionary<string, object?> { ["request_path"] = context.Request.Path.Value ?? "" },
-            deadline: DateTimeOffset.UtcNow + providerTimeout,
-            sourceEndpoint: FormatAddress(physical.RemoteAddress, physical.RemotePort));
-        var results = resolution is null
-            ? providers.Select(provider =>
-                new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Unavailable)).ToArray()
-            : await Task.WhenAll(providers.Select(async provider =>
-        {
-            if (!await providerSlots.WaitAsync(0, context.RequestAborted).ConfigureAwait(false))
-                return new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Unavailable);
-            Task<PeerIdentityResult> providerTask;
+            var identity = AuthIdentity.GetFrom(context);
+            var existing = identity is null
+                ? AuthContext.Anonymous
+                : new AuthContext(identity.Domain, identity.Authenticated, identity.Principal);
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
+            deadline.CancelAfter(providerTimeout);
+            var headers = context.Request.Headers.ToDictionary(
+                pair => pair.Key,
+                pair => (IReadOnlyList<string>)Array.AsReadOnly(pair.Value.Select(value => value ?? "").ToArray()),
+                StringComparer.OrdinalIgnoreCase);
+            var physical = context.Items[PhysicalPeerItem] as PhysicalConnection;
+            var resolution = physical is null ? null : new PeerResolutionContext(
+                "http",
+                physical.RemoteAddress,
+                destinationAddress: FormatAddress(physical.LocalAddress, physical.LocalPort),
+                authority: context.Request.Host.Value,
+                serviceName: serviceName,
+                headers: headers,
+                metadata: new Dictionary<string, object?> { ["request_path"] = context.Request.Path.Value ?? "" },
+                deadline: DateTimeOffset.UtcNow + providerTimeout,
+                sourceEndpoint: FormatAddress(physical.RemoteAddress, physical.RemotePort));
+            var results = resolution is null
+                ? providers.Select(provider =>
+                    new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Unavailable)).ToArray()
+                : await Task.WhenAll(providers.Select(async provider =>
+            {
+                if (!await providerSlots.WaitAsync(0, context.RequestAborted).ConfigureAwait(false))
+                    return new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Unavailable);
+                Task<PeerIdentityResult> providerTask;
+                try
+                {
+                    providerTask = provider.ResolveAsync(resolution, deadline.Token).AsTask();
+                }
+                catch (PeerIdentityRejectedException)
+                {
+                    providerSlots.Release();
+                    return new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Invalid);
+                }
+                catch (PeerIdentityUnavailableException)
+                {
+                    providerSlots.Release();
+                    return new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Unavailable);
+                }
+                catch
+                {
+                    providerSlots.Release();
+                    throw new InvalidOperationException("peer identity provider failed");
+                }
+                try
+                {
+                    var result = await providerTask.WaitAsync(providerTimeout, context.RequestAborted).ConfigureAwait(false);
+                    if (result is null || !StringComparer.Ordinal.Equals(provider.Provider, result.Provider))
+                        throw new InvalidOperationException("peer identity provider result mismatch");
+                    providerSlots.Release();
+                    return result;
+                }
+                catch (TimeoutException)
+                {
+                    ReleaseProviderSlotWhenComplete(providerTask, providerSlots);
+                    return new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Unavailable);
+                }
+                catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested)
+                {
+                    if (providerTask.IsCompleted) providerSlots.Release();
+                    else ReleaseProviderSlotWhenComplete(providerTask, providerSlots);
+                    return new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Unavailable);
+                }
+                catch (OperationCanceledException)
+                {
+                    if (providerTask.IsCompleted) providerSlots.Release();
+                    else ReleaseProviderSlotWhenComplete(providerTask, providerSlots);
+                    throw;
+                }
+                catch (PeerIdentityRejectedException)
+                {
+                    providerSlots.Release();
+                    return new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Invalid);
+                }
+                catch (PeerIdentityUnavailableException)
+                {
+                    providerSlots.Release();
+                    return new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Unavailable);
+                }
+                catch
+                {
+                    providerSlots.Release();
+                    throw new InvalidOperationException("peer identity provider failed");
+                }
+            })).ConfigureAwait(false);
+
+            var evidence = new PeerEvidenceSet(results);
+            AuthContext auth;
             try
             {
-                providerTask = provider.ResolveAsync(resolution, deadline.Token).AsTask();
+                auth = await policy(evidence, existing).ConfigureAwait(false);
             }
             catch (PeerIdentityRejectedException)
             {
-                providerSlots.Release();
-                return new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Invalid);
+                throw new AuthFailure(AuthReason.InvalidCredential, "peer identity rejected");
             }
-            catch (PeerIdentityUnavailableException)
+            catch (PeerIdentityUnavailableException unavailable)
             {
-                providerSlots.Release();
-                return new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Unavailable);
+                throw new PeerIdentityUnavailableException(
+                    "peer identity unavailable", unavailable.RetryAfterSeconds);
             }
-            catch
+            if (missing is not null && !auth.Authenticated) throw missing;
+            context.Items[AuthItem] = auth;
+            context.Items[EvidenceItem] = evidence;
+            var binding = EvidenceBinding(auth);
+            if (auth.Authenticated || binding is not null)
             {
-                providerSlots.Release();
-                throw new InvalidOperationException("peer identity provider failed");
+                AuthIdentity.SetOn(context, auth.Domain, auth.Principal ?? "", binding, auth.Authenticated);
             }
-            try
-            {
-                var result = await providerTask.WaitAsync(providerTimeout, context.RequestAborted).ConfigureAwait(false);
-                if (result is null || !StringComparer.Ordinal.Equals(provider.Provider, result.Provider))
-                    throw new InvalidOperationException("peer identity provider result mismatch");
-                providerSlots.Release();
-                return result;
-            }
-            catch (TimeoutException)
-            {
-                ReleaseProviderSlotWhenComplete(providerTask, providerSlots);
-                return new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Unavailable);
-            }
-            catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested)
-            {
-                if (providerTask.IsCompleted) providerSlots.Release();
-                else ReleaseProviderSlotWhenComplete(providerTask, providerSlots);
-                return new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Unavailable);
-            }
-            catch (OperationCanceledException)
-            {
-                if (providerTask.IsCompleted) providerSlots.Release();
-                else ReleaseProviderSlotWhenComplete(providerTask, providerSlots);
-                throw;
-            }
-            catch (PeerIdentityRejectedException)
-            {
-                providerSlots.Release();
-                return new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Invalid);
-            }
-            catch (PeerIdentityUnavailableException)
-            {
-                providerSlots.Release();
-                return new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Unavailable);
-            }
-            catch
-            {
-                providerSlots.Release();
-                throw new InvalidOperationException("peer identity provider failed");
-            }
-        })).ConfigureAwait(false);
-
-        var evidence = new PeerEvidenceSet(results);
-        AuthContext auth;
-        try
-        {
-            auth = await policy(evidence, existing).ConfigureAwait(false);
-        }
-        catch (PeerIdentityRejectedException)
-        {
-            throw new AuthFailure(AuthReason.InvalidCredential, "peer identity rejected");
-        }
-        catch (PeerIdentityUnavailableException unavailable)
-        {
-            throw new PeerIdentityUnavailableException(
-                "peer identity unavailable", unavailable.RetryAfterSeconds);
-        }
-        if (missing is not null && !auth.Authenticated) throw missing;
-        context.Items[AuthItem] = auth;
-        context.Items[EvidenceItem] = evidence;
-        var binding = EvidenceBinding(auth);
-        if (auth.Authenticated || binding is not null)
-        {
-            AuthIdentity.SetOn(context, auth.Domain, auth.Principal ?? "", binding, auth.Authenticated);
-        }
         };
     }
 

@@ -9,8 +9,8 @@ using QueryFarm.VgiRpc.Client;
 using QueryFarm.VgiRpc.Http;
 using QueryFarm.VgiRpc.Logging;
 using QueryFarm.VgiRpc.Reflection;
-using QueryFarm.VgiRpc.Wire;
 using QueryFarm.VgiRpc.Transport;
+using QueryFarm.VgiRpc.Wire;
 
 namespace QueryFarm.VgiRpc.Client.Http;
 
