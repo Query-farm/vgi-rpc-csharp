@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>QueryFarm.VgiRpc.Tailnet</RootNamespace>
+    <Description>Live-Tailnet qualification adapter for the C# vgi-rpc client and HTTP Serve worker.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="..\..\src\QueryFarm.VgiRpc.Client\QueryFarm.VgiRpc.Client.csproj" />
+    <ProjectReference Include="..\..\src\QueryFarm.VgiRpc.Client.Http\QueryFarm.VgiRpc.Client.Http.csproj" />
+    <ProjectReference Include="..\..\src\QueryFarm.VgiRpc.Http\QueryFarm.VgiRpc.Http.csproj" />
+  </ItemGroup>
+
+</Project>

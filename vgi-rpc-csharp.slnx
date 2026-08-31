@@ -7,6 +7,7 @@
     <Project Path="conformance/QueryFarm.VgiRpc.ConformanceClientDriver/QueryFarm.VgiRpc.ConformanceClientDriver.csproj" />
     <Project Path="conformance/QueryFarm.VgiRpc.Conformance/QueryFarm.VgiRpc.Conformance.csproj" />
     <Project Path="conformance/QueryFarm.VgiRpc.ConformanceWorker/QueryFarm.VgiRpc.ConformanceWorker.csproj" />
+    <Project Path="conformance/QueryFarm.VgiRpc.Tailnet/QueryFarm.VgiRpc.Tailnet.csproj" />
   </Folder>
   <Folder Name="/examples/">
     <Project Path="examples/01-hello-world/HelloWorld.csproj" />

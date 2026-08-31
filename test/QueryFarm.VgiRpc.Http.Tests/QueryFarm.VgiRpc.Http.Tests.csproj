@@ -23,6 +23,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\conformance\QueryFarm.VgiRpc.Tailnet\QueryFarm.VgiRpc.Tailnet.csproj" />
     <ProjectReference Include="..\..\src\QueryFarm.VgiRpc.Client.Http\QueryFarm.VgiRpc.Client.Http.csproj" />
     <ProjectReference Include="..\..\src\QueryFarm.VgiRpc.Http\QueryFarm.VgiRpc.Http.csproj" />
   </ItemGroup>
