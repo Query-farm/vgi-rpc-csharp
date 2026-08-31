@@ -148,6 +148,13 @@ public sealed class SocketTransport : IRpcTransport, IDisposable
         return new SocketTransport(socket);
     }
 
+    /// <summary>Dials TCP through an explicit credential-free SOCKS5h proxy.</summary>
+    public static async Task<IRpcTransport> ConnectTcpAsync(
+        string host, int port, string proxy, TimeSpan connectTimeout,
+        CancellationToken cancellationToken = default) =>
+        new SocketTransport(await Socks5h.ConnectAsync(host, port, proxy, connectTimeout, cancellationToken)
+            .ConfigureAwait(false));
+
     private static void WidenUnixSocketBuffers(Socket socket)
     {
         try

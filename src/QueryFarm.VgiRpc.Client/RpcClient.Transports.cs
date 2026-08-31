@@ -27,6 +27,16 @@ public sealed partial class RpcClient
         CancellationToken cancellationToken = default) =>
         new(await SocketTransport.ConnectTcpAsync(host, port, cancellationToken).ConfigureAwait(false), options);
 
+    public static async Task<RpcClient> ConnectTcpAsync(
+        string host,
+        int port,
+        string proxy,
+        TimeSpan connectTimeout,
+        RpcClientOptions? options = null,
+        CancellationToken cancellationToken = default) =>
+        new(await SocketTransport.ConnectTcpAsync(host, port, proxy, connectTimeout, cancellationToken)
+            .ConfigureAwait(false), options);
+
     public static async Task<RpcClient> ConnectNamedPipeAsync(
         string pipeName,
         string serverName = ".",

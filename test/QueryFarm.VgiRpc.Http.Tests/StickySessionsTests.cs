@@ -76,9 +76,51 @@ public class StickySessionsTests
     }
 
     [Fact]
+    public void ComputeAad_PeerEvidenceBindingPreventsReplay()
+    {
+        var first = StickySessions.ComputeAad(new AuthIdentity("d", "alice", "binding-a"));
+        var second = StickySessions.ComputeAad(new AuthIdentity("d", "alice", "binding-b"));
+
+        Assert.NotEqual(first, second);
+        var sessionId = System.Security.Cryptography.RandomNumberGenerator.GetBytes(12);
+        var token = StickySessions.SealToken("server-1", sessionId, 0, s_key, first);
+        Assert.Throws<SessionLostException>(() => StickySessions.OpenToken(token, s_key, second));
+    }
+
+    [Fact]
+    public void ComputeAad_AnonymousPeerEvidenceBindingPreventsReplay()
+    {
+        var first = new AuthIdentity("", "", "binding-a", Authenticated: false);
+        var second = first with { PeerEvidenceBinding = "binding-b" };
+
+        Assert.NotEqual(StickySessions.ComputeAad(null), StickySessions.ComputeAad(first));
+        Assert.NotEqual(StickySessions.ComputeAad(first), StickySessions.ComputeAad(second));
+        Assert.NotEqual(StickySessions.PrincipalKey(first), StickySessions.PrincipalKey(second));
+    }
+
+    [Fact]
+    public void ComputeCallAad_IsDomainSeparatedAndPeerBound()
+    {
+        var identity = new AuthIdentity("d", "alice", "binding-a");
+
+        Assert.NotEqual(StickySessions.ComputeAad(identity), StickySessions.ComputeCallAad(identity));
+        Assert.NotEqual(
+            StickySessions.ComputeCallAad(identity),
+            StickySessions.ComputeCallAad(identity with { PeerEvidenceBinding = "binding-b" }));
+    }
+
+    [Fact]
     public void PrincipalKey_AnonymousVsAuthenticated_Differ()
     {
         Assert.NotEqual(StickySessions.PrincipalKey(null), StickySessions.PrincipalKey(new AuthIdentity("d", "alice")));
+    }
+
+    [Fact]
+    public void PrincipalKey_IncludesPeerEvidenceBinding()
+    {
+        Assert.NotEqual(
+            StickySessions.PrincipalKey(new AuthIdentity("d", "alice", "binding-a")),
+            StickySessions.PrincipalKey(new AuthIdentity("d", "alice", "binding-b")));
     }
 
     // -------------------------------------------------------------------

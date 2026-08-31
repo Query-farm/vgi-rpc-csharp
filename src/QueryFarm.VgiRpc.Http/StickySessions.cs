@@ -53,12 +53,13 @@ public static class StickySessions
 
     // AAD prefix — deliberately the SAME literal Python's stream-state token and session token
     // share (spec §3: "Both Python's stream token and the session token share the same envelope
-    // construction"). This port's own stream/call tokens (StreamCallRegistry) don't yet bind a
-    // principal (aad: [] — a pre-existing gap predating auth support), so this prefix is
-    // currently exclusive to sticky-session tokens in this port; reusing Python's literal keeps
-    // the AAD *shape* documented by the spec even though no cross-token-type collision is
-    // possible here yet.
+    // construction"). The v5 prefix adds the verified peer-evidence digest after the stable
+    // application/peer principal, preventing a token issued under one transport identity from
+    // being replayed after the surrounding evidence changes.
     private static readonly byte[] s_aadPrefix = System.Text.Encoding.ASCII.GetBytes("vgi_rpc.state.v4\0");
+    private static readonly byte[] s_boundAadPrefix = System.Text.Encoding.ASCII.GetBytes("vgi_rpc.state.v5\0");
+    private static readonly byte[] s_callAadPrefix = System.Text.Encoding.ASCII.GetBytes("vgi_rpc.call.v1\0");
+    private static readonly byte[] s_boundCallAadPrefix = System.Text.Encoding.ASCII.GetBytes("vgi_rpc.call.v2\0");
 
     /// <summary>
     /// Computes the AAD binding a session token to its issuing principal — mirrors Python's
@@ -67,13 +68,34 @@ public static class StickySessions
     /// <c>Principal</c> feed the AAD — never volatile claims (spec §3.1).
     /// </summary>
     public static byte[] ComputeAad(AuthIdentity? identity)
+        => ComputeIdentityAad(identity, s_aadPrefix, s_boundAadPrefix);
+
+    /// <summary>Computes principal/evidence AAD for stream call tokens. Its distinct prefix
+    /// prevents a call token from being accepted as a state/sticky token.</summary>
+    public static byte[] ComputeCallAad(AuthIdentity? identity)
+        => ComputeIdentityAad(identity, s_callAadPrefix, s_boundCallAadPrefix);
+
+    private static byte[] ComputeIdentityAad(AuthIdentity? identity, byte[] legacyPrefix, byte[] boundPrefix)
     {
-        if (identity is null)
+        if (identity is null || !identity.Authenticated)
         {
-            return [.. s_aadPrefix, 0, .. "anonymous"u8];
+            var anonymous = new List<byte>([.. (identity?.PeerEvidenceBinding is null ? legacyPrefix : boundPrefix), 0, .. "anonymous"u8]);
+            if (identity?.PeerEvidenceBinding is not null)
+            {
+                anonymous.Add(0);
+                anonymous.AddRange(System.Text.Encoding.UTF8.GetBytes(identity.PeerEvidenceBinding));
+            }
+            return [.. anonymous];
         }
 
-        return [.. s_aadPrefix, 1, .. System.Text.Encoding.UTF8.GetBytes(identity.Domain), 0, .. System.Text.Encoding.UTF8.GetBytes(identity.Principal)];
+        var prefix = identity.PeerEvidenceBinding is null ? legacyPrefix : boundPrefix;
+        var aad = new List<byte>([.. prefix, 1, .. System.Text.Encoding.UTF8.GetBytes(identity.Domain), 0, .. System.Text.Encoding.UTF8.GetBytes(identity.Principal)]);
+        if (identity.PeerEvidenceBinding is not null)
+        {
+            aad.Add(0);
+            aad.AddRange(System.Text.Encoding.UTF8.GetBytes(identity.PeerEvidenceBinding));
+        }
+        return [.. aad];
     }
 
     /// <summary>Seals a session token. Returns the value for the <see cref="SessionHeader"/>.</summary>
@@ -153,7 +175,11 @@ public static class StickySessions
     /// AAD already makes cross-principal replay fail decryption, so this is a belt-and-braces
     /// registry-level check, not the primary control.</summary>
     public static string PrincipalKey(AuthIdentity? identity) =>
-        identity is null ? "\0anonymous" : $"{identity.Domain}\0{identity.Principal}";
+        identity is null || !identity.Authenticated
+            ? identity?.PeerEvidenceBinding is { } binding ? $"\0anonymous\0{binding}" : "\0anonymous"
+            : identity.PeerEvidenceBinding is null
+            ? $"{identity.Domain}\0{identity.Principal}"
+            : $"{identity.Domain}\0{identity.Principal}\0{identity.PeerEvidenceBinding}";
 }
 
 /// <summary>
@@ -171,12 +197,21 @@ public static class StickySessions
 /// <see cref="SetOn"/> after successful validation; the conformance worker's
 /// <c>--sticky-auth</c> flag does exactly that as a worked example.</para>
 /// </summary>
-public sealed record AuthIdentity(string Domain, string Principal)
+public sealed record AuthIdentity(
+    string Domain,
+    string Principal,
+    string? PeerEvidenceBinding = null,
+    bool Authenticated = true)
 {
     private const string ItemsKey = "vgi_rpc.auth.identity";
 
-    public static void SetOn(HttpContext context, string domain, string principal) =>
-        context.Items[ItemsKey] = new AuthIdentity(domain, principal);
+    public static void SetOn(
+        HttpContext context,
+        string domain,
+        string principal,
+        string? peerEvidenceBinding = null,
+        bool authenticated = true) =>
+        context.Items[ItemsKey] = new AuthIdentity(domain, principal, peerEvidenceBinding, authenticated);
 
     public static AuthIdentity? GetFrom(HttpContext context) => context.Items[ItemsKey] as AuthIdentity;
 }

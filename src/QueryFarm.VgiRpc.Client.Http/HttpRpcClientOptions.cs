@@ -23,6 +23,12 @@ public sealed class HttpRpcClientOptions
     public X509Certificate2? ClientCertificate { get; init; }
 
     public bool FollowRedirects { get; init; } = true;
+
+    /// <summary>Explicit credential-free <c>socks5h://host:port</c> proxy.</summary>
+    public string? TcpProxy { get; init; }
+
+    /// <summary>One setup deadline for proxy DNS, connect, negotiation, and target connect.</summary>
+    public TimeSpan ConnectTimeout { get; init; } = TimeSpan.FromSeconds(10);
 }
 
 public sealed record HttpServerCapabilities(

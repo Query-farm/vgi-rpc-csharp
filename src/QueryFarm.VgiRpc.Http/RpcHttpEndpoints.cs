@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using QueryFarm.VgiRpc.AccessLog;
 using QueryFarm.VgiRpc.Errors;
+using QueryFarm.VgiRpc.Identity;
 using QueryFarm.VgiRpc.Logging;
 using QueryFarm.VgiRpc.Reflection;
 using QueryFarm.VgiRpc.Server;
@@ -402,6 +403,17 @@ public static class RpcHttpEndpoints
             await UnauthorizedResponseWriter.WriteAsync(context, failure.Reason, failure.Detail, proxyHint, context.RequestAborted).ConfigureAwait(false);
             return true;
         }
+        catch (PeerIdentityUnavailableException unavailable)
+        {
+            context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            context.Response.ContentType = "application/json";
+            context.Response.Headers.CacheControl = "no-store";
+            context.Response.Headers.RetryAfter = unavailable.RetryAfterSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            await context.Response.WriteAsJsonAsync(
+                new { error = "peer_identity_unavailable", detail = unavailable.Message },
+                context.RequestAborted).ConfigureAwait(false);
+            return true;
+        }
         catch (Exception)
         {
             await UnauthorizedResponseWriter.WriteAsync(context, AuthReason.Unauthorized, "", proxyHint, context.RequestAborted).ConfigureAwait(false);
@@ -734,7 +746,12 @@ public static class RpcHttpEndpoints
         var status = "ok";
         var errorType = "";
         var errorMessage = "";
-        var callContext = info.HasContextParameter ? new BufferedHttpCallContext(stickyState) : null;
+        var callContext = info.HasContextParameter
+            ? new BufferedHttpCallContext(
+                stickyState,
+                PeerIdentityAuthentication.GetAuth(context),
+                PeerIdentityAuthentication.GetEvidence(context))
+            : null;
 
         var responseBuffer = new MemoryStream();
         try
@@ -969,7 +986,12 @@ public static class RpcHttpEndpoints
         }
 
         var start = Stopwatch.GetTimestamp();
-        var invokeContext = info.HasContextParameter ? new BufferedHttpCallContext(stickyState) : null;
+        var invokeContext = info.HasContextParameter
+            ? new BufferedHttpCallContext(
+                stickyState,
+                PeerIdentityAuthentication.GetAuth(context),
+                PeerIdentityAuthentication.GetEvidence(context))
+            : null;
 
         IRpcStream stream;
         try
@@ -986,8 +1008,13 @@ public static class RpcHttpEndpoints
             return;
         }
 
-        var callKey = registry.Register(stream);
-        var tokenBase64 = Convert.ToBase64String(Crypto.Seal(Convert.FromHexString(callKey), tokenKey, aad: []));
+        var callIdentity = AuthIdentity.GetFrom(context);
+        var callPrincipalKey = StickySessions.PrincipalKey(callIdentity);
+        var callKey = registry.Register(stream, callPrincipalKey);
+        var tokenBase64 = Convert.ToBase64String(Crypto.Seal(
+            Convert.FromHexString(callKey),
+            tokenKey,
+            StickySessions.ComputeCallAad(callIdentity)));
 
         var responseBuffer = new MemoryStream();
 
@@ -1033,7 +1060,11 @@ public static class RpcHttpEndpoints
         using OutputCollector? tickCollector = isProducer ? new OutputCollector(outputSchema) : null;
         if (isProducer)
         {
-            var tickContext = new StreamHttpCallContext(tickCollector!, stickyState);
+            var tickContext = new StreamHttpCallContext(
+                tickCollector!,
+                stickyState,
+                PeerIdentityAuthentication.GetAuth(context),
+                PeerIdentityAuthentication.GetEvidence(context));
             try
             {
                 using var tickBatch = ValueCodec.EmptyRow(s_emptySchema);
@@ -1236,7 +1267,10 @@ public static class RpcHttpEndpoints
         string callKey;
         try
         {
-            callKey = Convert.ToHexStringLower(Crypto.Open(Convert.FromBase64String(tokenB64), tokenKey, aad: []));
+            callKey = Convert.ToHexStringLower(Crypto.Open(
+                Convert.FromBase64String(tokenB64),
+                tokenKey,
+                StickySessions.ComputeCallAad(AuthIdentity.GetFrom(context))));
         }
         catch (Exception)
         {
@@ -1244,7 +1278,7 @@ public static class RpcHttpEndpoints
             return;
         }
 
-        if (!registry.TryGet(callKey, out var stream))
+        if (!registry.TryGet(callKey, StickySessions.PrincipalKey(AuthIdentity.GetFrom(context)), out var stream))
         {
             await ErrorResultAsync(server, method, new SessionLostException("No active stream for this token — it may have expired, been cancelled, or this server process restarted."), StatusCodes.Status500InternalServerError, s_emptySchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
             return;
@@ -1335,7 +1369,11 @@ public static class RpcHttpEndpoints
         // StreamState reading ctx.Session (sticky sessions) needs a real object here regardless of
         // whether the constructor method itself took a ctx param — mirrors the same fix in
         // RpcServer.ServeStreamAsync's own turnContext construction.
-        var turnContext = new StreamHttpCallContext(collector, stickyState);
+        var turnContext = new StreamHttpCallContext(
+            collector,
+            stickyState,
+            PeerIdentityAuthentication.GetAuth(context),
+            PeerIdentityAuthentication.GetEvidence(context));
         Exception? turnException = null;
         try
         {
@@ -1674,9 +1712,16 @@ public static class RpcHttpEndpoints
     /// shape (duplicated rather than shared since that one isn't part of the core assembly's
     /// public/internal surface).
     /// </summary>
-    private sealed class BufferedHttpCallContext(StickyCallState? sticky = null) : Server.ICallContext
+    private sealed class BufferedHttpCallContext(
+        StickyCallState? sticky = null,
+        AuthContext? auth = null,
+        PeerEvidenceSet? peerEvidence = null) : Server.ICallContext
     {
         public List<LogMessage> Buffered { get; } = [];
+
+        public AuthContext Auth { get; } = auth ?? AuthContext.Anonymous;
+
+        public PeerEvidenceSet PeerEvidence { get; } = peerEvidence ?? PeerEvidenceSet.Empty;
 
         public void EmitLog(VgiLogLevel level, string message, IReadOnlyDictionary<string, object?>? extra = null) =>
             Buffered.Add(new LogMessage(level, message, extra));
@@ -1695,8 +1740,16 @@ public static class RpcHttpEndpoints
     /// <summary>Forwards a stream turn's <see cref="Server.ICallContext.EmitLog"/> calls into
     /// that turn's <see cref="OutputCollector"/> — the HTTP-transport analog of
     /// <see cref="RpcServer"/>'s private nested type of the same shape.</summary>
-    private sealed class StreamHttpCallContext(OutputCollector collector, StickyCallState? sticky = null) : Server.ICallContext
+    private sealed class StreamHttpCallContext(
+        OutputCollector collector,
+        StickyCallState? sticky = null,
+        AuthContext? auth = null,
+        PeerEvidenceSet? peerEvidence = null) : Server.ICallContext
     {
+        public AuthContext Auth { get; } = auth ?? AuthContext.Anonymous;
+
+        public PeerEvidenceSet PeerEvidence { get; } = peerEvidence ?? PeerEvidenceSet.Empty;
+
         public void EmitLog(VgiLogLevel level, string message, IReadOnlyDictionary<string, object?>? extra = null) =>
             collector.ClientLog(level, message, extra);
 

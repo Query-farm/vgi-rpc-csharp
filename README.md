@@ -206,6 +206,27 @@ delegate can validate bearer tokens, client certificates, or application-specifi
 before dispatch. `QueryFarm.VgiRpc.Http.OAuth` adds JWT/JWKS validation, protected-resource
 metadata, and an OAuth 2.0 PKCE browser flow.
 
+Whenever `PeerIdentityAuthentication.Compose` is configured with any identity
+provider, the application must install the physical-peer snapshot middleware.
+This requirement also applies to direct LocalAPI providers. Install it before
+forwarded-header or other address-rewriting middleware, and before the composed
+authentication delegate can execute:
+
+```csharp
+app.UseVgiRpcPhysicalPeerSnapshot(); // must precede UseForwardedHeaders
+app.UseForwardedHeaders();
+app.MapVgiRpc(server, authenticate: peerAuthentication);
+```
+
+Reversing this order makes the forwarded address routing data rather than the
+physical trust-boundary peer. Omitting the mandatory snapshot is an intentional
+setup error: providers are not invoked, each contributes `UNAVAILABLE` evidence,
+and policies that require peer identity fail closed instead of falling back to
+mutable connection addresses. Observation and a valid application-auth `any_of`
+may continue according to policy, but no transport identity is available. Keep
+the VGI backend unreachable except through the exact allowlisted proxy even when
+the snapshot middleware is installed.
+
 The HTTP package also includes CORS handling, request and response size limits, zstd content
 encoding, sticky sessions, token introspection, and proxy-proof validation.
 

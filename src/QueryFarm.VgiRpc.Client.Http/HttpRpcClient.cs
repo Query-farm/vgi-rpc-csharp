@@ -1,5 +1,7 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 using Apache.Arrow;
 using Apache.Arrow.Types;
@@ -8,6 +10,7 @@ using QueryFarm.VgiRpc.Http;
 using QueryFarm.VgiRpc.Logging;
 using QueryFarm.VgiRpc.Reflection;
 using QueryFarm.VgiRpc.Wire;
+using QueryFarm.VgiRpc.Transport;
 
 namespace QueryFarm.VgiRpc.Client.Http;
 
@@ -27,14 +30,36 @@ public sealed partial class HttpRpcClient : IRpcClient
     {
         ArgumentNullException.ThrowIfNull(baseAddress);
         _options = options ?? new HttpRpcClientOptions();
-        var handler = new HttpClientHandler
+        HttpMessageHandler handler;
+        if (_options.TcpProxy is not null)
         {
-            AllowAutoRedirect = _options.FollowRedirects,
-            AutomaticDecompression = DecompressionMethods.None,
-        };
-        if (_options.ClientCertificate is not null)
+            var sockets = new SocketsHttpHandler
+            {
+                AllowAutoRedirect = _options.FollowRedirects,
+                AutomaticDecompression = DecompressionMethods.None,
+                UseProxy = false,
+                ConnectTimeout = _options.ConnectTimeout,
+                ConnectCallback = async (context, token) =>
+                {
+                    var socket = await Socks5h.ConnectAsync(context.DnsEndPoint.Host,
+                        context.DnsEndPoint.Port, _options.TcpProxy, _options.ConnectTimeout, token)
+                        .ConfigureAwait(false);
+                    return new NetworkStream(socket, ownsSocket: true);
+                },
+            };
+            if (_options.ClientCertificate is not null)
+                sockets.SslOptions.ClientCertificates = new X509CertificateCollection { _options.ClientCertificate };
+            handler = sockets;
+        }
+        else
         {
-            handler.ClientCertificates.Add(_options.ClientCertificate);
+            var standard = new HttpClientHandler
+            {
+                AllowAutoRedirect = _options.FollowRedirects,
+                AutomaticDecompression = DecompressionMethods.None,
+            };
+            if (_options.ClientCertificate is not null) standard.ClientCertificates.Add(_options.ClientCertificate);
+            handler = standard;
         }
 
         _http = new System.Net.Http.HttpClient(handler) { BaseAddress = baseAddress };

@@ -97,7 +97,7 @@ public static class TokenIntrospection
         // subject credential, including how long it took.
         var identity = AuthIdentity.GetFrom(context);
         var caller = identity?.Principal ?? "";
-        if (identity is null || !principals.Contains(caller))
+        if (identity is null || !identity.Authenticated || !principals.Contains(caller))
         {
             await RefuseAsync(context, StatusCodes.Status403Forbidden, "not_an_introspector").ConfigureAwait(false);
             return;

@@ -1,5 +1,6 @@
 using QueryFarm.VgiRpc.Errors;
 using QueryFarm.VgiRpc.Logging;
+using QueryFarm.VgiRpc.Identity;
 
 namespace QueryFarm.VgiRpc.Server;
 
@@ -22,6 +23,12 @@ namespace QueryFarm.VgiRpc.Server;
 /// </summary>
 public interface ICallContext
 {
+    /// <summary>Application or transport authentication for this call.</summary>
+    AuthContext Auth => AuthContext.Anonymous;
+
+    /// <summary>Immutable off-wire transport-peer evidence; empty when disabled.</summary>
+    PeerEvidenceSet PeerEvidence => PeerEvidenceSet.Empty;
+
     /// <summary>Emits a log message to the client, interleaved with the method's data/result batches.</summary>
     void EmitLog(VgiLogLevel level, string message, IReadOnlyDictionary<string, object?>? extra = null);
 
