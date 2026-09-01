@@ -110,6 +110,12 @@ static async Task RunTcpServerAsync(CliArguments arguments)
 {
     var issuer = arguments.Required("issuer");
     var capability = arguments.Required("expected-capability");
+    var proxyProtocolV2 = arguments.Flag("proxy-protocol-v2");
+    var trustedProxy = arguments.Optional("trusted-proxy-address");
+    if (proxyProtocolV2 && trustedProxy is null)
+        throw new ArgumentException("--proxy-protocol-v2 requires --trusted-proxy-address");
+    if (!proxyProtocolV2 && trustedProxy is not null)
+        throw new ArgumentException("--trusted-proxy-address requires --proxy-protocol-v2");
     using var localApi = TailscaleLocalApiHttpClient.ForUnixSocket(
         arguments.Optional("localapi-socket") ?? "/var/run/tailscale/tailscaled.sock");
     var provider = new TailscaleLocalApiProvider(issuer, localApi);
@@ -118,9 +124,17 @@ static async Task RunTcpServerAsync(CliArguments arguments)
         PeerIdentityProviders = [provider],
         PeerAuthenticationPolicy = PeerAuthenticationPolicies.Primary("tailscale"),
         IdentityResolutionTimeout = arguments.Timeout,
+        PeerServiceName = arguments.Optional("service-name"),
+        ProxyProtocolV2Required = proxyProtocolV2,
+        TrustedProxyAddresses = trustedProxy is null ? [] : [trustedProxy],
     };
     var implementation = new TailnetConformanceService(new TailnetServerExpectations(
-        issuer, capability, "localapi", "local_daemon"));
+        issuer, capability, "localapi", "local_daemon",
+        PeerSubjectKind.TaggedNode, SubjectStability.Stable, SubjectVerified: true,
+        ExpectProxy: proxyProtocolV2, Tag: arguments.Required("expected-tag"),
+        CapabilityTargetKind: arguments.Optional("service-name") is null
+            ? "destination_ip"
+            : "service"));
     var server = new RpcServer(typeof(IConformanceService), implementation);
     await SocketTransport.ServeTcpAsync(
         arguments.Required("host"),
@@ -158,7 +172,7 @@ internal sealed class CliArguments
             if (!option.StartsWith("--", StringComparison.Ordinal))
                 throw new ArgumentException("options must start with --");
             var name = option[2..];
-            var isFlag = name is "expect-authenticated" or "expect-proxy";
+            var isFlag = name is "expect-authenticated" or "expect-proxy" or "proxy-protocol-v2";
             if (!isFlag && index + 1 >= arguments.Length)
                 throw new ArgumentException($"--{name} requires a value");
             var value = isFlag ? "true" : arguments[index + 1];

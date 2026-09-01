@@ -87,15 +87,30 @@ public static class TailnetEvidenceValidator
             || !StringComparer.Ordinal.Equals(identity.Issuer, expected.Issuer)
             || !StringComparer.Ordinal.Equals(identity.EvidenceSource, expected.EvidenceSource)
             || Wire(identity.Assurance) != expected.Assurance
-            || identity.SubjectKind != PeerSubjectKind.Unknown
-            || identity.SubjectKey is not null
-            || identity.SubjectStability != SubjectStability.None
-            || identity.SubjectVerified
+            || identity.SubjectKind != expected.SubjectKind
+            || (identity.SubjectKey is not null) != expected.SubjectVerified
+            || identity.SubjectStability != expected.SubjectStability
+            || identity.SubjectVerified != expected.SubjectVerified
             || !identity.CapabilitiesVerified
             || !identity.Capabilities.ContainsKey(expected.Capability)
-            || string.IsNullOrWhiteSpace(identity.ProxyAddress))
-            throw new UnauthorizedAccessException("Tailnet Serve evidence does not match the qualification contract");
-        var derived = PeerAuthenticationPolicies.Require("tailscale")(
+            || (!string.IsNullOrWhiteSpace(identity.ProxyAddress)) != expected.ExpectProxy)
+            throw new UnauthorizedAccessException("Tailnet evidence does not match the qualification contract");
+        if (expected.Tag is not null
+            && (!identity.Attributes.TryGetValue("tags", out var tags)
+                || tags.ValueKind != JsonValueKind.Array
+                || !tags.EnumerateArray().Any(item => item.ValueKind == JsonValueKind.String
+                    && StringComparer.Ordinal.Equals(item.GetString(), expected.Tag))))
+            throw new UnauthorizedAccessException("Tailnet evidence is missing the expected tag");
+        if (expected.CapabilityTargetKind is not null
+            && (!identity.Attributes.TryGetValue("capability_target", out var target)
+                || target.ValueKind != JsonValueKind.Object
+                || !target.TryGetProperty("kind", out var kind)
+                || !StringComparer.Ordinal.Equals(kind.GetString(), expected.CapabilityTargetKind)))
+            throw new UnauthorizedAccessException(
+                "Tailnet evidence has the wrong capability target");
+        var derived = (expected.SubjectVerified
+            ? PeerAuthenticationPolicies.Primary("tailscale")
+            : PeerAuthenticationPolicies.Require("tailscale"))(
             context.PeerEvidence, AuthContext.Anonymous).GetAwaiter().GetResult();
         if (!AuthMatches(context.Auth, derived))
             throw new UnauthorizedAccessException("authentication context does not match the evidence-derived policy result");

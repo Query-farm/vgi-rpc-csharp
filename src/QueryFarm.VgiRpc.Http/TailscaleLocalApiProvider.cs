@@ -90,7 +90,10 @@ public sealed class TailscaleLocalApiProvider : IPeerIdentityProvider
             var identity = new PeerIdentity(Provider, "localapi", IdentityAssurance.LocalDaemon,
                 _issuer, context.Transport, kind, subject, SubjectStability.Stable, true,
                 attributes, capabilities, true,
-                NormalizeDestinationIp(context.AssertedPeer ?? context.SourceEndpoint ?? context.ImmediatePeer!));
+                NormalizeDestinationIp(context.AssertedPeer ?? context.SourceEndpoint ?? context.ImmediatePeer!),
+                context.AssertedPeer is null || context.ImmediatePeer is null
+                    ? null
+                    : NormalizeDestinationIp(context.ImmediatePeer));
             return PeerIdentityResult.Available(identity);
         }
         catch (TailscaleLocalApiPermissionException) { return Result(PeerIdentityStatus.PermissionDenied); }

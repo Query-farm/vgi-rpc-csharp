@@ -13,6 +13,15 @@ WhoIs request per connection. It does not cache and never invokes the Tailscale
 CLI. Untagged nodes use `user:<numeric-id>`; tagged nodes use
 `node:<stable-node-id>` and do not use their `UserProfile` as the caller.
 Destination- and service-scoped capability targets are retained in the evidence.
+For raw TCP behind an L4 proxy, `TcpServerOptions.ProxyProtocolV2Required`
+accepts only PROXY protocol v2 from exact IP literals in
+`TrustedProxyAddresses`. The immediate peer is checked before reading, the
+preamble has its own deadline and allocation limit, and only TCP over IPv4 or
+IPv6 is accepted. `LOCAL`, `UNSPEC`, UDP, malformed/truncated frames, and
+untrusted senders fail closed. Unknown TLVs are ignored within the total bound;
+bytes after the preamble remain available to the VGI reader. The LocalAPI lookup
+uses the asserted source while retaining the immediate proxy address as audit
+evidence. Keep the backend unreachable except through the trusted proxy.
 `TailscaleLocalApiHttpClient` supports:
 
 - `ForUnixSocket(...)` on Unix platforms;

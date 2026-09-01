@@ -1,3 +1,4 @@
+using QueryFarm.VgiRpc.Identity;
 using QueryFarm.VgiRpc.Server;
 
 namespace QueryFarm.VgiRpc.Tailnet;
@@ -26,7 +27,13 @@ public sealed record TailnetServerExpectations(
     string Issuer,
     string Capability,
     string EvidenceSource = "serve_proxy",
-    string Assurance = "configured_proxy");
+    string Assurance = "configured_proxy",
+    PeerSubjectKind SubjectKind = PeerSubjectKind.Unknown,
+    SubjectStability SubjectStability = SubjectStability.None,
+    bool SubjectVerified = false,
+    bool ExpectProxy = true,
+    string? Tag = null,
+    string? CapabilityTargetKind = null);
 
 public sealed record TailnetSnapshotExpectations(
     string Issuer,

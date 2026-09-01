@@ -28,6 +28,8 @@ public sealed class TailscaleLocalApiProviderTests
         Assert.Equal(PeerSubjectKind.User, identity.SubjectKind);
         Assert.Equal(SubjectStability.Stable, Assert.Single(second.Identities).SubjectStability);
         Assert.Equal("destination_ip", identity.Attributes["capability_target"].GetProperty("kind").GetString());
+        Assert.Equal("100.64.0.1", identity.SourceAddress);
+        Assert.Equal("127.0.0.1", identity.ProxyAddress);
     }
 
     [Fact]

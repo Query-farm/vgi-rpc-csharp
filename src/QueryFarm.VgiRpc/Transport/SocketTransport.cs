@@ -97,20 +97,22 @@ public sealed class SocketTransport : IRpcTransport, IDisposable
         ArgumentNullException.ThrowIfNull(options);
         options.Validate();
         var address = host is "localhost" or "" ? System.Net.IPAddress.Loopback : System.Net.IPAddress.Parse(host);
-        using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        using var listener = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
         listener.Bind(new System.Net.IPEndPoint(address, port));
         listener.Listen();
         onBound?.Invoke(((System.Net.IPEndPoint)listener.LocalEndPoint!).Port);
         var providerSlots = new SemaphoreSlim(
             options.PeerProviderConcurrency, options.PeerProviderConcurrency);
-        await AcceptLoopAsync(listener, handleConnection, cancellationToken, options, providerSlots)
+        await AcceptLoopAsync(listener, handleConnection, cancellationToken, options, providerSlots,
+                options.ParseTrustedProxyAddresses())
             .ConfigureAwait(false);
     }
 
     private static async Task AcceptLoopAsync(
         Socket listener, Func<IRpcTransport, CancellationToken, Task> handleConnection,
         CancellationToken cancellationToken, TcpServerOptions? tcpOptions = null,
-        SemaphoreSlim? providerSlots = null)
+        SemaphoreSlim? providerSlots = null,
+        IReadOnlySet<System.Net.IPAddress>? trustedProxyAddresses = null)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -139,10 +141,16 @@ public sealed class SocketTransport : IRpcTransport, IDisposable
                 using var transport = new SocketTransport(accepted);
                 try
                 {
+                    var proxyAddress = tcpOptions is null
+                        ? null
+                        : await ReadProxyProtocolV2Async(
+                                accepted, transport.Input, tcpOptions,
+                                trustedProxyAddresses!, cancellationToken)
+                            .ConfigureAwait(false);
                     using var identityScope = tcpOptions is null
                         ? null
                         : PeerIdentityScope.Push(await ResolveIdentityAsync(
-                                accepted, tcpOptions, providerSlots!, cancellationToken)
+                                accepted, proxyAddress, tcpOptions, providerSlots!, cancellationToken)
                             .ConfigureAwait(false));
                     await handleConnection(transport, cancellationToken).ConfigureAwait(false);
                 }
@@ -150,30 +158,73 @@ public sealed class SocketTransport : IRpcTransport, IDisposable
                 {
                     // A single connection's failure must never take down the accept loop.
                 }
-            }, cancellationToken);
+            });
+        }
+    }
+
+    private static async ValueTask<ProxyProtocolV2Address?> ReadProxyProtocolV2Async(
+        Socket socket, Stream input, TcpServerOptions options,
+        IReadOnlySet<System.Net.IPAddress> trustedProxyAddresses,
+        CancellationToken cancellationToken)
+    {
+        if (!options.ProxyProtocolV2Required) return null;
+        if (socket.RemoteEndPoint is not System.Net.IPEndPoint remote)
+            throw new InvalidDataException("PROXY v2 requires a TCP immediate peer");
+        var immediate = ProxyProtocolV2.Normalize(remote.Address);
+        if (!trustedProxyAddresses.Contains(immediate))
+            throw new InvalidDataException("immediate peer is not a trusted PROXY v2 sender");
+
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(options.ProxyPreambleTimeout);
+        try
+        {
+            return await ProxyProtocolV2.ReadAsync(
+                    input, options.MaximumProxyPreambleBytes, deadline.Token)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new InvalidDataException("PROXY v2 preamble timed out", exception);
         }
     }
 
     private static async Task<PeerConnectionIdentity> ResolveIdentityAsync(
-        Socket socket, TcpServerOptions options, SemaphoreSlim providerSlots,
+        Socket socket, ProxyProtocolV2Address? proxyAddress, TcpServerOptions options,
+        SemaphoreSlim providerSlots,
         CancellationToken cancellationToken)
     {
+        var remote = socket.RemoteEndPoint as System.Net.IPEndPoint;
+        var local = socket.LocalEndPoint as System.Net.IPEndPoint;
+        var immediatePeer = remote is null
+            ? null
+            : ProxyProtocolV2.Normalize(remote.Address).ToString();
+        var proxyEndpoint = remote?.ToString();
+        var sourceEndpoint = proxyEndpoint;
+        var assertedEndpoint = proxyAddress?.Source.ToString();
+        var destinationEndpoint = proxyAddress?.Destination.ToString() ?? local?.ToString();
+        var metadata = new Dictionary<string, object?>();
+        if (sourceEndpoint is not null) metadata["remote_addr"] = sourceEndpoint;
+        if (proxyAddress is not null)
+        {
+            metadata["asserted_peer"] = assertedEndpoint;
+            metadata["proxy_addr"] = proxyEndpoint;
+            metadata["proxy_protocol_v2"] = true;
+        }
         if (options.PeerIdentityProviders.Count == 0)
-            return PeerConnectionIdentity.Anonymous;
+            return proxyAddress is null
+                ? PeerConnectionIdentity.Anonymous
+                : new PeerConnectionIdentity(
+                    AuthContext.Anonymous, PeerEvidenceSet.Empty, metadata);
 
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         deadline.CancelAfter(options.IdentityResolutionTimeout);
-        var remote = socket.RemoteEndPoint as System.Net.IPEndPoint;
-        var local = socket.LocalEndPoint as System.Net.IPEndPoint;
-        var sourceEndpoint = remote?.ToString();
         var context = new PeerResolutionContext(
             "tcp",
-            immediatePeer: remote?.Address.ToString(),
-            destinationAddress: local?.ToString(),
+            immediatePeer: immediatePeer,
+            assertedPeer: assertedEndpoint,
+            destinationAddress: destinationEndpoint,
             serviceName: options.PeerServiceName,
-            metadata: sourceEndpoint is null
-                ? null
-                : new Dictionary<string, object?> { ["remote_addr"] = sourceEndpoint },
+            metadata: metadata,
             deadline: DateTimeOffset.UtcNow + options.IdentityResolutionTimeout,
             sourceEndpoint: sourceEndpoint);
         var started = System.Diagnostics.Stopwatch.StartNew();
@@ -215,9 +266,7 @@ public sealed class SocketTransport : IRpcTransport, IDisposable
         return new PeerConnectionIdentity(
             auth,
             evidence,
-            sourceEndpoint is null
-                ? new Dictionary<string, object?>()
-                : new Dictionary<string, object?> { ["remote_addr"] = sourceEndpoint });
+            metadata);
     }
 
     private static async Task<PeerIdentityResult> ResolveProviderAsync(

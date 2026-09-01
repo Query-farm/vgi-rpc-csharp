@@ -10,6 +10,10 @@ This executable exercises only transport and identity surfaces the C# port curre
   to the exact loopback addresses. The physical-peer snapshot
   middleware runs before any address-rewriting middleware, Serve headers are trusted only from
   exact configured proxy IP literals, and each RPC call requires verified capability evidence.
+- `server-tcp`: a raw TCP worker that snapshots LocalAPI identity once per connection. Optional
+  `--proxy-protocol-v2 --trusted-proxy-address <exact-ip>` requires a bounded PROXY v2 preamble
+  from that immediate peer before resolving the asserted source; `--service-name` selects a
+  destination-scoped Tailscale Service capability target.
 
 Client qualification validates the provider status, issuer, evidence source, assurance, subject
 kind and stability, capability, optional tag and capability-target kind, proxy topology signal,
@@ -19,9 +23,3 @@ snapshot method twice and requires byte-identical evidence to exercise stable co
 The HTTP worker accepts capability-only evidence and therefore intentionally remains anonymous;
 its service method rejects a user subject, including a spoofed login that reaches the worker
 without being stripped and replaced by the trusted Serve proxy.
-
-Raw-TCP server qualification is intentionally absent. `SocketTransport.ServeTcpAsync` supplies a
-plain `IRpcTransport`, while the persistent `RpcServer` call contexts currently expose anonymous
-authentication and empty peer evidence. `TailscaleLocalApiProvider` exists for ASP.NET request
-composition, but attaching it outside that request pipeline would require a new connection-level
-identity snapshot seam in core. Advertising raw LocalAPI coverage here would therefore be false.
