@@ -19,15 +19,15 @@ public sealed record PeerConnectionIdentity(
 /// </summary>
 public static class PeerIdentityScope
 {
-    private static readonly AsyncLocal<PeerConnectionIdentity?> CurrentValue = new();
+    private static readonly AsyncLocal<PeerConnectionIdentity?> s_currentValue = new();
 
-    public static PeerConnectionIdentity Current => CurrentValue.Value ?? PeerConnectionIdentity.Anonymous;
+    public static PeerConnectionIdentity Current => s_currentValue.Value ?? PeerConnectionIdentity.Anonymous;
 
     public static IDisposable Push(PeerConnectionIdentity identity)
     {
         ArgumentNullException.ThrowIfNull(identity);
-        var previous = CurrentValue.Value;
-        CurrentValue.Value = identity;
+        var previous = s_currentValue.Value;
+        s_currentValue.Value = identity;
         return new RestoreScope(previous);
     }
 
@@ -38,7 +38,7 @@ public static class PeerIdentityScope
         public void Dispose()
         {
             if (_disposed) return;
-            CurrentValue.Value = previous;
+            s_currentValue.Value = previous;
             _disposed = true;
         }
     }
