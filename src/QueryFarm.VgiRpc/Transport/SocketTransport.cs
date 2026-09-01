@@ -1,4 +1,6 @@
 using System.Net.Sockets;
+using QueryFarm.VgiRpc.Identity;
+using QueryFarm.VgiRpc.Server;
 
 namespace QueryFarm.VgiRpc.Transport;
 
@@ -83,15 +85,32 @@ public sealed class SocketTransport : IRpcTransport, IDisposable
     /// discover it), invoking <paramref name="handleConnection"/> once per accepted connection.</summary>
     public static async Task ServeTcpAsync(string host, int port, Func<IRpcTransport, CancellationToken, Task> handleConnection, CancellationToken cancellationToken, Action<int>? onBound = null)
     {
+        await ServeTcpAsync(host, port, handleConnection, new TcpServerOptions(), cancellationToken, onBound)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>Listens on raw TCP and resolves off-wire identity once per accepted connection.</summary>
+    public static async Task ServeTcpAsync(
+        string host, int port, Func<IRpcTransport, CancellationToken, Task> handleConnection,
+        TcpServerOptions options, CancellationToken cancellationToken, Action<int>? onBound = null)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        options.Validate();
         var address = host is "localhost" or "" ? System.Net.IPAddress.Loopback : System.Net.IPAddress.Parse(host);
         using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         listener.Bind(new System.Net.IPEndPoint(address, port));
         listener.Listen();
         onBound?.Invoke(((System.Net.IPEndPoint)listener.LocalEndPoint!).Port);
-        await AcceptLoopAsync(listener, handleConnection, cancellationToken).ConfigureAwait(false);
+        var providerSlots = new SemaphoreSlim(
+            options.PeerProviderConcurrency, options.PeerProviderConcurrency);
+        await AcceptLoopAsync(listener, handleConnection, cancellationToken, options, providerSlots)
+            .ConfigureAwait(false);
     }
 
-    private static async Task AcceptLoopAsync(Socket listener, Func<IRpcTransport, CancellationToken, Task> handleConnection, CancellationToken cancellationToken)
+    private static async Task AcceptLoopAsync(
+        Socket listener, Func<IRpcTransport, CancellationToken, Task> handleConnection,
+        CancellationToken cancellationToken, TcpServerOptions? tcpOptions = null,
+        SemaphoreSlim? providerSlots = null)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -120,6 +139,11 @@ public sealed class SocketTransport : IRpcTransport, IDisposable
                 using var transport = new SocketTransport(accepted);
                 try
                 {
+                    using var identityScope = tcpOptions is null
+                        ? null
+                        : PeerIdentityScope.Push(await ResolveIdentityAsync(
+                                accepted, tcpOptions, providerSlots!, cancellationToken)
+                            .ConfigureAwait(false));
                     await handleConnection(transport, cancellationToken).ConfigureAwait(false);
                 }
                 catch
@@ -127,6 +151,105 @@ public sealed class SocketTransport : IRpcTransport, IDisposable
                     // A single connection's failure must never take down the accept loop.
                 }
             }, cancellationToken);
+        }
+    }
+
+    private static async Task<PeerConnectionIdentity> ResolveIdentityAsync(
+        Socket socket, TcpServerOptions options, SemaphoreSlim providerSlots,
+        CancellationToken cancellationToken)
+    {
+        if (options.PeerIdentityProviders.Count == 0)
+            return PeerConnectionIdentity.Anonymous;
+
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(options.IdentityResolutionTimeout);
+        var remote = socket.RemoteEndPoint as System.Net.IPEndPoint;
+        var local = socket.LocalEndPoint as System.Net.IPEndPoint;
+        var sourceEndpoint = remote?.ToString();
+        var context = new PeerResolutionContext(
+            "tcp",
+            immediatePeer: remote?.Address.ToString(),
+            destinationAddress: local?.ToString(),
+            serviceName: options.PeerServiceName,
+            metadata: sourceEndpoint is null
+                ? null
+                : new Dictionary<string, object?> { ["remote_addr"] = sourceEndpoint },
+            deadline: DateTimeOffset.UtcNow + options.IdentityResolutionTimeout,
+            sourceEndpoint: sourceEndpoint);
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        var tasks = options.PeerIdentityProviders.Select(provider =>
+        {
+            if (!providerSlots.Wait(0))
+            {
+                return Task.FromResult(
+                    new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Unavailable));
+            }
+            return ResolveProviderAsync(provider, context, deadline.Token, providerSlots);
+        }).ToArray();
+        var results = new PeerIdentityResult[tasks.Length];
+        for (var index = 0; index < tasks.Length; index++)
+        {
+            var task = tasks[index];
+            var remaining = options.IdentityResolutionTimeout - started.Elapsed;
+            try
+            {
+                if (task.IsCompleted)
+                    results[index] = await task.ConfigureAwait(false);
+                else if (remaining <= TimeSpan.Zero)
+                    results[index] = new PeerIdentityResult(
+                        options.PeerIdentityProviders[index].Provider, PeerIdentityStatus.Unavailable);
+                else
+                    results[index] = await task.WaitAsync(remaining, cancellationToken).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                results[index] = new PeerIdentityResult(
+                    options.PeerIdentityProviders[index].Provider, PeerIdentityStatus.Unavailable);
+            }
+        }
+        deadline.Cancel();
+        var evidence = new PeerEvidenceSet(results);
+        var auth = options.PeerAuthenticationPolicy is null
+            ? AuthContext.Anonymous
+            : await options.PeerAuthenticationPolicy(evidence, AuthContext.Anonymous).ConfigureAwait(false);
+        return new PeerConnectionIdentity(
+            auth,
+            evidence,
+            sourceEndpoint is null
+                ? new Dictionary<string, object?>()
+                : new Dictionary<string, object?> { ["remote_addr"] = sourceEndpoint });
+    }
+
+    private static async Task<PeerIdentityResult> ResolveProviderAsync(
+        IPeerIdentityProvider provider, PeerResolutionContext context,
+        CancellationToken cancellationToken, SemaphoreSlim providerSlots)
+    {
+        try
+        {
+            var result = await provider.ResolveAsync(context, cancellationToken).ConfigureAwait(false);
+            return result.Provider == provider.Provider
+                ? result
+                : new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Invalid);
+        }
+        catch (PeerIdentityUnavailableException)
+        {
+            return new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Unavailable);
+        }
+        catch (PeerIdentityRejectedException)
+        {
+            return new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Invalid);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Unavailable);
+        }
+        catch
+        {
+            return new PeerIdentityResult(provider.Provider, PeerIdentityStatus.Invalid);
+        }
+        finally
+        {
+            providerSlots.Release();
         }
     }
 

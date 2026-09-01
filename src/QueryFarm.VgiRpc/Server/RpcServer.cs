@@ -4,6 +4,7 @@ using Apache.Arrow;
 using QueryFarm.VgiRpc.AccessLog;
 using QueryFarm.VgiRpc.Errors;
 using QueryFarm.VgiRpc.Logging;
+using QueryFarm.VgiRpc.Identity;
 using QueryFarm.VgiRpc.Reflection;
 using QueryFarm.VgiRpc.Shm;
 using QueryFarm.VgiRpc.Streaming;
@@ -693,6 +694,9 @@ public sealed class RpcServer
     /// <c>out.client_log()</c> (the same sink) during stream processing.</summary>
     private sealed class StreamCallContext(OutputCollector collector) : ICallContext
     {
+        private readonly PeerConnectionIdentity _identity = PeerIdentityScope.Current;
+        public AuthContext Auth => _identity.Auth;
+        public PeerEvidenceSet PeerEvidence => _identity.Evidence;
         public void EmitLog(VgiLogLevel level, string message, IReadOnlyDictionary<string, object?>? extra = null) =>
             collector.ClientLog(level, message, extra);
     }
@@ -705,6 +709,9 @@ public sealed class RpcServer
     /// </summary>
     private sealed class BufferedCallContext : ICallContext
     {
+        private readonly PeerConnectionIdentity _identity = PeerIdentityScope.Current;
+        public AuthContext Auth => _identity.Auth;
+        public PeerEvidenceSet PeerEvidence => _identity.Evidence;
         public List<LogMessage> Buffered { get; } = [];
 
         public void EmitLog(VgiLogLevel level, string message, IReadOnlyDictionary<string, object?>? extra = null) =>

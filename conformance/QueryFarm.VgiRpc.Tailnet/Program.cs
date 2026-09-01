@@ -7,6 +7,7 @@ using QueryFarm.VgiRpc.Http;
 using QueryFarm.VgiRpc.Identity;
 using QueryFarm.VgiRpc.Server;
 using QueryFarm.VgiRpc.Tailnet;
+using QueryFarm.VgiRpc.Transport;
 
 try
 {
@@ -22,8 +23,11 @@ try
         case "server-http":
             await RunHttpServerAsync(arguments);
             break;
+        case "server-tcp":
+            await RunTcpServerAsync(arguments);
+            break;
         default:
-            throw new ArgumentException("mode must be client-tcp, client-http, or server-http");
+            throw new ArgumentException("mode must be client-tcp, client-http, server-http, or server-tcp");
     }
 }
 catch (Exception exception)
@@ -100,6 +104,35 @@ static async Task RunHttpServerAsync(CliArguments arguments)
     var implementation = new TailnetConformanceService(new TailnetServerExpectations(issuer, capability));
     app.MapVgiRpc(new RpcServer(typeof(IConformanceService), implementation), authenticate: authenticate);
     await app.RunAsync();
+}
+
+static async Task RunTcpServerAsync(CliArguments arguments)
+{
+    var issuer = arguments.Required("issuer");
+    var capability = arguments.Required("expected-capability");
+    using var localApi = TailscaleLocalApiHttpClient.ForUnixSocket(
+        arguments.Optional("localapi-socket") ?? "/var/run/tailscale/tailscaled.sock");
+    var provider = new TailscaleLocalApiProvider(issuer, localApi);
+    var options = new TcpServerOptions
+    {
+        PeerIdentityProviders = [provider],
+        PeerAuthenticationPolicy = PeerAuthenticationPolicies.Primary("tailscale"),
+        IdentityResolutionTimeout = arguments.Timeout,
+    };
+    var implementation = new TailnetConformanceService(new TailnetServerExpectations(
+        issuer, capability, "localapi", "local_daemon"));
+    var server = new RpcServer(typeof(IConformanceService), implementation);
+    await SocketTransport.ServeTcpAsync(
+        arguments.Required("host"),
+        arguments.RequiredInt("port"),
+        (transport, token) => server.ServeAsync(transport, token),
+        options,
+        CancellationToken.None,
+        port =>
+        {
+            Console.WriteLine($"TCP:{arguments.Required("host")}:{port}");
+            Console.Out.Flush();
+        });
 }
 
 internal sealed class CliArguments
