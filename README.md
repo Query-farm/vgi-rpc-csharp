@@ -227,6 +227,16 @@ may continue according to policy, but no transport identity is available. Keep
 the VGI backend unreachable except through the exact allowlisted proxy even when
 the snapshot middleware is installed.
 
+An Iroh bridge can forward its cryptographically verified remote EndpointId to a raw TCP or HTTP
+worker without making every C# worker embed Iroh. Raw TCP uses the dedicated VGI PROXY-v2
+`PROXY/UNSPEC` EndpointId TLV and is enabled with `TcpServerOptions.IrohProxyIssuer`; HTTP uses
+`IrohPeerIdentityProviders.Forwarded(...)` and the sanitized
+`VGI-Forwarded-Iroh-Endpoint` header. Both forms require an exact trusted immediate proxy,
+derive the issuer from worker-local configuration, and produce a stable lowercase EndpointId
+subject for the existing peer-authentication policies. See
+[`docs/iroh-forwarded-identity.md`](docs/iroh-forwarded-identity.md) for configuration and trust
+requirements.
+
 The HTTP package also includes CORS handling, request and response size limits, zstd content
 encoding, sticky sessions, token introspection, and proxy-proof validation.
 

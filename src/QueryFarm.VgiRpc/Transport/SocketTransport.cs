@@ -141,7 +141,7 @@ public sealed class SocketTransport : IRpcTransport, IDisposable
                 using var transport = new SocketTransport(accepted);
                 try
                 {
-                    var proxyAddress = tcpOptions is null
+                    var proxyPeer = tcpOptions is null
                         ? null
                         : await ReadProxyProtocolV2Async(
                                 accepted, transport.Input, tcpOptions,
@@ -150,7 +150,7 @@ public sealed class SocketTransport : IRpcTransport, IDisposable
                     using var identityScope = tcpOptions is null
                         ? null
                         : PeerIdentityScope.Push(await ResolveIdentityAsync(
-                                accepted, proxyAddress, tcpOptions, providerSlots!, cancellationToken)
+                                accepted, proxyPeer, tcpOptions, providerSlots!, cancellationToken)
                             .ConfigureAwait(false));
                     await handleConnection(transport, cancellationToken).ConfigureAwait(false);
                 }
@@ -162,7 +162,7 @@ public sealed class SocketTransport : IRpcTransport, IDisposable
         }
     }
 
-    private static async ValueTask<ProxyProtocolV2Address?> ReadProxyProtocolV2Async(
+    private static async ValueTask<ProxyProtocolV2Peer?> ReadProxyProtocolV2Async(
         Socket socket, Stream input, TcpServerOptions options,
         IReadOnlySet<System.Net.IPAddress> trustedProxyAddresses,
         CancellationToken cancellationToken)
@@ -178,9 +178,15 @@ public sealed class SocketTransport : IRpcTransport, IDisposable
         deadline.CancelAfter(options.ProxyPreambleTimeout);
         try
         {
-            return await ProxyProtocolV2.ReadAsync(
-                    input, options.MaximumProxyPreambleBytes, deadline.Token)
-                .ConfigureAwait(false);
+            if (options.IrohProxyIssuer is not null)
+                return await ProxyProtocolV2.ReadAllowingIrohIdentityAsync(
+                        input, options.MaximumProxyPreambleBytes, deadline.Token)
+                    .ConfigureAwait(false);
+            return new ProxyProtocolV2Peer(
+                await ProxyProtocolV2.ReadAsync(
+                        input, options.MaximumProxyPreambleBytes, deadline.Token)
+                    .ConfigureAwait(false),
+                null);
         }
         catch (OperationCanceledException exception) when (!cancellationToken.IsCancellationRequested)
         {
@@ -189,7 +195,7 @@ public sealed class SocketTransport : IRpcTransport, IDisposable
     }
 
     private static async Task<PeerConnectionIdentity> ResolveIdentityAsync(
-        Socket socket, ProxyProtocolV2Address? proxyAddress, TcpServerOptions options,
+        Socket socket, ProxyProtocolV2Peer? proxyPeer, TcpServerOptions options,
         SemaphoreSlim providerSlots,
         CancellationToken cancellationToken)
     {
@@ -200,18 +206,22 @@ public sealed class SocketTransport : IRpcTransport, IDisposable
             : ProxyProtocolV2.Normalize(remote.Address).ToString();
         var proxyEndpoint = remote?.ToString();
         var sourceEndpoint = proxyEndpoint;
+        var proxyAddress = proxyPeer?.Address;
         var assertedEndpoint = proxyAddress?.Source.ToString();
         var destinationEndpoint = proxyAddress?.Destination.ToString() ?? local?.ToString();
         var metadata = new Dictionary<string, object?>();
         if (sourceEndpoint is not null) metadata["remote_addr"] = sourceEndpoint;
-        if (proxyAddress is not null)
+        if (proxyPeer is not null)
         {
-            metadata["asserted_peer"] = assertedEndpoint;
+            if (assertedEndpoint is not null) metadata["asserted_peer"] = assertedEndpoint;
             metadata["proxy_addr"] = proxyEndpoint;
             metadata["proxy_protocol_v2"] = true;
+            if (proxyPeer.IrohIdentity is not null)
+                metadata["iroh_endpoint_id"] = proxyPeer.IrohIdentity.EndpointId;
         }
-        if (options.PeerIdentityProviders.Count == 0)
-            return proxyAddress is null
+        if (options.PeerIdentityProviders.Count == 0 && proxyPeer?.IrohIdentity is null
+            && options.PeerAuthenticationPolicy is null)
+            return proxyPeer is null
                 ? PeerConnectionIdentity.Anonymous
                 : new PeerConnectionIdentity(
                     AuthContext.Anonymous, PeerEvidenceSet.Empty, metadata);
@@ -259,7 +269,28 @@ public sealed class SocketTransport : IRpcTransport, IDisposable
             }
         }
         deadline.Cancel();
-        var evidence = new PeerEvidenceSet(results);
+        var evidenceResults = results.ToList();
+        if (proxyPeer?.IrohIdentity is { } forwardedIroh)
+        {
+            var identity = new PeerIdentity(
+                "iroh",
+                "proxy_protocol_v2",
+                IdentityAssurance.ConfiguredProxy,
+                options.IrohProxyIssuer!,
+                "tcp",
+                PeerSubjectKind.Endpoint,
+                forwardedIroh.EndpointId,
+                SubjectStability.Stable,
+                subjectVerified: true,
+                attributes: new Dictionary<string, object?>
+                {
+                    ["original_assurance"] = "cryptographic_peer",
+                },
+                sourceAddress: forwardedIroh.EndpointId,
+                proxyAddress: proxyEndpoint);
+            evidenceResults.Insert(0, PeerIdentityResult.Available(identity));
+        }
+        var evidence = new PeerEvidenceSet(evidenceResults);
         var auth = options.PeerAuthenticationPolicy is null
             ? AuthContext.Anonymous
             : await options.PeerAuthenticationPolicy(evidence, AuthContext.Anonymous).ConfigureAwait(false);

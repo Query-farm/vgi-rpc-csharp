@@ -144,6 +144,74 @@ public sealed class SocketTransportTcpTests
     }
 
     [Fact]
+    public async Task ProxyV2PromotesForwardedIrohIdentityThroughExistingPolicy()
+    {
+        var server = new RpcServer(typeof(IIdentityService), new IdentityService());
+        using var cancellation = new CancellationTokenSource();
+        var boundPort = new TaskCompletionSource<int>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var options = new TcpServerOptions
+        {
+            ProxyProtocolV2Required = true,
+            TrustedProxyAddresses = ["127.0.0.1"],
+            ProxyPreambleTimeout = TimeSpan.FromSeconds(1),
+            IrohProxyIssuer = "production-mesh",
+            PeerAuthenticationPolicy = PeerAuthenticationPolicies.Primary("iroh"),
+        };
+        var serveTask = SocketTransport.ServeTcpAsync(
+            "127.0.0.1", 0,
+            (transport, token) => server.ServeAsync(transport, token),
+            options, cancellation.Token, port => boundPort.TrySetResult(port));
+
+        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        await socket.ConnectAsync(IPAddress.Loopback, await boundPort.Task);
+        var endpointId = Enumerable.Range(0, 32).Select(value => (byte)value).ToArray();
+        await SendAllAsync(socket,
+            ProxyProtocolV2Tests.IrohHeader(endpointId, [0xee, 0x00, 0x01, 0x07]));
+        using var clientTransport = new SocketTransport(socket);
+        var client = new RpcConnection<IIdentityService>(clientTransport).CreateProxy();
+
+        const string subject = "000102030405060708090a0b0c0d0e0f"
+            + "101112131415161718191a1b1c1d1e1f";
+        var identity = await client.ForwardedIrohAsync();
+        Assert.StartsWith(
+            $"iroh:production-mesh:{subject}:ConfiguredProxy:cryptographic_peer:127.0.0.1:",
+            identity);
+
+        cancellation.Cancel();
+        await serveTask;
+    }
+
+    [Fact]
+    public async Task ForwardedIrohPrimaryRejectsAnOrdinaryProxyAddressWithoutIdentity()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var boundPort = new TaskCompletionSource<int>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var options = new TcpServerOptions
+        {
+            ProxyProtocolV2Required = true,
+            TrustedProxyAddresses = ["127.0.0.1"],
+            IrohProxyIssuer = "production-mesh",
+            PeerAuthenticationPolicy = PeerAuthenticationPolicies.Primary("iroh"),
+        };
+        var serveTask = SocketTransport.ServeTcpAsync(
+            "127.0.0.1", 0, (_, _) => Task.CompletedTask,
+            options, cancellation.Token, port => boundPort.TrySetResult(port));
+        using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream,
+            ProtocolType.Tcp);
+        await socket.ConnectAsync(IPAddress.Loopback, await boundPort.Task);
+        await SendAllAsync(socket, ProxyHeader(
+            new IPEndPoint(IPAddress.Parse("192.0.2.7"), 42000),
+            new IPEndPoint(IPAddress.Parse("198.51.100.9"), 19400)));
+        var buffer = new byte[1];
+        Assert.Equal(0, await socket.ReceiveAsync(buffer, SocketFlags.None)
+            .WaitAsync(TimeSpan.FromSeconds(2)));
+        cancellation.Cancel();
+        await serveTask;
+    }
+
+    [Fact]
     public async Task ProxyV2RejectsAnUntrustedPeerBeforeReadingAndBoundsSlowPreambles()
     {
         var provider = new TestPeerProvider();
@@ -187,15 +255,44 @@ public sealed class SocketTransportTcpTests
             "127.0.0.1", 0, (_, _) => Task.CompletedTask, options, CancellationToken.None));
     }
 
+    [Fact]
+    public async Task ForwardedIrohConfigurationRequiresProxyTrustAndAUniqueProvider()
+    {
+        await Assert.ThrowsAnyAsync<ArgumentException>(() => SocketTransport.ServeTcpAsync(
+            "127.0.0.1", 0, (_, _) => Task.CompletedTask,
+            new TcpServerOptions { IrohProxyIssuer = "production-mesh" },
+            CancellationToken.None));
+        await Assert.ThrowsAnyAsync<ArgumentException>(() => SocketTransport.ServeTcpAsync(
+            "127.0.0.1", 0, (_, _) => Task.CompletedTask,
+            new TcpServerOptions
+            {
+                ProxyProtocolV2Required = true,
+                TrustedProxyAddresses = ["127.0.0.1"],
+                IrohProxyIssuer = "production-mesh",
+                PeerIdentityProviders = [new IrohProvider()],
+            },
+            CancellationToken.None));
+    }
+
     public interface IIdentityService
     {
         Task<string> WhoAmIAsync(string value, ICallContext? context = null);
+        Task<string> ForwardedIrohAsync(ICallContext? context = null);
     }
 
     private sealed class IdentityService : IIdentityService
     {
         public Task<string> WhoAmIAsync(string value, ICallContext? context = null) =>
             Task.FromResult($"{value}:{context!.Auth.Domain}:{context.PeerEvidence.Status("test-peer")}");
+
+        public Task<string> ForwardedIrohAsync(ICallContext? context = null)
+        {
+            var identity = context!.PeerEvidence.UniqueVerifiedSubject("iroh");
+            return Task.FromResult($"{context.Auth.Domain}:{identity.Issuer}:"
+                + $"{identity.SubjectKey}:{identity.Assurance}:"
+                + $"{identity.Attributes["original_assurance"].GetString()}:"
+                + identity.ProxyAddress);
+        }
     }
 
     private sealed class TestPeerProvider : IPeerIdentityProvider
@@ -260,6 +357,21 @@ public sealed class SocketTransportTcpTests
         BinaryPrimitives.WriteUInt16BigEndian(value.AsSpan(24, 2), checked((ushort)source.Port));
         BinaryPrimitives.WriteUInt16BigEndian(value.AsSpan(26, 2), checked((ushort)destination.Port));
         return value;
+    }
+
+    private static async Task SendAllAsync(Socket socket, byte[] value)
+    {
+        for (var offset = 0; offset < value.Length;)
+            offset += await socket.SendAsync(value.AsMemory(offset), SocketFlags.None);
+    }
+
+    private sealed class IrohProvider : IPeerIdentityProvider
+    {
+        public string Provider => "iroh";
+        public ValueTask<PeerIdentityResult> ResolveAsync(
+            PeerResolutionContext context,
+            CancellationToken cancellationToken = default) =>
+            ValueTask.FromResult(new PeerIdentityResult(Provider, PeerIdentityStatus.NoMatch));
     }
 
     private sealed class HungPeerProvider : IPeerIdentityProvider

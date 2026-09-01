@@ -14,12 +14,17 @@ public sealed class TcpServerOptions
     public IReadOnlyList<string> TrustedProxyAddresses { get; init; } = [];
     public TimeSpan ProxyPreambleTimeout { get; init; } = TimeSpan.FromSeconds(1);
     public int MaximumProxyPreambleBytes { get; init; } = ProxyProtocolV2.DefaultMaximumPreambleBytes;
+    /// <summary>
+    /// Enables trusted bridge-forwarded Iroh EndpointId evidence under this local namespace.
+    /// </summary>
+    public string? IrohProxyIssuer { get; init; }
 
     internal void Validate()
     {
         if (IdentityResolutionTimeout <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(IdentityResolutionTimeout), "identity resolution timeout must be positive");
-        if (PeerAuthenticationPolicy is not null && PeerIdentityProviders.Count == 0)
+        if (PeerAuthenticationPolicy is not null && PeerIdentityProviders.Count == 0
+            && IrohProxyIssuer is null)
             throw new ArgumentException("peer authentication policy requires an identity provider");
         if (PeerProviderConcurrency <= 0 || PeerProviderConcurrency < PeerIdentityProviders.Count)
             throw new ArgumentOutOfRangeException(nameof(PeerProviderConcurrency),
@@ -39,6 +44,22 @@ public sealed class TcpServerOptions
         {
             if (provider is null || string.IsNullOrWhiteSpace(provider.Provider) || !names.Add(provider.Provider))
                 throw new ArgumentException("peer identity providers must have unique non-empty names");
+        }
+        if (IrohProxyIssuer is not null)
+        {
+            if (string.IsNullOrWhiteSpace(IrohProxyIssuer)
+                || IrohProxyIssuer.Any(character => character <= 0x1f || character == 0x7f))
+                throw new ArgumentException(
+                    "Iroh proxy issuer must be non-empty text without controls",
+                    nameof(IrohProxyIssuer));
+            if (!ProxyProtocolV2Required)
+                throw new ArgumentException(
+                    "Iroh proxy issuer requires PROXY v2",
+                    nameof(IrohProxyIssuer));
+            if (names.Contains("iroh"))
+                throw new ArgumentException(
+                    "forwarded Iroh identity conflicts with another iroh provider",
+                    nameof(PeerIdentityProviders));
         }
     }
 

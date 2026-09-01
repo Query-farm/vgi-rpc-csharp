@@ -42,6 +42,44 @@ public sealed class ProxyProtocolV2Tests
     }
 
     [Fact]
+    public async Task DedicatedIrohParserIsOptInCanonicalAndPreservesFollowingBytes()
+    {
+        var endpointId = Enumerable.Range(0, 32).Select(value => (byte)value).ToArray();
+        var preamble = IrohHeader(endpointId, [0xee, 0x00, 0x01, 0x07]);
+        Assert.Throws<InvalidDataException>(() => ProxyProtocolV2.Parse(preamble));
+
+        const string expected = "000102030405060708090a0b0c0d0e0f"
+            + "101112131415161718191a1b1c1d1e1f";
+        Assert.Equal(expected, ProxyProtocolV2.ParseIrohIdentity(preamble).EndpointId);
+
+        var stream = new MemoryStream([.. preamble, 0x41, 0x42]);
+        Assert.Equal(expected, (await ProxyProtocolV2.ReadIrohIdentityAsync(stream)).EndpointId);
+        Assert.Equal(0x41, stream.ReadByte());
+        Assert.Equal(0x42, stream.ReadByte());
+    }
+
+    [Fact]
+    public void DedicatedIrohParserRejectsMissingDuplicateMalformedAndIpFamilyIdentity()
+    {
+        var endpointId = new byte[32];
+        var validTlv = IrohTlv(endpointId);
+        var wrongVersion = validTlv.ToArray();
+        wrongVersion[3] = 2;
+        var ipFamilyBody = Ipv4Header()[16..].Concat(validTlv).ToArray();
+
+        foreach (var rejected in new[]
+        {
+            Header(0x21, 0x00, []),
+            Header(0x21, 0x00, [.. validTlv, .. validTlv]),
+            Header(0x21, 0x00, wrongVersion),
+            Header(0x21, 0x00, [ProxyProtocolV2.VgiIrohEndpointTlv, 0x00, 0x01, 0x01]),
+            Header(0x21, 0x11, ipFamilyBody),
+        })
+            Assert.Throws<InvalidDataException>(() =>
+                ProxyProtocolV2.ParseIrohIdentity(rejected));
+    }
+
+    [Fact]
     public void RejectsUnsafeCommandsFamiliesFramingAndLimits()
     {
         var valid = Ipv4Header();
@@ -78,6 +116,16 @@ public sealed class ProxyProtocolV2Tests
         BinaryPrimitives.WriteUInt16BigEndian(body.AsSpan(8, 2), 42000);
         BinaryPrimitives.WriteUInt16BigEndian(body.AsSpan(10, 2), 19400);
         return Header(0x21, 0x11, body);
+    }
+
+    internal static byte[] IrohHeader(byte[] endpointId, byte[]? additionalTlvs = null) =>
+        Header(0x21, 0x00, [.. IrohTlv(endpointId), .. additionalTlvs ?? []]);
+
+    private static byte[] IrohTlv(byte[] endpointId)
+    {
+        if (endpointId.Length != 32)
+            throw new ArgumentException("32 endpoint bytes required", nameof(endpointId));
+        return [ProxyProtocolV2.VgiIrohEndpointTlv, 0x00, 0x21, 0x01, .. endpointId];
     }
 
     private static byte[] Header(byte versionCommand, byte familyProtocol, byte[] body)
