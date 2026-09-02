@@ -103,7 +103,7 @@ public sealed class PythonClientWorkerTests
     [Fact]
     public async Task HttpProducer_HandlesContinuationZeroRowAndTerminalTurns()
     {
-        await using var worker = await PythonWorker.StartHttpAsync(Prefix, "--producer-turn-bytes", "16384");
+        await using var worker = await PythonWorker.StartHttpAsync(Prefix, "--producer-turn-bytes", "65536");
         await using var client = new HttpRpcClient(worker.Address, new HttpRpcClientOptions { Prefix = Prefix });
 
         using (var parameters = LongParameters(("count", 2), ("payload_bytes", 4)))
