@@ -71,7 +71,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: Query-farm/vgi-rpc-python
-          ref: v0.43.2
           path: _conformance/vgi-rpc
       # The cross-language client-role adapter is currently shared by the Rust port. It speaks a
       # language-neutral JSONL + Arrow IPC driver protocol; this job substitutes the C# driver.
@@ -142,7 +141,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: Query-farm/vgi-rpc-python
-          ref: v0.43.2
           path: _conformance/vgi-rpc
       # This repository owns the language-neutral client-role pytest adapter used for every
       # worker. VGI_CLIENT_DRIVER substitutes the C# JSONL + Arrow IPC driver.
@@ -155,19 +153,18 @@ jobs:
         with:
           repository: Query-farm/vgi-rpc-java
           path: _conformance/vgi-rpc-java
-      # vgi-go pins the vgi-rpc-go release whose conformance command is built below.
+      # The response-budget contract is coordinated across RPC ports, so exercise the current
+      # Go implementation rather than the older release pinned by the high-level vgi-go SDK.
       - uses: actions/checkout@v4
         if: matrix.worker == 'go'
         with:
-          repository: Query-farm/vgi-go
-          path: _conformance/vgi-go
-      # This is the RPC implementation underlying vgi-typescript. Pin the same release used by
-      # that SDK so the cross-test represents a released worker, not an arbitrary main commit.
+          repository: Query-farm/vgi-rpc-go
+          path: _conformance/vgi-rpc-go
+      # The response-budget contract is coordinated across RPC ports, so test TypeScript main.
       - uses: actions/checkout@v4
         if: matrix.worker == 'typescript'
         with:
           repository: Query-farm/vgi-rpc-typescript
-          ref: v0.22.0
           path: _conformance/vgi-rpc-typescript
       - uses: actions/setup-dotnet@v4
         with:
@@ -184,7 +181,7 @@ jobs:
         if: matrix.worker == 'go'
         with:
           go-version: "1.26"
-          cache-dependency-path: _conformance/vgi-go/go.sum
+          cache-dependency-path: _conformance/vgi-rpc-go/go.sum
       - uses: oven-sh/setup-bun@v2
         if: matrix.worker == 'typescript'
         with:
@@ -206,11 +203,11 @@ jobs:
         run: ./gradlew :conformance-worker:installDist --no-daemon
       - name: Build Go worker
         if: matrix.worker == 'go'
-        working-directory: _conformance/vgi-go
-        run: |
-          RPC_VERSION="$(go list -m -f '{{.Version}}' github.com/Query-farm/vgi-rpc-go)"
-          GOBIN="${{ github.workspace }}/_conformance" \
-            go install "github.com/Query-farm/vgi-rpc-go/conformance/cmd/vgi-rpc-conformance-go@${RPC_VERSION}"
+        working-directory: _conformance/vgi-rpc-go
+        run: >-
+          go build
+          -o "${{ github.workspace }}/_conformance/vgi-rpc-conformance-go"
+          ./conformance/cmd/vgi-rpc-conformance-go
       - name: Install TypeScript worker dependencies
         if: matrix.worker == 'typescript'
         working-directory: _conformance/vgi-rpc-typescript
@@ -226,8 +223,7 @@ jobs:
           VGI_PY_TESTS_DIR: ${{ github.workspace }}/_conformance/vgi-rpc/tests
           VGI_TYPESCRIPT_RPC_ROOT: ${{ github.workspace }}/_conformance/vgi-rpc-typescript
           RUST_CONFORMANCE_WORKER: ${{ github.workspace }}/${{ matrix.worker_path }}
-        # Java intentionally gates HTTP __describe__ behind its --introspect worker mode. TypeScript
-        # 0.22.0 has a narrower describe defect: Unix/TCP omit protocol_version from the response
-        # even though ordinary RPC and the remaining describe assertions pass. The matrix values
-        # deselect only those known worker-side cases; all other client/transport coverage remains.
+        # Java intentionally gates HTTP __describe__ behind its --introspect worker mode. The
+        # TypeScript matrix values deselect its known Unix/TCP describe defect while retaining all
+        # ordinary RPC and remaining describe coverage.
         run: python -m pytest test_rust_conformance.py -q ${{ matrix.pytest_args }}
