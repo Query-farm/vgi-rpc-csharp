@@ -41,6 +41,8 @@ public static class RpcHttpEndpoints
     /// error batch — mirrors Python's <c>RPC_ERROR_HEADER</c> / <c>_set_http_status</c>'s
     /// 500→200 translation, so clients that discard bodies on 5xx still see the error metadata.</summary>
     public const string RpcErrorHeader = "X-VGI-RPC-Error";
+    public const string AcceptMaxResponseBytesHeader = "VGI-Accept-Max-Response-Bytes";
+    public const string AcceptMaxResponseBytesSupportHeader = "VGI-Accept-Max-Response-Bytes-Support";
 
     private static readonly Schema s_emptySchema = new([], metadata: null);
 
@@ -66,11 +68,8 @@ public static class RpcHttpEndpoints
     /// default. A shared key is only needed for multi-process deployments, which this port
     /// doesn't support yet (see <see cref="StreamCallRegistry"/>'s doc comment) — provided now
     /// so the seam exists.</param>
-    /// <param name="maxResponseBytes">HTTP body cap enforced on unary results and exchange turns
-    /// (hard — no escape valve) — <see langword="null"/> (the default) means unbounded. Producer
-    /// turns don't enforce this yet (Python's own wire cap is *soft* there — a continuation token
-    /// carries the overshoot to the next turn — which this port doesn't implement; see
-    /// docs/roadmap.md M7). Advertised via <c>VGI-Max-Response-Bytes</c> on
+    /// <param name="maxResponseBytes">Application hard cap for every decoded Arrow IPC response;
+    /// <see langword="null"/> means unbounded. Advertised via <c>VGI-Max-Response-Bytes</c> on
     /// <c>OPTIONS {prefix}/health</c>, matching <c>vgi_rpc.http._client.http_capabilities</c>'s
     /// discovery contract.</param>
     /// <param name="authenticate">Run before every unary/init/exchange dispatch (never for
@@ -128,16 +127,26 @@ public static class RpcHttpEndpoints
     /// set — the synthetic <c>POST {prefix}/__upload_url__/init</c> route. <see langword="null"/>
     /// (the default) leaves the wire byte-identical to the pre-M13 framework, matching Python's
     /// opt-in default.</param>
-    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null, long? maxResponseBytes = null, AuthenticateDelegate? authenticate = null, string? proxyHint = null, string? corsPolicyName = null, StickySessionRegistry? sticky = null, bool proxyProofRequired = false, TokenIntrospection.TokenResolver? introspectResolver = null, IReadOnlySet<string>? introspectPrincipals = null, int introspectRateLimitPerSecond = 20, ExternalizationOptions? externalization = null)
+    /// <param name="hostingMaxRequestBytes">Provider-neutral hosting request ceiling; null means unset.</param>
+    /// <param name="hostingMaxResponseBytes">Provider-neutral hosting response ceiling; null means unset.</param>
+    /// <param name="preferredResponseBytes">Advisory batching target, clamped to the effective hard limit.</param>
+    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null, long? maxResponseBytes = null, AuthenticateDelegate? authenticate = null, string? proxyHint = null, string? corsPolicyName = null, StickySessionRegistry? sticky = null, bool proxyProofRequired = false, TokenIntrospection.TokenResolver? introspectResolver = null, IReadOnlySet<string>? introspectPrincipals = null, int introspectRateLimitPerSecond = 20, ExternalizationOptions? externalization = null, long? hostingMaxRequestBytes = null, long? hostingMaxResponseBytes = null, long? preferredResponseBytes = null)
     {
+        ValidateResponseBudget(maxResponseBytes, nameof(maxResponseBytes));
+        ValidateResponseBudget(hostingMaxResponseBytes, nameof(hostingMaxResponseBytes));
+        ValidateResponseBudget(preferredResponseBytes, nameof(preferredResponseBytes));
+        var effectiveMaxResponseBytes = MinLimit(maxResponseBytes, hostingMaxResponseBytes);
+        var effectiveMaxRequestBytes = MinLimit(externalization?.MaxRequestBytes, hostingMaxRequestBytes);
         tokenKey ??= RandomNumberGenerator.GetBytes(32);
         var registry = new StreamCallRegistry();
         var introspectEnabled = introspectResolver is not null;
-        var health = endpoints.MapMethods($"{prefix}/health", ["GET", "HEAD"], (HttpContext context) => HandleHealthAsync(server, context, proxyProofRequired));
-        var capabilities = endpoints.MapMethods($"{prefix}/health", ["OPTIONS"], (HttpContext context) => HandleCapabilitiesAsync(context, maxResponseBytes, sticky, proxyProofRequired, introspectEnabled, externalization));
-        var unary = endpoints.MapPost($"{prefix}/{{method}}", (string method, HttpContext context) => HandleUnaryAsync(server, method, context, compressionLevel, maxResponseBytes, authenticate, proxyHint, sticky, tokenKey, externalization));
-        var init = endpoints.MapPost($"{prefix}/{{method}}/init", (string method, HttpContext context) => HandleStreamInitAsync(server, method, context, compressionLevel, tokenKey, registry, authenticate, proxyHint, sticky, externalization));
-        var exchange = endpoints.MapPost($"{prefix}/{{method}}/exchange", (string method, HttpContext context) => HandleStreamExchangeAsync(server, method, context, compressionLevel, tokenKey, registry, maxResponseBytes, authenticate, proxyHint, sticky, externalization));
+        void Stamp(HttpContext context) => ApplyResponseBudgetCapabilities(
+            context.Response, effectiveMaxRequestBytes, effectiveMaxResponseBytes);
+        var health = endpoints.MapMethods($"{prefix}/health", ["GET", "HEAD"], (HttpContext context) => { Stamp(context); return HandleHealthAsync(server, context, proxyProofRequired); });
+        var capabilities = endpoints.MapMethods($"{prefix}/health", ["OPTIONS"], (HttpContext context) => { Stamp(context); return HandleCapabilitiesAsync(server, context, effectiveMaxResponseBytes, sticky, proxyProofRequired, introspectEnabled, externalization, effectiveMaxRequestBytes, authenticate, proxyHint); });
+        var unary = endpoints.MapPost($"{prefix}/{{method}}", (string method, HttpContext context) => { Stamp(context); return HandleUnaryAsync(server, method, context, compressionLevel, effectiveMaxResponseBytes, authenticate, proxyHint, sticky, tokenKey, externalization, effectiveMaxRequestBytes, preferredResponseBytes); });
+        var init = endpoints.MapPost($"{prefix}/{{method}}/init", (string method, HttpContext context) => { Stamp(context); return HandleStreamInitAsync(server, method, context, compressionLevel, tokenKey, registry, effectiveMaxResponseBytes, authenticate, proxyHint, sticky, externalization, effectiveMaxRequestBytes, preferredResponseBytes); });
+        var exchange = endpoints.MapPost($"{prefix}/{{method}}/exchange", (string method, HttpContext context) => { Stamp(context); return HandleStreamExchangeAsync(server, method, context, compressionLevel, tokenKey, registry, effectiveMaxResponseBytes, authenticate, proxyHint, sticky, externalization, effectiveMaxRequestBytes, preferredResponseBytes); });
         if (corsPolicyName is not null)
         {
             health.RequireCors(corsPolicyName);
@@ -149,7 +158,7 @@ public static class RpcHttpEndpoints
 
         if (sticky is not null)
         {
-            var session = endpoints.MapDelete($"{prefix}/{StickySessions.SessionEndpoint}", (HttpContext context) => HandleSessionDeleteAsync(server, sticky, tokenKey, context));
+            var session = endpoints.MapDelete($"{prefix}/{StickySessions.SessionEndpoint}", (HttpContext context) => { Stamp(context); return HandleSessionDeleteAsync(server, sticky, tokenKey, context); });
             if (corsPolicyName is not null)
             {
                 session.RequireCors(corsPolicyName);
@@ -160,7 +169,7 @@ public static class RpcHttpEndpoints
         // the per-request handler, since NormalizePrincipals/the rate limiter are per-worker state.
         var normalizedPrincipals = introspectEnabled ? TokenIntrospection.NormalizePrincipals(introspectPrincipals) : null;
         var rateLimiter = introspectEnabled ? new IntrospectionRateLimiter(introspectRateLimitPerSecond) : null;
-        var introspect = endpoints.MapPost($"{prefix}{TokenIntrospection.IntrospectEndpoint}", (HttpContext context) => HandleIntrospectAsync(context, authenticate, proxyHint, introspectResolver, normalizedPrincipals, rateLimiter));
+        var introspect = endpoints.MapPost($"{prefix}{TokenIntrospection.IntrospectEndpoint}", (HttpContext context) => { Stamp(context); return HandleIntrospectAsync(context, authenticate, proxyHint, introspectResolver, normalizedPrincipals, rateLimiter); });
         if (corsPolicyName is not null)
         {
             introspect.RequireCors(corsPolicyName);
@@ -168,7 +177,7 @@ public static class RpcHttpEndpoints
 
         if (externalization?.UploadUrlProvider is not null)
         {
-            var uploadUrl = endpoints.MapPost($"{prefix}/__upload_url__/init", (HttpContext context) => HandleUploadUrlAsync(server, context, authenticate, proxyHint, externalization));
+            var uploadUrl = endpoints.MapPost($"{prefix}/__upload_url__/init", (HttpContext context) => { Stamp(context); return HandleUploadUrlAsync(server, context, authenticate, proxyHint, externalization, effectiveMaxResponseBytes); });
             if (corsPolicyName is not null)
             {
                 uploadUrl.RequireCors(corsPolicyName);
@@ -176,6 +185,16 @@ public static class RpcHttpEndpoints
         }
 
         return endpoints;
+    }
+
+    private static void ApplyResponseBudgetCapabilities(HttpResponse response,
+        long? maxRequestBytes, long? maxResponseBytes)
+    {
+        response.Headers[AcceptMaxResponseBytesSupportHeader] = "true";
+        if (maxRequestBytes is { } requestCap)
+            response.Headers["VGI-Max-Request-Bytes"] = requestCap.ToString();
+        if (maxResponseBytes is { } responseCap)
+            response.Headers["VGI-Max-Response-Bytes"] = responseCap.ToString();
     }
 
     private static readonly Schema s_uploadUrlParamsSchema = new([new Field("count", Apache.Arrow.Types.Int64Type.Default, nullable: true)], metadata: null);
@@ -194,12 +213,26 @@ public static class RpcHttpEndpoints
     /// band. Follows the same dispatch shape as unary calls (auth gate, request-cap enforcement,
     /// standard wire request/response framing) despite the <c>/init</c> suffix — unlike a real
     /// stream method, this is always answered in one shot; there is no matching <c>/exchange</c>.</summary>
-    private static async Task HandleUploadUrlAsync(RpcServer server, HttpContext context, AuthenticateDelegate? authenticate, string? proxyHint, ExternalizationOptions externalization)
+    private static async Task HandleUploadUrlAsync(RpcServer server, HttpContext context,
+        AuthenticateDelegate? authenticate, string? proxyHint,
+        ExternalizationOptions externalization, long? maxResponseBytes)
     {
         if (await TryRejectUnauthenticatedAsync(context, authenticate, proxyHint).ConfigureAwait(false))
         {
             return;
         }
+
+        if (!TryAcceptedResponseLimit(context.Request, out var acceptedMaxResponseBytes,
+                out var budgetError))
+        {
+            await ErrorResultAsync(server, "__upload_url__",
+                new RpcException("ValueError", budgetError!),
+                StatusCodes.Status400BadRequest, s_emptySchema,
+                StatusCodes.Status400BadRequest, context, null, false, null)
+                .ConfigureAwait(false);
+            return;
+        }
+        var responseLimitBytes = MinLimit(maxResponseBytes, acceptedMaxResponseBytes);
 
         var request = context.Request;
         var cancellationToken = context.RequestAborted;
@@ -280,6 +313,17 @@ public static class RpcHttpEndpoints
 
             var resultBatch = new RecordBatch(s_uploadUrlResultSchema, [uploadArray.Build(), downloadArray.Build(), expiresArray.Build()], (int)count);
             await writer.WriteOwnedBatchAsync(resultBatch, null, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (responseLimitBytes is { } cap && responseBuffer.Length > cap)
+        {
+            var overshoot = new RpcException("ResponseTooLargeError",
+                $"method '__upload_url__' exceeds max_response_bytes ({responseBuffer.Length} > {cap})");
+            await ErrorResultAsync(server, "__upload_url__", overshoot,
+                StatusCodes.Status500InternalServerError, s_emptySchema,
+                StatusCodes.Status200OK, context, null, false, null)
+                .ConfigureAwait(false);
+            return;
         }
 
         EmitAccessLog(server, "__upload_url__", "unary", "ok", "", "", Stopwatch.GetTimestamp(), StatusCodes.Status200OK);
@@ -504,9 +548,27 @@ public static class RpcHttpEndpoints
     /// and <c>VGI-Supported-Encodings</c> naming the codecs this server can actually produce for
     /// responses.
     /// </summary>
-    private static Task HandleCapabilitiesAsync(HttpContext context, long? maxResponseBytes, StickySessionRegistry? sticky, bool proxyProofRequired, bool introspectEnabled, ExternalizationOptions? externalization)
+    private static async Task HandleCapabilitiesAsync(RpcServer server, HttpContext context,
+        long? maxResponseBytes, StickySessionRegistry? sticky, bool proxyProofRequired,
+        bool introspectEnabled, ExternalizationOptions? externalization, long? maxRequestBytes,
+        AuthenticateDelegate? authenticate, string? proxyHint)
     {
+        if (await TryRejectUnauthenticatedAsync(context, authenticate, proxyHint).ConfigureAwait(false))
+        {
+            return;
+        }
+        if (!TryAcceptedResponseLimit(context.Request, out _, out var budgetError))
+        {
+            context.Response.Headers[RpcErrorHeader] = "true";
+            await ErrorResultAsync(server, "__transport_options__",
+                new RpcException("ValueError", budgetError!),
+                StatusCodes.Status400BadRequest, s_emptySchema,
+                StatusCodes.Status400BadRequest, context, null, false, null)
+                .ConfigureAwait(false);
+            return;
+        }
         var headers = context.Response.Headers;
+        headers[AcceptMaxResponseBytesSupportHeader] = "true";
         if (maxResponseBytes is { } cap)
         {
             headers["VGI-Max-Response-Bytes"] = cap.ToString();
@@ -515,9 +577,9 @@ public static class RpcHttpEndpoints
         headers["VGI-Externalization-Enabled"] = externalization?.External?.Storage is not null ? "true" : "false";
         headers["VGI-Upload-URL-Support"] = externalization?.UploadUrlProvider is not null ? "true" : "false";
         headers["VGI-Supported-Encodings"] = "zstd, gzip";
-        if (externalization?.MaxRequestBytes is { } maxRequestBytes)
+        if (maxRequestBytes is { } requestCap)
         {
-            headers["VGI-Max-Request-Bytes"] = maxRequestBytes.ToString();
+            headers["VGI-Max-Request-Bytes"] = requestCap.ToString();
         }
 
         if (externalization?.MaxUploadBytes is { } maxUploadBytes)
@@ -556,7 +618,41 @@ public static class RpcHttpEndpoints
         }
 
         context.Response.StatusCode = StatusCodes.Status200OK;
-        return Task.CompletedTask;
+    }
+
+    private static long? MinLimit(long? first, long? second) => (first, second) switch
+    {
+        ({ } a, { } b) => Math.Min(a, b),
+        ({ } a, null) => a,
+        (null, { } b) => b,
+        _ => null,
+    };
+
+    private static void ValidateResponseBudget(long? value, string name)
+    {
+        if (value is { } configured && configured is < (64L << 10) or > 9_007_199_254_740_991L)
+        {
+            throw new ArgumentOutOfRangeException(name,
+                "response budgets must be between 65536 and 9007199254740991");
+        }
+    }
+
+    private static bool TryAcceptedResponseLimit(HttpRequest request, out long? value, out string? error)
+    {
+        value = null;
+        error = null;
+        if (!request.Headers.TryGetValue(AcceptMaxResponseBytesHeader, out var raw)) return true;
+        if (raw.Count != 1 || raw[0] is not { } text || text.Length == 0 || text.Contains(',')
+            || text.Any(c => c is < '0' or > '9') || text[0] == '0'
+            || !long.TryParse(text, System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out var parsed)
+            || parsed is < (64L << 10) or > 9_007_199_254_740_991L)
+        {
+            error = $"{AcceptMaxResponseBytesHeader} must be one ASCII integer between 65536 and 9007199254740991";
+            return false;
+        }
+        value = parsed;
+        return true;
     }
 
     private static Task HandleHealthAsync(RpcServer server, HttpContext context, bool proxyProofRequired)
@@ -587,12 +683,22 @@ public static class RpcHttpEndpoints
         return context.Response.Body.WriteAsync(body, context.RequestAborted).AsTask();
     }
 
-    private static async Task HandleUnaryAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky, byte[] tokenKey, ExternalizationOptions? externalization)
+    private static async Task HandleUnaryAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky, byte[] tokenKey, ExternalizationOptions? externalization, long? maxRequestBytes, long? preferredResponseBytes)
     {
         if (await TryRejectUnauthenticatedAsync(context, authenticate, proxyHint).ConfigureAwait(false))
         {
             return;
         }
+
+        if (!TryAcceptedResponseLimit(context.Request, out var acceptedMaxResponseBytes, out var budgetError))
+        {
+            await ErrorResultAsync(server, method, new RpcException("ValueError", budgetError!),
+                StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest,
+                context, null, false, compressionLevel).ConfigureAwait(false);
+            return;
+        }
+        var responseLimitBytes = MinLimit(maxResponseBytes, acceptedMaxResponseBytes);
+        var preferredLimitBytes = MinLimit(preferredResponseBytes, responseLimitBytes);
 
         var request = context.Request;
         var cancellationToken = context.RequestAborted;
@@ -639,7 +745,7 @@ public static class RpcHttpEndpoints
         Stream requestBody;
         try
         {
-            requestBody = OpenRequestBody(request, externalization?.MaxRequestBytes);
+            requestBody = OpenRequestBody(request, maxRequestBytes);
         }
         catch (NotSupportedException exc)
         {
@@ -750,7 +856,8 @@ public static class RpcHttpEndpoints
             ? new BufferedHttpCallContext(
                 stickyState,
                 PeerIdentityAuthentication.GetAuth(context),
-                PeerIdentityAuthentication.GetEvidence(context))
+                PeerIdentityAuthentication.GetEvidence(context),
+                responseLimitBytes, preferredLimitBytes)
             : null;
 
         var responseBuffer = new MemoryStream();
@@ -812,11 +919,11 @@ public static class RpcHttpEndpoints
         // Hard wire-body cap — checked post-flush since building the buffer is free. On overshoot,
         // discard the oversize body and answer with only the error batch instead (mirrors
         // Python's _enforce_response_budgets + its post-overshoot re-write of resp_buf).
-        if (status == "ok" && maxResponseBytes is { } cap && responseBuffer.Length > cap)
+        if (status == "ok" && responseLimitBytes is { } cap && responseBuffer.Length > cap)
         {
-            var overshoot = new RpcException("RuntimeError", $"HTTP body exceeds max_response_bytes ({responseBuffer.Length} > {cap}) for method '{method}'");
+            var overshoot = new RpcException("ResponseTooLargeError", $"method '{method}' exceeds max_response_bytes ({responseBuffer.Length} > {cap})");
             status = "error";
-            errorType = "RuntimeError";
+            errorType = "ResponseTooLargeError";
             errorMessage = overshoot.Message;
             responseBuffer = new MemoryStream();
             await using var errWriter = new WireWriter(responseBuffer, info.ResultSchema);
@@ -854,12 +961,22 @@ public static class RpcHttpEndpoints
     /// happens via <see cref="HandleStreamExchangeAsync"/> — which the client's generic init-response
     /// reader handles correctly regardless (it just sees zero data batches this turn).
     /// </summary>
-    private static async Task HandleStreamInitAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky, ExternalizationOptions? externalization)
+    private static async Task HandleStreamInitAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky, ExternalizationOptions? externalization, long? maxRequestBytes, long? preferredResponseBytes)
     {
         if (await TryRejectUnauthenticatedAsync(context, authenticate, proxyHint).ConfigureAwait(false))
         {
             return;
         }
+
+        if (!TryAcceptedResponseLimit(context.Request, out var acceptedMaxResponseBytes, out var budgetError))
+        {
+            await ErrorResultAsync(server, method, new RpcException("ValueError", budgetError!),
+                StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest,
+                context, null, false, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+        var responseLimitBytes = MinLimit(maxResponseBytes, acceptedMaxResponseBytes);
+        var preferredLimitBytes = MinLimit(preferredResponseBytes, responseLimitBytes);
 
         var request = context.Request;
         var cancellationToken = context.RequestAborted;
@@ -888,7 +1005,7 @@ public static class RpcHttpEndpoints
         Stream requestBody;
         try
         {
-            requestBody = OpenRequestBody(request, externalization?.MaxRequestBytes);
+            requestBody = OpenRequestBody(request, maxRequestBytes);
         }
         catch (NotSupportedException exc)
         {
@@ -990,7 +1107,8 @@ public static class RpcHttpEndpoints
             ? new BufferedHttpCallContext(
                 stickyState,
                 PeerIdentityAuthentication.GetAuth(context),
-                PeerIdentityAuthentication.GetEvidence(context))
+                PeerIdentityAuthentication.GetEvidence(context),
+                responseLimitBytes, preferredLimitBytes)
             : null;
 
         IRpcStream stream;
@@ -1010,7 +1128,7 @@ public static class RpcHttpEndpoints
 
         var callIdentity = AuthIdentity.GetFrom(context);
         var callPrincipalKey = StickySessions.PrincipalKey(callIdentity);
-        var callKey = registry.Register(stream, callPrincipalKey);
+        var callKey = registry.Register(stream, callPrincipalKey, responseLimitBytes);
         var tokenBase64 = Convert.ToBase64String(Crypto.Seal(
             Convert.FromHexString(callKey),
             tokenKey,
@@ -1057,14 +1175,16 @@ public static class RpcHttpEndpoints
         // /init response and finding it carried zero data even for a method that emits on its
         // very first tick). Exchange streams get no such tick here — nothing to produce until the
         // client sends its first exchange turn with real input.
-        using OutputCollector? tickCollector = isProducer ? new OutputCollector(outputSchema) : null;
+        using OutputCollector? tickCollector = isProducer
+            ? new OutputCollector(outputSchema, responseLimitBytes, preferredLimitBytes) : null;
         if (isProducer)
         {
             var tickContext = new StreamHttpCallContext(
                 tickCollector!,
                 stickyState,
                 PeerIdentityAuthentication.GetAuth(context),
-                PeerIdentityAuthentication.GetEvidence(context));
+                PeerIdentityAuthentication.GetEvidence(context),
+                responseLimitBytes, preferredLimitBytes);
             try
             {
                 using var tickBatch = ValueCodec.EmptyRow(s_emptySchema);
@@ -1155,6 +1275,20 @@ public static class RpcHttpEndpoints
             FinishSticky(context, sticky!, stickyState);
         }
 
+        if (responseLimitBytes is { } cap && responseBuffer.Length > cap)
+        {
+            registry.Remove(callKey);
+            var actual = responseBuffer.Length;
+            responseBuffer.Dispose();
+            responseBuffer = new MemoryStream();
+            var overshoot = new RpcException("ResponseTooLargeError",
+                $"method '{method}' exceeds max_response_bytes ({actual} > {cap})");
+            await using var errorWriter = new WireWriter(responseBuffer, outputSchema);
+            await errorWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outputSchema),
+                LogMessage.FromException(overshoot).AddToMetadata(), cancellationToken).ConfigureAwait(false);
+            context.Response.Headers[RpcErrorHeader] = "true";
+        }
+
         await WriteBytesAsync(context, StatusCodes.Status200OK, WrittenMemory(responseBuffer), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
     }
 
@@ -1181,12 +1315,21 @@ public static class RpcHttpEndpoints
     /// (unlike accumulate-until-cap) trivially supporting mid-stream cancel — see
     /// <see cref="StreamCallRegistry"/>'s doc comment for the same simplification's rationale.
     /// </summary>
-    private static async Task HandleStreamExchangeAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky, ExternalizationOptions? externalization)
+    private static async Task HandleStreamExchangeAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky, ExternalizationOptions? externalization, long? maxRequestBytes, long? preferredResponseBytes)
     {
         if (await TryRejectUnauthenticatedAsync(context, authenticate, proxyHint).ConfigureAwait(false))
         {
             return;
         }
+
+        if (!TryAcceptedResponseLimit(context.Request, out var acceptedMaxResponseBytes, out var budgetError))
+        {
+            await ErrorResultAsync(server, method, new RpcException("ValueError", budgetError!),
+                StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest,
+                context, null, false, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+        var currentResponseLimitBytes = MinLimit(maxResponseBytes, acceptedMaxResponseBytes);
 
         var request = context.Request;
         var cancellationToken = context.RequestAborted;
@@ -1208,7 +1351,7 @@ public static class RpcHttpEndpoints
         Stream requestBody;
         try
         {
-            requestBody = OpenRequestBody(request, externalization?.MaxRequestBytes);
+            requestBody = OpenRequestBody(request, maxRequestBytes);
         }
         catch (NotSupportedException exc)
         {
@@ -1278,11 +1421,14 @@ public static class RpcHttpEndpoints
             return;
         }
 
-        if (!registry.TryGet(callKey, StickySessions.PrincipalKey(AuthIdentity.GetFrom(context)), out var stream))
+        if (!registry.TryGet(callKey, StickySessions.PrincipalKey(AuthIdentity.GetFrom(context)),
+                out var stream, out var initialResponseLimitBytes))
         {
             await ErrorResultAsync(server, method, new SessionLostException("No active stream for this token — it may have expired, been cancelled, or this server process restarted."), StatusCodes.Status500InternalServerError, s_emptySchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
             return;
         }
+        var responseLimitBytes = MinLimit(currentResponseLimitBytes, initialResponseLimitBytes);
+        var preferredLimitBytes = MinLimit(preferredResponseBytes, responseLimitBytes);
 
         var start = Stopwatch.GetTimestamp();
         var outputSchema = stream.OutputSchema;
@@ -1361,7 +1507,7 @@ public static class RpcHttpEndpoints
             await stickyResolution.Value.Entry.Lock.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        using var collector = new OutputCollector(outputSchema);
+        using var collector = new OutputCollector(outputSchema, responseLimitBytes, preferredLimitBytes);
         // Always construct a per-turn context, not gated on info.HasContextParameter (that flag
         // reflects whether the RPC method that RETURNED the stream declared a ctx parameter —
         // relevant only to that method's own reflection-invoke arg count, in HandleStreamInitAsync
@@ -1373,7 +1519,8 @@ public static class RpcHttpEndpoints
             collector,
             stickyState,
             PeerIdentityAuthentication.GetAuth(context),
-            PeerIdentityAuthentication.GetEvidence(context));
+            PeerIdentityAuthentication.GetEvidence(context),
+            responseLimitBytes, preferredLimitBytes);
         Exception? turnException = null;
         try
         {
@@ -1509,13 +1656,12 @@ public static class RpcHttpEndpoints
             }
         }
 
-        // Hard wire-body cap, exchange turns only — matches Python's _skip_if_no_wire_cap
-        // reasoning: producer turns have a *soft* cap (a continuation token carries the
-        // overshoot to the next turn), which this port doesn't implement, so producer turns
-        // aren't capped at all yet. Exchange has no such escape valve.
-        if (!isProducer && maxResponseBytes is { } cap && responseBuffer.Length > cap)
+        // The decoded Arrow IPC budget is strict for every continuation shape.
+        if (responseLimitBytes is { } cap && responseBuffer.Length > cap)
         {
-            var overshoot = new RpcException("RuntimeError", $"HTTP body exceeds max_response_bytes ({responseBuffer.Length} > {cap}) for method '{method}'");
+            var overshoot = new RpcException("ResponseTooLargeError", $"method '{method}' exceeds max_response_bytes ({responseBuffer.Length} > {cap})");
+            registry.Remove(callKey);
+            responseBuffer.Dispose();
             responseBuffer = new MemoryStream();
             await using (var errWriter = new WireWriter(responseBuffer, outputSchema))
             {
@@ -1523,7 +1669,8 @@ public static class RpcHttpEndpoints
                 await errWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outputSchema), errMetadata, cancellationToken).ConfigureAwait(false);
             }
 
-            EmitAccessLog(server, info.WireName, "stream", "error", "RuntimeError", overshoot.Message, start, StatusCodes.Status200OK, callKey);
+            context.Response.Headers[RpcErrorHeader] = "true";
+            EmitAccessLog(server, info.WireName, "stream", "error", "ResponseTooLargeError", overshoot.Message, start, StatusCodes.Status200OK, callKey);
             if (stickyState is not null)
             {
                 FinishSticky(context, sticky!, stickyState);
@@ -1715,13 +1862,17 @@ public static class RpcHttpEndpoints
     private sealed class BufferedHttpCallContext(
         StickyCallState? sticky = null,
         AuthContext? auth = null,
-        PeerEvidenceSet? peerEvidence = null) : Server.ICallContext
+        PeerEvidenceSet? peerEvidence = null,
+        long? responseLimitBytes = null,
+        long? preferredResponseBytes = null) : Server.ICallContext
     {
         public List<LogMessage> Buffered { get; } = [];
 
         public AuthContext Auth { get; } = auth ?? AuthContext.Anonymous;
 
         public PeerEvidenceSet PeerEvidence { get; } = peerEvidence ?? PeerEvidenceSet.Empty;
+        public long? ResponseLimitBytes { get; } = responseLimitBytes;
+        public long? PreferredResponseBytes { get; } = preferredResponseBytes;
 
         public void EmitLog(VgiLogLevel level, string message, IReadOnlyDictionary<string, object?>? extra = null) =>
             Buffered.Add(new LogMessage(level, message, extra));
@@ -1744,11 +1895,15 @@ public static class RpcHttpEndpoints
         OutputCollector collector,
         StickyCallState? sticky = null,
         AuthContext? auth = null,
-        PeerEvidenceSet? peerEvidence = null) : Server.ICallContext
+        PeerEvidenceSet? peerEvidence = null,
+        long? responseLimitBytes = null,
+        long? preferredResponseBytes = null) : Server.ICallContext
     {
         public AuthContext Auth { get; } = auth ?? AuthContext.Anonymous;
 
         public PeerEvidenceSet PeerEvidence { get; } = peerEvidence ?? PeerEvidenceSet.Empty;
+        public long? ResponseLimitBytes { get; } = responseLimitBytes ?? collector.ResponseLimitBytes;
+        public long? PreferredResponseBytes { get; } = preferredResponseBytes ?? collector.PreferredResponseBytes;
 
         public void EmitLog(VgiLogLevel level, string message, IReadOnlyDictionary<string, object?>? extra = null) =>
             collector.ClientLog(level, message, extra);

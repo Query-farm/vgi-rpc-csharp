@@ -30,7 +30,11 @@ public sealed class HttpRpcClientSocks5hTests
             using var stream = new NetworkStream(socket, ownsSocket: false);
             var request = await ReadHeaders(stream);
             Assert.StartsWith("OPTIONS /health HTTP/1.1\r\n", request);
-            await stream.WriteAsync("HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"u8.ToArray());
+            Assert.Contains("VGI-Accept-Max-Response-Bytes: 268435456\r\n", request,
+                StringComparison.OrdinalIgnoreCase);
+            await stream.WriteAsync(Encoding.ASCII.GetBytes(
+                "HTTP/1.1 204 No Content\r\nConnection: close\r\n"
+                + "Content-Length: 0\r\nVGI-Accept-Max-Response-Bytes-Support: true\r\n\r\n"));
         });
         try
         {

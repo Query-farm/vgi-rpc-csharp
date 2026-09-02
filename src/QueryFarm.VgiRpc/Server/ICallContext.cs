@@ -29,6 +29,12 @@ public interface ICallContext
     /// <summary>Immutable off-wire transport-peer evidence; empty when disabled.</summary>
     PeerEvidenceSet PeerEvidence => PeerEvidenceSet.Empty;
 
+    /// <summary>Negotiated hard decoded-Arrow response limit, or null when unbounded.</summary>
+    long? ResponseLimitBytes => null;
+
+    /// <summary>Server batching target clamped to the hard limit, or null when unset.</summary>
+    long? PreferredResponseBytes => null;
+
     /// <summary>Emits a log message to the client, interleaved with the method's data/result batches.</summary>
     void EmitLog(VgiLogLevel level, string message, IReadOnlyDictionary<string, object?>? extra = null);
 

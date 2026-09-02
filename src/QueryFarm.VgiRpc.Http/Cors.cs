@@ -47,6 +47,7 @@ public static class Cors
             "VGI-Externalization-Enabled",
             "VGI-Upload-URL-Support",
             "VGI-Supported-Encodings",
+            RpcHttpEndpoints.AcceptMaxResponseBytesSupportHeader,
         };
         if (maxResponseBytes is not null)
         {

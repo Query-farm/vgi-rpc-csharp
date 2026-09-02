@@ -25,19 +25,21 @@ public sealed class StreamCallRegistry(TimeSpan? ttl = null)
     private readonly ConcurrentDictionary<string, Entry> _calls = new();
     private readonly TimeSpan _ttl = ttl ?? TimeSpan.FromMinutes(10);
 
-    private sealed class Entry(IRpcStream stream, string principalKey)
+    private sealed class Entry(IRpcStream stream, string principalKey, long? responseLimitBytes)
     {
         public IRpcStream Stream { get; } = stream;
         public string PrincipalKey { get; } = principalKey;
+        public long? ResponseLimitBytes { get; } = responseLimitBytes;
         public DateTimeOffset LastAccess { get; set; } = DateTimeOffset.UtcNow;
     }
 
     /// <summary>Registers a newly-dispatched stream under a fresh random call id (16 bytes, hex-encoded key).</summary>
-    public string Register(IRpcStream stream, string principalKey = "\0anonymous")
+    public string Register(IRpcStream stream, string principalKey = "\0anonymous",
+        long? responseLimitBytes = null)
     {
         var callId = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
         var key = Convert.ToHexStringLower(callId);
-        _calls[key] = new Entry(stream, principalKey);
+        _calls[key] = new Entry(stream, principalKey, responseLimitBytes);
         return key;
     }
 
@@ -50,12 +52,20 @@ public sealed class StreamCallRegistry(TimeSpan? ttl = null)
     /// principal/evidence partition as the request that registered it.</summary>
     public bool TryGet(string key, string principalKey, out IRpcStream stream)
     {
+        return TryGet(key, principalKey, out stream, out _);
+    }
+
+    /// <summary>Looks up the stream and the hard response limit bound at init.</summary>
+    public bool TryGet(string key, string principalKey, out IRpcStream stream,
+        out long? responseLimitBytes)
+    {
         if (_calls.TryGetValue(key, out var entry))
         {
             if (DateTimeOffset.UtcNow - entry.LastAccess >= _ttl)
             {
                 _calls.TryRemove(new KeyValuePair<string, Entry>(key, entry));
                 stream = null!;
+                responseLimitBytes = null;
                 return false;
             }
 
@@ -65,15 +75,18 @@ public sealed class StreamCallRegistry(TimeSpan? ttl = null)
             if (!StringComparer.Ordinal.Equals(entry.PrincipalKey, principalKey))
             {
                 stream = null!;
+                responseLimitBytes = null;
                 return false;
             }
 
             entry.LastAccess = DateTimeOffset.UtcNow;
             stream = entry.Stream;
+            responseLimitBytes = entry.ResponseLimitBytes;
             return true;
         }
 
         stream = null!;
+        responseLimitBytes = null;
         return false;
     }
 

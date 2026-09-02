@@ -8,11 +8,14 @@ namespace QueryFarm.VgiRpc.Streaming;
 /// <see cref="StreamState.ProcessAsync"/> call emits for one lockstep turn. Mirrors Python's
 /// <c>OutputCollector</c>.
 /// </summary>
-public sealed class OutputCollector(Schema outputSchema) : IDisposable
+public sealed class OutputCollector(Schema outputSchema, long? responseLimitBytes = null,
+    long? preferredResponseBytes = null) : IDisposable
 {
     private readonly List<LogMessage> _logs = [];
 
     public Schema OutputSchema { get; } = outputSchema;
+    public long? ResponseLimitBytes { get; } = responseLimitBytes;
+    public long? PreferredResponseBytes { get; } = preferredResponseBytes;
 
     /// <summary>This turn's INCOMING batch's custom_metadata (e.g. an application-level protocol
     /// riding control data on an otherwise-empty producer "tick" batch — VGI's dynamic Top-N

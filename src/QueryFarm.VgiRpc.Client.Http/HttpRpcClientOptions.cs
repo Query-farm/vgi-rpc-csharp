@@ -6,6 +6,7 @@ namespace QueryFarm.VgiRpc.Client.Http;
 
 public sealed class HttpRpcClientOptions
 {
+    public const long DefaultAcceptedMaxResponseBytes = 256L << 20;
     public string Prefix { get; init; } = "";
 
     public int? CompressionLevel { get; init; } = 1;
@@ -29,6 +30,9 @@ public sealed class HttpRpcClientOptions
 
     /// <summary>One setup deadline for proxy DNS, connect, negotiation, and target connect.</summary>
     public TimeSpan ConnectTimeout { get; init; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>Largest decoded Arrow IPC response accepted by this native client.</summary>
+    public long AcceptedMaxResponseBytes { get; init; } = DefaultAcceptedMaxResponseBytes;
 }
 
 public sealed record HttpServerCapabilities(
@@ -36,6 +40,7 @@ public sealed record HttpServerCapabilities(
     long? MaxResponseBytes,
     long? MaxUploadBytes,
     long? MaxExternalizedResponseBytes,
+    bool AcceptMaxResponseBytesSupport,
     bool ExternalizationEnabled,
     bool UploadUrlSupport,
     bool StickyEnabled,

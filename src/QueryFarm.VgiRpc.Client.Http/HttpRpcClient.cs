@@ -1,3 +1,4 @@
+using System.IO.Compression;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Sockets;
@@ -6,6 +7,7 @@ using System.Text.Json;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using QueryFarm.VgiRpc.Client;
+using QueryFarm.VgiRpc.Errors;
 using QueryFarm.VgiRpc.Http;
 using QueryFarm.VgiRpc.Logging;
 using QueryFarm.VgiRpc.Reflection;
@@ -18,6 +20,8 @@ namespace QueryFarm.VgiRpc.Client.Http;
 public sealed partial class HttpRpcClient : IRpcClient
 {
     private const string ArrowContentType = "application/vnd.apache.arrow.stream";
+    private const long EncodedResponseSafetyFloorBytes =
+        HttpRpcClientOptions.DefaultAcceptedMaxResponseBytes;
     private readonly System.Net.Http.HttpClient _http;
     private readonly bool _ownsHttpClient;
     private readonly HttpRpcClientOptions _options;
@@ -25,6 +29,12 @@ public sealed partial class HttpRpcClient : IRpcClient
     private readonly Stack<SessionSnapshot> _sessionScopes = new();
     private string? _sessionToken;
     private bool _acceptNewSession;
+    private readonly SemaphoreSlim _responseBudgetDiscovery = new(1, 1);
+    private bool _responseBudgetSupportVerified;
+    private long? _advertisedMaxResponseBytes;
+
+    internal const string AcceptMaxResponseBytesHeader = "VGI-Accept-Max-Response-Bytes";
+    internal const string AcceptMaxResponseBytesSupportHeader = "VGI-Accept-Max-Response-Bytes-Support";
 
     public HttpRpcClient(Uri baseAddress, HttpRpcClientOptions? options = null)
     {
@@ -66,6 +76,8 @@ public sealed partial class HttpRpcClient : IRpcClient
         _ownsHttpClient = true;
         _prefix = NormalizePrefix(_options.Prefix);
         _acceptNewSession = _options.AcceptNewSession;
+        ValidateAcceptedMaxResponseBytes(_options.AcceptedMaxResponseBytes);
+        ValidateNoBudgetHeaderOverride(_options.DefaultHeaders);
     }
 
     public HttpRpcClient(System.Net.Http.HttpClient httpClient, HttpRpcClientOptions? options = null, bool ownsHttpClient = false)
@@ -75,6 +87,8 @@ public sealed partial class HttpRpcClient : IRpcClient
         _ownsHttpClient = ownsHttpClient;
         _prefix = NormalizePrefix(_options.Prefix);
         _acceptNewSession = _options.AcceptNewSession;
+        ValidateAcceptedMaxResponseBytes(_options.AcceptedMaxResponseBytes);
+        ValidateNoBudgetHeaderOverride(_options.DefaultHeaders);
     }
 
     public string? SessionToken => _sessionToken;
@@ -149,6 +163,9 @@ public sealed partial class HttpRpcClient : IRpcClient
                 using var request = new HttpRequestMessage(HttpMethod.Delete, $"{_prefix}/__session__");
                 AddCommonHeaders(request);
                 using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+                RequireResponseBudgetSupport(response, "__session__");
+                _ = StrictOptionalResponseBudgetHeader(
+                    response, "VGI-Max-Response-Bytes", "__session__");
                 await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
             }
         }
@@ -224,13 +241,20 @@ public sealed partial class HttpRpcClient : IRpcClient
     {
         using var request = new HttpRequestMessage(HttpMethod.Options, $"{_prefix}/health");
         AddCommonHeaders(request);
+        request.Headers.TryAddWithoutValidation(
+            AcceptMaxResponseBytesHeader, _options.AcceptedMaxResponseBytes.ToString(
+                System.Globalization.CultureInfo.InvariantCulture));
         using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
-        return new HttpServerCapabilities(
+        RequireResponseBudgetSupport(response, "OPTIONS /health");
+        var advertisedMaxResponseBytes = StrictOptionalResponseBudgetHeader(
+            response, "VGI-Max-Response-Bytes", "OPTIONS /health");
+        var capabilities = new HttpServerCapabilities(
             LongHeader(response, "VGI-Max-Request-Bytes"),
-            LongHeader(response, "VGI-Max-Response-Bytes"),
+            advertisedMaxResponseBytes,
             LongHeader(response, "VGI-Max-Upload-Bytes"),
             LongHeader(response, "VGI-Max-Externalized-Response-Bytes"),
+            true,
             BoolHeader(response, "VGI-Externalization-Enabled"),
             BoolHeader(response, "VGI-Upload-URL-Support"),
             BoolHeader(response, StickySessions.StickyEnabledHeader),
@@ -238,6 +262,9 @@ public sealed partial class HttpRpcClient : IRpcClient
             (Header(response, StickySessions.StickyEchoHeadersHeader) ?? "")
                 .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries),
             ContentEncodingNegotiation.ParseEncodingList(Header(response, "VGI-Supported-Encodings")));
+        _advertisedMaxResponseBytes = advertisedMaxResponseBytes;
+        _responseBudgetSupportVerified = true;
+        return capabilities;
     }
 
     public async Task<IReadOnlyList<UploadUrl>> RequestUploadUrlsAsync(
@@ -327,10 +354,14 @@ public sealed partial class HttpRpcClient : IRpcClient
         bool allowExternalize = true,
         bool useCompression = true)
     {
+        await EnsureResponseBudgetSupportAsync(cancellationToken).ConfigureAwait(false);
         var serializedBody = await SerializeAsync(batch, metadata, cancellationToken).ConfigureAwait(false);
         var body = serializedBody;
         using var request = new HttpRequestMessage(HttpMethod.Post, path);
         AddCommonHeaders(request);
+        request.Headers.TryAddWithoutValidation(
+            AcceptMaxResponseBytesHeader, _options.AcceptedMaxResponseBytes.ToString(
+                System.Globalization.CultureInfo.InvariantCulture));
         if (useCompression && _options.CompressionLevel is { } level)
         {
             body = HttpCodec.Compress(body, _options.PreferredEncoding, level);
@@ -344,7 +375,11 @@ public sealed partial class HttpRpcClient : IRpcClient
         }
 
         request.Content.Headers.ContentType = MediaTypeHeaderValue.Parse(ArrowContentType);
-        using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken).ConfigureAwait(false);
+        using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        var responseMethod = MethodFromPath(path);
+        RequireResponseBudgetSupport(response, responseMethod);
+        var responseAdvertisedMaxResponseBytes = StrictOptionalResponseBudgetHeader(
+            response, "VGI-Max-Response-Bytes", responseMethod);
         CaptureSession(response);
         if (response.StatusCode == HttpStatusCode.UnsupportedMediaType && useCompression)
         {
@@ -387,9 +422,10 @@ public sealed partial class HttpRpcClient : IRpcClient
             }
         }
 
-        var responseBody = await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
         var encoding = Header(response, "X-VGI-Content-Encoding") ?? response.Content.Headers.ContentEncoding.FirstOrDefault();
-        responseBody = HttpCodec.Decompress(responseBody, encoding);
+        var responseBody = await ReadResponseBodyAsync(
+            response, encoding, responseMethod, responseAdvertisedMaxResponseBytes,
+            cancellationToken).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
         {
             var mediaType = response.Content.Headers.ContentType?.MediaType;
@@ -408,6 +444,111 @@ public sealed partial class HttpRpcClient : IRpcClient
         }
 
         return responseBody;
+    }
+
+    private async Task EnsureResponseBudgetSupportAsync(CancellationToken cancellationToken)
+    {
+        if (_responseBudgetSupportVerified) return;
+        await _responseBudgetDiscovery.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_responseBudgetSupportVerified) return;
+            var capabilities = await GetCapabilitiesAsync(cancellationToken).ConfigureAwait(false);
+            if (!capabilities.AcceptMaxResponseBytesSupport)
+            {
+                throw new RpcException("ProtocolError",
+                    $"Server does not advertise {AcceptMaxResponseBytesSupportHeader}: true");
+            }
+            _responseBudgetSupportVerified = true;
+        }
+        finally
+        {
+            _responseBudgetDiscovery.Release();
+        }
+    }
+
+    private static void ValidateAcceptedMaxResponseBytes(long value)
+    {
+        if (value is < (64L << 10) or > 9_007_199_254_740_991L)
+        {
+            throw new ArgumentOutOfRangeException(nameof(HttpRpcClientOptions.AcceptedMaxResponseBytes),
+                "accepted_max_response_bytes must be between 65536 and 9007199254740991");
+        }
+    }
+
+    private async Task<byte[]> ReadResponseBodyAsync(HttpResponseMessage response, string? encoding,
+        string method, long? responseAdvertisedMaxResponseBytes,
+        CancellationToken cancellationToken)
+    {
+        var decodedLimit = _options.AcceptedMaxResponseBytes;
+        if (_advertisedMaxResponseBytes is { } discovered)
+            decodedLimit = Math.Min(decodedLimit, discovered);
+        if (responseAdvertisedMaxResponseBytes is { } current)
+            decodedLimit = Math.Min(decodedLimit, current);
+        // The advertised cap describes decoded Arrow IPC bytes. Keep the raw
+        // transport safety bound independent so a valid compressed response is
+        // not rejected merely because its encoded representation is larger.
+        var encodedSafetyLimit = Math.Max(
+            EncodedResponseSafetyFloorBytes, _options.AcceptedMaxResponseBytes);
+        await using var raw = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        await using var encoded = new ResponseLimitStream(
+            raw, encodedSafetyLimit, method, "encoded");
+        var normalized = encoding?.Trim().ToLowerInvariant();
+        if (normalized is null or "" or "identity")
+        {
+            return await ReadBoundedAsync(encoded, decodedLimit,
+                method, cancellationToken).ConfigureAwait(false);
+        }
+
+        await using Stream decoded = normalized switch
+        {
+            "zstd" => new ZstdSharp.DecompressionStream(encoded),
+            "gzip" => new GZipStream(encoded, CompressionMode.Decompress),
+            _ => encoded,
+        };
+        return await ReadBoundedAsync(decoded, decodedLimit,
+            method, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<byte[]> ReadBoundedAsync(Stream input, long limit, string method,
+        CancellationToken cancellationToken)
+    {
+        using var output = new MemoryStream((int)Math.Min(limit, 64L << 10));
+        var buffer = new byte[8192];
+        long total = 0;
+        while (await input.ReadAsync(buffer, cancellationToken).ConfigureAwait(false) is var read
+               && read != 0)
+        {
+            total += read;
+            if (total > limit)
+            {
+                throw ResponseTooLarge(method, total, limit);
+            }
+            await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+        }
+        return output.ToArray();
+    }
+
+    private static RpcException ResponseTooLarge(string method, long actual, long limit) =>
+        new("ResponseTooLargeError",
+            $"method '{method}' exceeds max_response_bytes ({actual} > {limit})");
+
+    private static string MethodFromPath(string path)
+    {
+        var parts = path.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 0) return path;
+        var index = parts[^1] is "init" or "exchange" ? parts.Length - 2 : parts.Length - 1;
+        return index >= 0 ? Uri.UnescapeDataString(parts[index]) : path;
+    }
+
+    private static void ValidateNoBudgetHeaderOverride(IReadOnlyDictionary<string, string>? headers)
+    {
+        if (headers?.Keys.Any(name => string.Equals(name, AcceptMaxResponseBytesHeader,
+                StringComparison.OrdinalIgnoreCase)) == true)
+        {
+            throw new ArgumentException(
+                $"Configure {nameof(HttpRpcClientOptions.AcceptedMaxResponseBytes)} instead of setting {AcceptMaxResponseBytesHeader} in DefaultHeaders.");
+        }
     }
 
     private static async Task<byte[]> SerializeAsync(
@@ -585,6 +726,80 @@ public sealed partial class HttpRpcClient : IRpcClient
     private static bool BoolHeader(HttpResponseMessage response, string name) =>
         string.Equals(Header(response, name), "true", StringComparison.OrdinalIgnoreCase);
 
+    private static bool SingleTrueHeader(HttpResponseMessage response, string name) =>
+        response.Headers.TryGetValues(name, out var values)
+        && values.ToArray() is [var value]
+        && value == "true";
+
+    private static void RequireResponseBudgetSupport(HttpResponseMessage response, string method)
+    {
+        if (!SingleTrueHeader(response, AcceptMaxResponseBytesSupportHeader))
+        {
+            throw new RpcException("ProtocolError",
+                $"method '{method}' response must advertise exactly one "
+                + $"{AcceptMaxResponseBytesSupportHeader}: true");
+        }
+    }
+
+    private static long? StrictOptionalResponseBudgetHeader(
+        HttpResponseMessage response, string name, string method)
+    {
+        if (!response.Headers.TryGetValues(name, out var values)) return null;
+        var all = values.ToArray();
+        if (all is not [var text] || text.Length == 0 || text.Contains(',')
+            || text[0] == '0' || text.Any(c => c is < '0' or > '9')
+            || !long.TryParse(text, System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out var parsed)
+            || parsed is < (64L << 10) or > 9_007_199_254_740_991L)
+        {
+            throw new RpcException("ProtocolError",
+                $"method '{method}' response header {name} must be exactly one ASCII integer "
+                + "between 65536 and 9007199254740991");
+        }
+        return parsed;
+    }
+
+    private sealed class ResponseLimitStream(
+        Stream inner, long limit, string method, string dimension) : Stream
+    {
+        private long _read;
+        public override bool CanRead => inner.CanRead;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => _read; set => throw new NotSupportedException(); }
+        public override void Flush() => inner.Flush();
+        public override int Read(byte[] buffer, int offset, int count) =>
+            Count(inner.Read(buffer, offset, count));
+        public override int Read(Span<byte> buffer) => Count(inner.Read(buffer));
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer, CancellationToken cancellationToken = default) =>
+            Count(await inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false));
+        private int Count(int read)
+        {
+            _read += read;
+            if (_read > limit)
+            {
+                throw ResponseTooLarge(method, _read, limit);
+            }
+            return read;
+        }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) inner.Dispose();
+            base.Dispose(disposing);
+        }
+        public override async ValueTask DisposeAsync()
+        {
+            await inner.DisposeAsync().ConfigureAwait(false);
+            GC.SuppressFinalize(this);
+        }
+        public override string ToString() => $"bounded {dimension} response stream";
+    }
+
     private static async Task EnsureSuccessAsync(HttpResponseMessage response, CancellationToken cancellationToken)
     {
         if (response.IsSuccessStatusCode)
@@ -615,6 +830,7 @@ public sealed partial class HttpRpcClient : IRpcClient
         {
             _http.Dispose();
         }
+        _responseBudgetDiscovery.Dispose();
 
         return ValueTask.CompletedTask;
     }
