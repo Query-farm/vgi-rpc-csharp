@@ -10,4 +10,11 @@
     <ProjectReference Include="..\QueryFarm.VgiRpc\QueryFarm.VgiRpc.csproj" />
   </ItemGroup>
 
+  <!-- Pack RID-specific C ABI libraries when a release assembly stages them here. -->
+  <ItemGroup Condition="Exists('runtimes')">
+    <None Include="runtimes/**/native/*" Pack="true"
+          PackagePath="runtimes/%(RecursiveDir)%(Filename)%(Extension)"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

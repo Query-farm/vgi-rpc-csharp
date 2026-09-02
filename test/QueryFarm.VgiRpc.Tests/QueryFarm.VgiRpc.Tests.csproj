@@ -26,4 +26,8 @@
     <ProjectReference Include="..\..\src\QueryFarm.VgiRpc\QueryFarm.VgiRpc.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Update="Fixtures\iroh_transport_vectors.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>
