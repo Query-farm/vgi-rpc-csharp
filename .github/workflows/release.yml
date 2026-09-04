@@ -1,5 +1,8 @@
 name: Release
 
+env:
+  VGI_IROH_CABI_VERSION: "0.24.1"
+
 on:
   release:
     types: [published]
@@ -26,6 +29,33 @@ jobs:
             exit 1
           fi
 
+      - name: Stage version-matched Iroh native libraries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          download_root=$(mktemp -d)
+          while IFS='|' read -r rid target runtime_path; do
+            archive="vgi-iroh-cabi-v${VGI_IROH_CABI_VERSION}-${target}.tar.gz"
+            gh release download "v${VGI_IROH_CABI_VERSION}" \
+              --repo Query-farm/vgi-rpc-rust \
+              --pattern "$archive" \
+              --dir "$download_root"
+            target_root="$download_root/$target"
+            mkdir -p "$target_root"
+            tar -xzf "$download_root/$archive" -C "$target_root"
+            package_root="$target_root/vgi-iroh-cabi-v${VGI_IROH_CABI_VERSION}-${target}"
+            destination="src/QueryFarm.VgiRpc.Client/runtimes/$rid/native"
+            mkdir -p "$destination"
+            cp "$package_root/$runtime_path" "$destination/"
+          done <<'TARGETS'
+          linux-x64|x86_64-unknown-linux-gnu|lib/libvgi_iroh_cabi.so
+          linux-arm64|aarch64-unknown-linux-gnu|lib/libvgi_iroh_cabi.so
+          osx-x64|x86_64-apple-darwin|lib/libvgi_iroh_cabi.dylib
+          osx-arm64|aarch64-apple-darwin|lib/libvgi_iroh_cabi.dylib
+          win-x64|x86_64-pc-windows-msvc|bin/vgi_iroh_cabi.dll
+          TARGETS
+
       - run: dotnet restore
       - run: dotnet build -c Release --no-restore
       - run: dotnet test -c Release --no-build
@@ -37,6 +67,17 @@ jobs:
       # native, HTTP, and OAuth client packages. QueryFarm.Arrow/QueryFarm.Arrow.Scalars are the
       # vendored patched Arrow fork and are versioned independently of the first-party packages.
       - run: dotnet pack -c Release --no-build -o ./artifacts/nupkg
+
+      - name: Verify native Iroh libraries are packed
+        run: |
+          set -euo pipefail
+          package="artifacts/nupkg/QueryFarm.VgiRpc.Client.${GITHUB_REF_NAME#v}.nupkg"
+          unzip -l "$package" > /tmp/client-package.txt
+          grep -q 'runtimes/linux-x64/native/libvgi_iroh_cabi.so' /tmp/client-package.txt
+          grep -q 'runtimes/linux-arm64/native/libvgi_iroh_cabi.so' /tmp/client-package.txt
+          grep -q 'runtimes/osx-x64/native/libvgi_iroh_cabi.dylib' /tmp/client-package.txt
+          grep -q 'runtimes/osx-arm64/native/libvgi_iroh_cabi.dylib' /tmp/client-package.txt
+          grep -q 'runtimes/win-x64/native/vgi_iroh_cabi.dll' /tmp/client-package.txt
 
       # Trusted Publishing (https://learn.microsoft.com/nuget/nuget-org/trusted-publishing):
       # exchanges this job's short-lived GitHub OIDC token (id-token: write above) for a NuGet API
