@@ -153,6 +153,8 @@ the wire schema.
 | TCP | `SocketTransport.ServeTcpAsync(...)` | `RpcClient.ConnectTcpAsync(...)` |
 | Named pipe | Application-owned listener | `RpcClient.ConnectNamedPipeAsync(...)` |
 | HTTP | `MapVgiRpc(...)` | `new HttpRpcClient(baseAddress)` |
+| HTTP over Iroh | Iroh bridge to `MapVgiRpc(...)` | `HttpRpcClient.ConnectIroh("httpi://<endpoint-id>[/base-path]")` |
+| Raw Iroh | Native or bridged Arrow Mux worker | `RpcClient.ConnectIrohAsync("iroh://<endpoint-id>")` |
 | Shared memory | Negotiated alongside a pipe or socket | Set `RpcClientOptions.SharedMemorySize` |
 
 Both client classes expose exact-schema methods (`CallUnaryAsync`, `OpenProducerAsync`, and

@@ -1,5 +1,9 @@
 name: CI
 
+env:
+  VGI_IROH_CABI_VERSION: "0.24.1"
+  VGI_IROH_RUST_REV: b0a25a95993fb5aae7af7db1142cea24a6cbecc3
+
 on:
   push:
     branches: [main]
@@ -37,6 +41,94 @@ jobs:
       # third_party/ is vendored, unmodified-by-us upstream source (see
       # third_party/apache-arrow-dotnet/README.md) — never reformat it.
       - run: dotnet format --verify-no-changes --exclude third_party
+
+  iroh-http-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Query-farm/vgi-rpc-rust
+          ref: ${{ env.VGI_IROH_RUST_REV }}
+          path: .ci/vgi-rpc-rust
+      - uses: actions/checkout@v4
+        with:
+          repository: Query-farm/vgi-rpc-python
+          path: .ci/vgi-rpc-python
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .ci/vgi-rpc-rust -> target
+          key: csharp-httpi-x86_64-unknown-linux-gnu
+      - name: Build the pinned Iroh HTTP bridge
+        working-directory: .ci/vgi-rpc-rust
+        run: cargo build --locked --release -p vgi-iroh-bridge
+      - name: Download the released, version-matched C ABI library
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          archive="vgi-iroh-cabi-v${VGI_IROH_CABI_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir -p .ci/iroh-cabi
+          gh release download "v${VGI_IROH_CABI_VERSION}" \
+            --repo Query-farm/vgi-rpc-rust --pattern "$archive" --dir .ci/iroh-cabi
+          tar -xzf ".ci/iroh-cabi/$archive" -C .ci/iroh-cabi
+          echo "VGI_IROH_NATIVE=$GITHUB_WORKSPACE/.ci/iroh-cabi/vgi-iroh-cabi-v${VGI_IROH_CABI_VERSION}-x86_64-unknown-linux-gnu/lib" \
+            >> "$GITHUB_ENV"
+      - name: Build the C# HTTP client tests
+        run: |
+          dotnet restore test/QueryFarm.VgiRpc.Http.Tests/QueryFarm.VgiRpc.Http.Tests.csproj
+          dotnet build test/QueryFarm.VgiRpc.Http.Tests/QueryFarm.VgiRpc.Http.Tests.csproj \
+            -c Release --no-restore
+          python -m pip install -e './.ci/vgi-rpc-python[http]'
+      - name: Test native HTTP-over-Iroh end to end (direct, no relay)
+        run: |
+          set -euo pipefail
+          worker_log="$RUNNER_TEMP/vgi-http-worker.log"
+          bridge_log="$RUNNER_TEMP/vgi-iroh-bridge.log"
+          worker_pid=
+          bridge_pid=
+          cleanup() {
+            if [ -n "$bridge_pid" ]; then kill "$bridge_pid" 2>/dev/null || true; fi
+            if [ -n "$worker_pid" ]; then kill "$worker_pid" 2>/dev/null || true; fi
+          }
+          trap cleanup EXIT
+
+          python .ci/vgi-rpc-python/tests/serve_fixture_describe_http.py >"$worker_log" 2>&1 &
+          worker_pid=$!
+          for _ in $(seq 1 30); do
+            grep -q '^PORT:' "$worker_log" && break
+            kill -0 "$worker_pid" 2>/dev/null || break
+            sleep 1
+          done
+          port=$(sed -n 's/^PORT://p' "$worker_log" | head -n 1)
+          if [ -z "$port" ]; then cat "$worker_log"; exit 1; fi
+
+          .ci/vgi-rpc-rust/target/release/vgi-iroh-bridge \
+            --ephemeral --no-relay --print-direct-addresses \
+            --http-upstream "http://127.0.0.1:$port" >"$bridge_log" 2>&1 &
+          bridge_pid=$!
+          for _ in $(seq 1 30); do
+            grep -q '^DIRECT:' "$bridge_log" && break
+            kill -0 "$bridge_pid" 2>/dev/null || break
+            sleep 1
+          done
+          endpoint=$(grep -m1 -E '^[0-9a-f]{64}$' "$bridge_log" || true)
+          direct_addresses=$(sed -n 's/^DIRECT://p' "$bridge_log" | paste -sd, -)
+          if [ -z "$endpoint" ] || [ -z "$direct_addresses" ]; then cat "$bridge_log"; exit 1; fi
+
+          LD_LIBRARY_PATH="$VGI_IROH_NATIVE${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+          VGI_RPC_HTTPI_TEST_ENDPOINT="$endpoint" \
+          VGI_RPC_IROH_TEST_DIRECT_ADDRESSES="$direct_addresses" \
+            dotnet test test/QueryFarm.VgiRpc.Http.Tests/QueryFarm.VgiRpc.Http.Tests.csproj \
+              -c Release --no-build \
+              --filter FullyQualifiedName~NativeHttpiConnectsToLiveBridgeWhenConfigured
 
   # Becomes required once Milestone 2 lands (first full unary conformance pass).
   # The transport/feature matrix here grows as later milestones land — see docs/roadmap.md.

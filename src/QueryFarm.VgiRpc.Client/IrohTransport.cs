@@ -48,3 +48,29 @@ public interface IIrohTransportProvider
     ValueTask<IRpcTransport> OpenArrowMuxAsync(
         IrohEndpoint endpoint, IrohConnectOptions options, CancellationToken cancellationToken = default);
 }
+
+/// <summary>A bounded, fully materialized HTTP request carried by <c>iroh-http/2</c>.</summary>
+public sealed record IrohHttpRequest(
+    string Method,
+    string Path,
+    IReadOnlyList<KeyValuePair<string, string>> Headers,
+    byte[] Body,
+    long MaxResponseBytes,
+    long MaxResponseHeaderBytes);
+
+/// <summary>An HTTP response whose body remains backed by the native Iroh stream.</summary>
+public sealed record IrohHttpResponse(
+    int StatusCode,
+    IReadOnlyList<KeyValuePair<string, string>> Headers,
+    Stream Body,
+    string RemoteEndpointId);
+
+/// <summary>Optional HTTP-over-Iroh provider implemented by the version-matched native package.</summary>
+public interface IIrohHttpTransportProvider
+{
+    ValueTask<IrohHttpResponse> SendHttpAsync(
+        IrohEndpoint endpoint,
+        IrohHttpRequest request,
+        IrohConnectOptions options,
+        CancellationToken cancellationToken = default);
+}

@@ -40,44 +40,33 @@ public sealed partial class HttpRpcClient : IRpcClient
     {
         ArgumentNullException.ThrowIfNull(baseAddress);
         _options = options ?? new HttpRpcClientOptions();
-        HttpMessageHandler handler;
-        if (_options.TcpProxy is not null)
-        {
-            var sockets = new SocketsHttpHandler
-            {
-                AllowAutoRedirect = _options.FollowRedirects,
-                AutomaticDecompression = DecompressionMethods.None,
-                UseProxy = false,
-                ConnectTimeout = _options.ConnectTimeout,
-                ConnectCallback = async (context, token) =>
-                {
-                    var socket = await Socks5h.ConnectAsync(context.DnsEndPoint.Host,
-                        context.DnsEndPoint.Port, _options.TcpProxy, _options.ConnectTimeout, token)
-                        .ConfigureAwait(false);
-                    return new NetworkStream(socket, ownsSocket: true);
-                },
-            };
-            if (_options.ClientCertificate is not null)
-                sockets.SslOptions.ClientCertificates = new X509CertificateCollection { _options.ClientCertificate };
-            handler = sockets;
-        }
-        else
-        {
-            var standard = new HttpClientHandler
-            {
-                AllowAutoRedirect = _options.FollowRedirects,
-                AutomaticDecompression = DecompressionMethods.None,
-            };
-            if (_options.ClientCertificate is not null) standard.ClientCertificates.Add(_options.ClientCertificate);
-            handler = standard;
-        }
-
+        var handler = CreateNetworkHandler(_options);
         _http = new System.Net.Http.HttpClient(handler) { BaseAddress = baseAddress };
         _ownsHttpClient = true;
         _prefix = NormalizePrefix(_options.Prefix);
         _acceptNewSession = _options.AcceptNewSession;
         ValidateAcceptedMaxResponseBytes(_options.AcceptedMaxResponseBytes);
         ValidateNoBudgetHeaderOverride(_options.DefaultHeaders);
+    }
+
+    /// <summary>Create a VGI HTTP client carried over the native <c>iroh-http/2</c> transport.</summary>
+    public static HttpRpcClient ConnectIroh(
+        string endpoint,
+        IrohConnectOptions? irohOptions = null,
+        HttpRpcClientOptions? options = null,
+        IIrohHttpTransportProvider? provider = null)
+    {
+        var parsed = IrohEndpoint.Parse(endpoint);
+        if (parsed.Scheme != "httpi")
+            throw new IrohUriException("HttpRpcClient.ConnectIroh requires an httpi:// endpoint.");
+        options ??= new HttpRpcClientOptions();
+        var handler = new IrohHttpMessageHandler(parsed, irohOptions, provider,
+            CreateNetworkHandler(options));
+        var http = new System.Net.Http.HttpClient(handler)
+        {
+            BaseAddress = new Uri($"httpi://{parsed.EndpointId}/"),
+        };
+        return new HttpRpcClient(http, options, ownsHttpClient: true);
     }
 
     public HttpRpcClient(System.Net.Http.HttpClient httpClient, HttpRpcClientOptions? options = null, bool ownsHttpClient = false)
@@ -92,6 +81,37 @@ public sealed partial class HttpRpcClient : IRpcClient
     }
 
     public string? SessionToken => _sessionToken;
+
+    private static HttpMessageHandler CreateNetworkHandler(HttpRpcClientOptions options)
+    {
+        if (options.TcpProxy is not null)
+        {
+            var sockets = new SocketsHttpHandler
+            {
+                AllowAutoRedirect = options.FollowRedirects,
+                AutomaticDecompression = DecompressionMethods.None,
+                UseProxy = false,
+                ConnectTimeout = options.ConnectTimeout,
+                ConnectCallback = async (context, token) =>
+                {
+                    var socket = await Socks5h.ConnectAsync(context.DnsEndPoint.Host,
+                        context.DnsEndPoint.Port, options.TcpProxy, options.ConnectTimeout, token)
+                        .ConfigureAwait(false);
+                    return new NetworkStream(socket, ownsSocket: true);
+                },
+            };
+            if (options.ClientCertificate is not null)
+                sockets.SslOptions.ClientCertificates = new X509CertificateCollection { options.ClientCertificate };
+            return sockets;
+        }
+        var standard = new HttpClientHandler
+        {
+            AllowAutoRedirect = options.FollowRedirects,
+            AutomaticDecompression = DecompressionMethods.None,
+        };
+        if (options.ClientCertificate is not null) standard.ClientCertificates.Add(options.ClientCertificate);
+        return standard;
+    }
 
     /// <summary>Creates a reflection-based typed facade over this HTTP client.</summary>
     public TContract CreateProxy<TContract>() where TContract : class =>
