@@ -72,7 +72,7 @@ public static class RpcHttpEndpoints
         new HashSet<ContentEncoding> { ContentEncoding.Zstd, ContentEncoding.Gzip };
     private static readonly IReadOnlySet<ContentEncoding> s_noEncodings = new HashSet<ContentEncoding>();
 
-    /// <summary>Registers <paramref name="server"/>'s routes under <paramref name="prefix"/>
+    /// <summary>Registers <c>server</c>'s routes under <paramref name="prefix"/>
     /// (default the root — matches Python's default <c>prefix=""</c>).</summary>
     /// <param name="endpoints">The route builder to register onto.</param>
     /// <param name="server">The dispatch target.</param>
@@ -251,7 +251,7 @@ public static class RpcHttpEndpoints
         if (!TryAcceptedResponseLimit(context.Request, out var acceptedMaxResponseBytes,
                 out var budgetError))
         {
-            await ErrorResultAsync(server, "__upload_url__",
+            await ErrorResultAsync(server, server.ProtocolName, "__upload_url__",
                 new RpcException("ValueError", budgetError!),
                 StatusCodes.Status400BadRequest, s_emptySchema,
                 StatusCodes.Status400BadRequest, context, null, false, null)
@@ -264,7 +264,7 @@ public static class RpcHttpEndpoints
         var cancellationToken = context.RequestAborted;
         if (request.ContentType != ArrowContentType)
         {
-            await ErrorResultAsync(server, "__upload_url__", new RpcException("TypeError", $"Expected Content-Type: '{ArrowContentType}', got '{request.ContentType}'."), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, null, false, null).ConfigureAwait(false);
+            await ErrorResultAsync(server, server.ProtocolName, "__upload_url__", new RpcException("TypeError", $"Expected Content-Type: '{ArrowContentType}', got '{request.ContentType}'."), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, null, false, null).ConfigureAwait(false);
             return;
         }
 
@@ -345,14 +345,14 @@ public static class RpcHttpEndpoints
         {
             var overshoot = new RpcException("ResponseTooLargeError",
                 $"method '__upload_url__' exceeds max_response_bytes ({responseBuffer.Length} > {cap})");
-            await ErrorResultAsync(server, "__upload_url__", overshoot,
+            await ErrorResultAsync(server, server.ProtocolName, "__upload_url__", overshoot,
                 StatusCodes.Status500InternalServerError, s_emptySchema,
                 StatusCodes.Status200OK, context, null, false, null)
                 .ConfigureAwait(false);
             return;
         }
 
-        EmitAccessLog(server, "__upload_url__", "unary", "ok", "", "", Stopwatch.GetTimestamp(), StatusCodes.Status200OK);
+        EmitAccessLog(server, server.ProtocolName, "__upload_url__", "unary", "ok", "", "", Stopwatch.GetTimestamp(), StatusCodes.Status200OK);
         await WriteBytesAsync(context, StatusCodes.Status200OK, WrittenMemory(responseBuffer), null, false, null, cancellationToken).ConfigureAwait(false);
     }
 
@@ -521,7 +521,7 @@ public static class RpcHttpEndpoints
         if (RawProtocolSegmentHasPercent(context, prefixSegments))
         {
             await ErrorResultAsync(
-                server, method,
+                server, protocol, method,
                 new ProtocolNotSpecifiedException(
                     "The protocol path segment contains a percent sign. The protocol charset never "
                     + "requires encoding, so this is rejected rather than decoded."),
@@ -533,7 +533,7 @@ public static class RpcHttpEndpoints
         if (!WireNaming.IsValidProtocolName(protocol))
         {
             await ErrorResultAsync(
-                server, method,
+                server, protocol, method,
                 new ProtocolNotSupportedException("The protocol path segment is not a protocol name."),
                 StatusCodes.Status404NotFound, s_emptySchema, StatusCodes.Status404NotFound,
                 context, encoding, useCustomHeader, compressionLevel, methodType).ConfigureAwait(false);
@@ -548,7 +548,7 @@ public static class RpcHttpEndpoints
             // field and a metric label are shared, retained, and of bounded cardinality by
             // assumption. The record carries the protocol this server actually serves.
             await ErrorResultAsync(
-                server, method,
+                server, protocol, method,
                 new ProtocolNotSupportedException(
                     $"This server does not host protocol '{protocol}'. Hosted: [{string.Join(", ", server.HostedProtocols)}]"),
                 StatusCodes.Status404NotFound, s_emptySchema, StatusCodes.Status404NotFound,
@@ -604,12 +604,12 @@ public static class RpcHttpEndpoints
         if (!string.Equals(declared, protocol, StringComparison.Ordinal))
         {
             await ErrorResultAsync(
-                server, method,
+                server, protocol, method,
                 new ProtocolNotSupportedException(
                     $"Protocol mismatch: the request path resolved to '{protocol}' but the Arrow IPC "
                     + $"custom_metadata '{MetadataKeys.Protocol}' says '{declared}'. These must agree."),
                 StatusCodes.Status400BadRequest, schema, StatusCodes.Status400BadRequest,
-                context, encoding, useCustomHeader, compressionLevel, methodType, protocol: protocol).ConfigureAwait(false);
+                context, encoding, useCustomHeader, compressionLevel, methodType).ConfigureAwait(false);
             return false;
         }
 
@@ -675,7 +675,7 @@ public static class RpcHttpEndpoints
     /// returns <see langword="null"/> — callers must return immediately in that case, exactly
     /// like every other <c>ErrorResultAsync</c> short-circuit in this class.
     /// </summary>
-    private static async Task<StickyResolution?> TryResolveStickyAsync(StickySessionRegistry? sticky, RpcServer server, string method, HttpContext context, Schema errorSchema, ContentEncoding? encoding, bool useCustomHeader, int? compressionLevel, byte[] tokenKey, string methodType)
+    private static async Task<StickyResolution?> TryResolveStickyAsync(StickySessionRegistry? sticky, RpcServer server, string protocol, string method, HttpContext context, Schema errorSchema, ContentEncoding? encoding, bool useCustomHeader, int? compressionLevel, byte[] tokenKey, string methodType)
     {
         var identity = AuthIdentity.GetFrom(context);
         var principalKey = StickySessions.PrincipalKey(identity);
@@ -709,7 +709,7 @@ public static class RpcHttpEndpoints
         }
         catch (SessionLostException exc)
         {
-            await ErrorResultAsync(server, method, exc, StatusCodes.Status500InternalServerError, errorSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: methodType).ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, exc, StatusCodes.Status500InternalServerError, errorSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: methodType).ConfigureAwait(false);
             return null;
         }
     }
@@ -756,7 +756,7 @@ public static class RpcHttpEndpoints
         if (!TryAcceptedResponseLimit(context.Request, out _, out var budgetError))
         {
             context.Response.Headers[RpcErrorHeader] = "true";
-            await ErrorResultAsync(server, "__transport_options__",
+            await ErrorResultAsync(server, server.ProtocolName, "__transport_options__",
                 new RpcException("ValueError", budgetError!),
                 StatusCodes.Status400BadRequest, s_emptySchema,
                 StatusCodes.Status400BadRequest, context, null, false, null)
@@ -888,7 +888,7 @@ public static class RpcHttpEndpoints
 
         if (!TryAcceptedResponseLimit(context.Request, out var acceptedMaxResponseBytes, out var budgetError))
         {
-            await ErrorResultAsync(server, method, new RpcException("ValueError", budgetError!),
+            await ErrorResultAsync(server, protocol, method, new RpcException("ValueError", budgetError!),
                 StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest,
                 context, null, false, compressionLevel).ConfigureAwait(false);
             return;
@@ -911,12 +911,12 @@ public static class RpcHttpEndpoints
         if (request.ContentType != ArrowContentType)
         {
             await ErrorResultAsync(
-                server,
+                server, protocol,
                 method,
                 new RpcException("TypeError", $"Expected Content-Type: '{ArrowContentType}', got '{request.ContentType}'. All vgi-rpc HTTP requests must use Content-Type: {ArrowContentType}"),
                 StatusCodes.Status415UnsupportedMediaType,
                 s_emptySchema,
-                httpStatusForLog: StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, protocol: protocol).ConfigureAwait(false);
+                httpStatusForLog: StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
         }
 
@@ -924,7 +924,7 @@ public static class RpcHttpEndpoints
         {
             var available = string.Join(", ", methodNames.OrderBy(k => k, StringComparer.Ordinal));
             await ErrorResultAsync(
-                server,
+                server, protocol,
                 method,
                 // `__describe__` is retired rather than merely absent, and the two are
                 // indistinguishable from the caller's side while needing opposite fixes. Same
@@ -935,7 +935,7 @@ public static class RpcHttpEndpoints
                     : new MethodNotImplementedException($"Protocol '{protocol}' has no method '{method}'. Available methods: [{available}]"),
                 StatusCodes.Status404NotFound,
                 s_emptySchema,
-                httpStatusForLog: StatusCodes.Status404NotFound, context, encoding, useCustomHeader, compressionLevel, protocol: protocol).ConfigureAwait(false);
+                httpStatusForLog: StatusCodes.Status404NotFound, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
         }
 
@@ -952,7 +952,7 @@ public static class RpcHttpEndpoints
         if (info.Kind == RpcMethodKind.Stream)
         {
             await ErrorResultAsync(
-                server,
+                server, protocol,
                 method,
                 new RpcException("TypeError", $"Stream method '{method}' requires /init and /exchange endpoints"),
                 StatusCodes.Status400BadRequest,
@@ -968,7 +968,7 @@ public static class RpcHttpEndpoints
         }
         catch (NotSupportedException exc)
         {
-            await ErrorResultAsync(server, method, new RpcException("TypeError", exc.Message), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, httpStatusForLog: StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, new RpcException("TypeError", exc.Message), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, httpStatusForLog: StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
         }
         catch (RequestTooLargeException exc)
@@ -991,7 +991,7 @@ public static class RpcHttpEndpoints
         }
         catch (Exception exc)
         {
-            await ErrorResultAsync(server, method, exc, StatusCodes.Status400BadRequest, info.ResultSchema, httpStatusForLog: StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, exc, StatusCodes.Status400BadRequest, info.ResultSchema, httpStatusForLog: StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
         }
         finally
@@ -1004,7 +1004,7 @@ public static class RpcHttpEndpoints
 
         if (requestBatch is null)
         {
-            await ErrorResultAsync(server, method, new RpcException("RpcException", "Request body carried no batch."), StatusCodes.Status400BadRequest, info.ResultSchema, httpStatusForLog: StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, new RpcException("RpcException", "Request body carried no batch."), StatusCodes.Status400BadRequest, info.ResultSchema, httpStatusForLog: StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
         }
 
@@ -1014,12 +1014,12 @@ public static class RpcHttpEndpoints
         if (ipcMethod != method)
         {
             await ErrorResultAsync(
-                server,
+                server, protocol,
                 method,
                 new RpcException("TypeError", $"Method name mismatch: URL path has '{method}' but Arrow IPC custom_metadata 'vgi_rpc.method' has '{ipcMethod}'. These must match."),
                 StatusCodes.Status400BadRequest,
                 info.ResultSchema,
-                httpStatusForLog: StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, protocol: protocol).ConfigureAwait(false);
+                httpStatusForLog: StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
         }
 
@@ -1043,7 +1043,7 @@ public static class RpcHttpEndpoints
             }
             catch (Exception exc)
             {
-                await ErrorResultAsync(server, method, exc, StatusCodes.Status500InternalServerError, info.ResultSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
+                await ErrorResultAsync(server, protocol, method, exc, StatusCodes.Status500InternalServerError, info.ResultSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
                 return;
             }
         }
@@ -1055,12 +1055,12 @@ public static class RpcHttpEndpoints
         }
         catch (Exception exc)
         {
-            await ErrorResultAsync(server, method, exc, StatusCodes.Status400BadRequest, info.ResultSchema, httpStatusForLog: StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, exc, StatusCodes.Status400BadRequest, info.ResultSchema, httpStatusForLog: StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
         }
 
         using var ownedLargeBytesArguments = new LargeBytesBufferArgumentsOwner(args);
-        var stickyResolution = await TryResolveStickyAsync(sticky, server, method, context, info.ResultSchema, encoding, useCustomHeader, compressionLevel, tokenKey, "unary").ConfigureAwait(false);
+        var stickyResolution = await TryResolveStickyAsync(sticky, server, protocol, method, context, info.ResultSchema, encoding, useCustomHeader, compressionLevel, tokenKey, "unary").ConfigureAwait(false);
         if (stickyResolution is null)
         {
             return; // error response already written
@@ -1160,7 +1160,7 @@ public static class RpcHttpEndpoints
         // status=error still answers HTTP 200 — the body carries a real in-band error batch, and
         // RpcErrorHeader is the signal a client checks instead of the status code (mirrors
         // Python's _set_http_status 500→200 translation).
-        EmitAccessLog(server, info.WireName, "unary", status, errorType, errorMessage, start, StatusCodes.Status200OK);
+        EmitAccessLog(server, protocol, info.WireName, "unary", status, errorType, errorMessage, start, StatusCodes.Status200OK);
 
         if (status == "error")
         {
@@ -1215,7 +1215,7 @@ public static class RpcHttpEndpoints
         }
         catch (NotSupportedException exc)
         {
-            await ErrorResultAsync(server, method, new RpcException("TypeError", exc.Message), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, protocol: protocol).ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, new RpcException("TypeError", exc.Message), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
         }
         catch (RequestTooLargeException exc)
@@ -1238,7 +1238,7 @@ public static class RpcHttpEndpoints
         }
         catch (Exception exc)
         {
-            await ErrorResultAsync(server, method, exc, StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, protocol: protocol).ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, exc, StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
         }
         finally
@@ -1251,7 +1251,7 @@ public static class RpcHttpEndpoints
 
         if (requestBatch is null)
         {
-            await ErrorResultAsync(server, method, new RpcException("RpcException", "Request body carried no batch."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, protocol: protocol).ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, new RpcException("RpcException", "Request body carried no batch."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
         }
 
@@ -1260,7 +1260,7 @@ public static class RpcHttpEndpoints
         var ipcMethod = requestBatch.GetMetadata(MetadataKeys.Method);
         if (ipcMethod != method)
         {
-            await ErrorResultAsync(server, method, new RpcException("TypeError", $"Method name mismatch: URL path has '{method}' but Arrow IPC custom_metadata 'vgi_rpc.method' has '{ipcMethod}'. These must match."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, protocol: protocol).ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, new RpcException("TypeError", $"Method name mismatch: URL path has '{method}' but Arrow IPC custom_metadata 'vgi_rpc.method' has '{ipcMethod}'. These must match."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
         }
 
@@ -1289,7 +1289,7 @@ public static class RpcHttpEndpoints
         catch (Exception exc)
         {
             var actual = Unwrap(exc);
-            await ErrorResultAsync(server, method, actual, StatusCodes.Status500InternalServerError, s_emptySchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, protocol: protocol).ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, actual, StatusCodes.Status500InternalServerError, s_emptySchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
         }
 
@@ -1309,7 +1309,7 @@ public static class RpcHttpEndpoints
             await errWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outcome.Schema), errMetadata, cancellationToken).ConfigureAwait(false);
         }
 
-        EmitAccessLog(server, method, "unary", status, errorType, errorMessage, start, StatusCodes.Status200OK, protocol: protocol);
+        EmitAccessLog(server, protocol, method, "unary", status, errorType, errorMessage, start, StatusCodes.Status200OK);
 
         if (status == "error")
         {
@@ -1340,7 +1340,7 @@ public static class RpcHttpEndpoints
 
         if (!TryAcceptedResponseLimit(context.Request, out var acceptedMaxResponseBytes, out var budgetError))
         {
-            await ErrorResultAsync(server, method, new RpcException("ValueError", budgetError!),
+            await ErrorResultAsync(server, protocol, method, new RpcException("ValueError", budgetError!),
                 StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest,
                 context, null, false, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
@@ -1362,14 +1362,14 @@ public static class RpcHttpEndpoints
 
         if (request.ContentType != ArrowContentType)
         {
-            await ErrorResultAsync(server, method, new RpcException("TypeError", $"Expected Content-Type: '{ArrowContentType}', got '{request.ContentType}'. All vgi-rpc HTTP requests must use Content-Type: {ArrowContentType}"), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", protocol: protocol).ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, new RpcException("TypeError", $"Expected Content-Type: '{ArrowContentType}', got '{request.ContentType}'. All vgi-rpc HTTP requests must use Content-Type: {ArrowContentType}"), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
         }
 
         if (!methodNames.Contains(method))
         {
             var available = string.Join(", ", methodNames.OrderBy(k => k, StringComparer.Ordinal));
-            await ErrorResultAsync(server, method, new MethodNotImplementedException($"Protocol '{protocol}' has no method '{method}'. Available methods: [{available}]"), StatusCodes.Status404NotFound, s_emptySchema, StatusCodes.Status404NotFound, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", protocol: protocol).ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, new MethodNotImplementedException($"Protocol '{protocol}' has no method '{method}'. Available methods: [{available}]"), StatusCodes.Status404NotFound, s_emptySchema, StatusCodes.Status404NotFound, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
         }
 
@@ -1379,7 +1379,7 @@ public static class RpcHttpEndpoints
         // methods are never in it.
         if (RpcServer.IsFrameworkProtocol(protocol) || server.Methods[method].Kind != RpcMethodKind.Stream)
         {
-            await ErrorResultAsync(server, method, new RpcException("TypeError", $"Method '{method}' is not a stream — call it as a plain unary POST {{prefix}}/{protocol}/{method} instead."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", protocol: protocol).ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, new RpcException("TypeError", $"Method '{method}' is not a stream — call it as a plain unary POST {{prefix}}/{protocol}/{method} instead."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
         }
 
@@ -1392,7 +1392,7 @@ public static class RpcHttpEndpoints
         }
         catch (NotSupportedException exc)
         {
-            await ErrorResultAsync(server, method, new RpcException("TypeError", exc.Message), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, new RpcException("TypeError", exc.Message), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
         }
         catch (RequestTooLargeException exc)
@@ -1415,7 +1415,7 @@ public static class RpcHttpEndpoints
         }
         catch (Exception exc)
         {
-            await ErrorResultAsync(server, method, exc, StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, exc, StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
         }
         finally
@@ -1428,7 +1428,7 @@ public static class RpcHttpEndpoints
 
         if (requestBatch is null)
         {
-            await ErrorResultAsync(server, method, new RpcException("RpcException", "Request body carried no batch."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, new RpcException("RpcException", "Request body carried no batch."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
         }
 
@@ -1437,7 +1437,7 @@ public static class RpcHttpEndpoints
         var ipcMethod = requestBatch.GetMetadata(MetadataKeys.Method);
         if (ipcMethod != method)
         {
-            await ErrorResultAsync(server, method, new RpcException("TypeError", $"Method name mismatch: URL path has '{method}' but Arrow IPC custom_metadata 'vgi_rpc.method' has '{ipcMethod}'. These must match."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", protocol: protocol).ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, new RpcException("TypeError", $"Method name mismatch: URL path has '{method}' but Arrow IPC custom_metadata 'vgi_rpc.method' has '{ipcMethod}'. These must match."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
         }
 
@@ -1461,7 +1461,7 @@ public static class RpcHttpEndpoints
             }
             catch (Exception exc)
             {
-                await ErrorResultAsync(server, method, exc, StatusCodes.Status500InternalServerError, s_emptySchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+                await ErrorResultAsync(server, protocol, method, exc, StatusCodes.Status500InternalServerError, s_emptySchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
                 return;
             }
         }
@@ -1473,12 +1473,12 @@ public static class RpcHttpEndpoints
         }
         catch (Exception exc)
         {
-            await ErrorResultAsync(server, method, exc, StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, exc, StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
         }
 
         using var ownedLargeBytesArguments = new LargeBytesBufferArgumentsOwner(args);
-        var stickyResolution = await TryResolveStickyAsync(sticky, server, method, context, s_emptySchema, encoding, useCustomHeader, compressionLevel, tokenKey, "stream").ConfigureAwait(false);
+        var stickyResolution = await TryResolveStickyAsync(sticky, server, protocol, method, context, s_emptySchema, encoding, useCustomHeader, compressionLevel, tokenKey, "stream").ConfigureAwait(false);
         if (stickyResolution is null)
         {
             return; // error response already written
@@ -1512,7 +1512,7 @@ public static class RpcHttpEndpoints
         {
             stickyState?.ReleaseLockIfHeld();
             var actual = Unwrap(exc);
-            await ErrorResultAsync(server, method, actual, StatusCodes.Status500InternalServerError, s_emptySchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, actual, StatusCodes.Status500InternalServerError, s_emptySchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
         }
 
@@ -1588,7 +1588,7 @@ public static class RpcHttpEndpoints
                 registry.Remove(callKey);
                 stickyState?.ReleaseLockIfHeld();
                 var actual = Unwrap(exc);
-                await ErrorResultAsync(server, method, actual, StatusCodes.Status500InternalServerError, outputSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
+                await ErrorResultAsync(server, protocol, method, actual, StatusCodes.Status500InternalServerError, outputSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
                 return;
             }
         }
@@ -1605,7 +1605,7 @@ public static class RpcHttpEndpoints
                 registry.Remove(callKey);
                 stickyState?.ReleaseLockIfHeld();
                 var overshoot = new RpcException("RuntimeError", $"Externalised payload exceeds max_externalized_response_bytes ({predicted} > {externalCap}) for method '{method}'");
-                await ErrorResultAsync(server, method, overshoot, StatusCodes.Status500InternalServerError, outputSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
+                await ErrorResultAsync(server, protocol, method, overshoot, StatusCodes.Status500InternalServerError, outputSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
                 return;
             }
 
@@ -1662,7 +1662,7 @@ public static class RpcHttpEndpoints
             }
         }
 
-        EmitAccessLog(server, info.WireName, "stream", "ok", "", "", start, StatusCodes.Status200OK, callKey);
+        EmitAccessLog(server, protocol, info.WireName, "stream", "ok", "", "", start, StatusCodes.Status200OK, callKey);
         if (stickyState is not null)
         {
             FinishSticky(context, sticky!, stickyState);
@@ -1717,7 +1717,7 @@ public static class RpcHttpEndpoints
 
         if (!TryAcceptedResponseLimit(context.Request, out var acceptedMaxResponseBytes, out var budgetError))
         {
-            await ErrorResultAsync(server, method, new RpcException("ValueError", budgetError!),
+            await ErrorResultAsync(server, protocol, method, new RpcException("ValueError", budgetError!),
                 StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest,
                 context, null, false, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
@@ -1738,14 +1738,14 @@ public static class RpcHttpEndpoints
 
         if (request.ContentType != ArrowContentType)
         {
-            await ErrorResultAsync(server, method, new RpcException("TypeError", $"Expected Content-Type: '{ArrowContentType}', got '{request.ContentType}'. All vgi-rpc HTTP requests must use Content-Type: {ArrowContentType}"), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", protocol: protocol).ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, new RpcException("TypeError", $"Expected Content-Type: '{ArrowContentType}', got '{request.ContentType}'. All vgi-rpc HTTP requests must use Content-Type: {ArrowContentType}"), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
         }
 
         if (RpcServer.IsFrameworkProtocol(protocol)
             || !server.Methods.TryGetValue(method, out var info) || info.Kind != RpcMethodKind.Stream)
         {
-            await ErrorResultAsync(server, method, new MethodNotImplementedException($"Protocol '{protocol}' has no stream method '{method}'."), StatusCodes.Status404NotFound, s_emptySchema, StatusCodes.Status404NotFound, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", protocol: protocol).ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, new MethodNotImplementedException($"Protocol '{protocol}' has no stream method '{method}'."), StatusCodes.Status404NotFound, s_emptySchema, StatusCodes.Status404NotFound, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
         }
 
@@ -1756,7 +1756,7 @@ public static class RpcHttpEndpoints
         }
         catch (NotSupportedException exc)
         {
-            await ErrorResultAsync(server, method, new RpcException("TypeError", exc.Message), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, new RpcException("TypeError", exc.Message), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
         }
         catch (RequestTooLargeException exc)
@@ -1779,7 +1779,7 @@ public static class RpcHttpEndpoints
         }
         catch (Exception exc)
         {
-            await ErrorResultAsync(server, method, exc, StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, exc, StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
         }
         finally
@@ -1792,7 +1792,7 @@ public static class RpcHttpEndpoints
 
         if (requestBatch is null)
         {
-            await ErrorResultAsync(server, method, new RpcException("RpcException", "Request body carried no batch."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, new RpcException("RpcException", "Request body carried no batch."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
         }
 
@@ -1804,7 +1804,7 @@ public static class RpcHttpEndpoints
         var tokenB64 = requestBatch.GetMetadata(MetadataKeys.StreamState);
         if (tokenB64 is null)
         {
-            await ErrorResultAsync(server, method, new RpcException("TypeError", $"Exchange request is missing the {MetadataKeys.StreamState} continuation token."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, new RpcException("TypeError", $"Exchange request is missing the {MetadataKeys.StreamState} continuation token."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
         }
 
@@ -1822,14 +1822,14 @@ public static class RpcHttpEndpoints
         }
         catch (Exception)
         {
-            await ErrorResultAsync(server, method, new SessionLostException("Stream continuation token is invalid, tampered, or expired."), StatusCodes.Status500InternalServerError, s_emptySchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, new SessionLostException("Stream continuation token is invalid, tampered, or expired."), StatusCodes.Status500InternalServerError, s_emptySchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
         }
 
         if (!registry.TryGet(callKey, StickySessions.PrincipalKey(AuthIdentity.GetFrom(context)),
                 out var stream, out var initialResponseLimitBytes))
         {
-            await ErrorResultAsync(server, method, new SessionLostException("No active stream for this token — it may have expired, been cancelled, or this server process restarted."), StatusCodes.Status500InternalServerError, s_emptySchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, new SessionLostException("No active stream for this token — it may have expired, been cancelled, or this server process restarted."), StatusCodes.Status500InternalServerError, s_emptySchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
             return;
         }
         var responseLimitBytes = MinLimit(currentResponseLimitBytes, initialResponseLimitBytes);
@@ -1843,7 +1843,7 @@ public static class RpcHttpEndpoints
         {
             stream.State.OnCancel(null);
             registry.Remove(callKey);
-            EmitAccessLog(server, info.WireName, "stream", "ok", "", "", start, StatusCodes.Status200OK, callKey);
+            EmitAccessLog(server, protocol, info.WireName, "stream", "ok", "", "", start, StatusCodes.Status200OK, callKey);
             var cancelBuffer = new MemoryStream();
             await using (var cancelWriter = new WireWriter(cancelBuffer, outputSchema))
             {
@@ -1872,7 +1872,7 @@ public static class RpcHttpEndpoints
             catch (Exception exc)
             {
                 registry.Remove(callKey);
-                await ErrorResultAsync(server, method, exc, StatusCodes.Status500InternalServerError, outputSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
+                await ErrorResultAsync(server, protocol, method, exc, StatusCodes.Status500InternalServerError, outputSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
                 return;
             }
         }
@@ -1888,7 +1888,7 @@ public static class RpcHttpEndpoints
             catch (Exception exc)
             {
                 registry.Remove(callKey);
-                await ErrorResultAsync(server, method, exc, StatusCodes.Status500InternalServerError, outputSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
+                await ErrorResultAsync(server, protocol, method, exc, StatusCodes.Status500InternalServerError, outputSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
                 return;
             }
         }
@@ -1898,7 +1898,7 @@ public static class RpcHttpEndpoints
         // scratch and the per-session lock is acquired and released within this one turn only,
         // never held across turns (spec §5's "same-session calls serialize" is about concurrent
         // requests, not about a producer/exchange stream's own successive turns).
-        var stickyResolution = await TryResolveStickyAsync(sticky, server, method, context, outputSchema, encoding, useCustomHeader, compressionLevel, tokenKey, "stream").ConfigureAwait(false);
+        var stickyResolution = await TryResolveStickyAsync(sticky, server, protocol, method, context, outputSchema, encoding, useCustomHeader, compressionLevel, tokenKey, "stream").ConfigureAwait(false);
         if (stickyResolution is null)
         {
             return; // error response already written
@@ -1953,7 +1953,7 @@ public static class RpcHttpEndpoints
                 FinishSticky(context, sticky!, stickyState);
             }
 
-            await ErrorResultAsync(server, method, turnException, StatusCodes.Status500InternalServerError, outputSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
+            await ErrorResultAsync(server, protocol, method, turnException, StatusCodes.Status500InternalServerError, outputSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
             return;
         }
 
@@ -1993,7 +1993,7 @@ public static class RpcHttpEndpoints
                 }
 
                 var overshoot = new RpcException("RuntimeError", $"Externalised payload exceeds max_externalized_response_bytes ({predicted} > {externalCap}) for method '{method}'");
-                await ErrorResultAsync(server, method, overshoot, StatusCodes.Status500InternalServerError, outputSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
+                await ErrorResultAsync(server, protocol, method, overshoot, StatusCodes.Status500InternalServerError, outputSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
                 return;
             }
 
@@ -2075,7 +2075,7 @@ public static class RpcHttpEndpoints
             }
 
             context.Response.Headers[RpcErrorHeader] = "true";
-            EmitAccessLog(server, info.WireName, "stream", "error", "ResponseTooLargeError", overshoot.Message, start, StatusCodes.Status200OK, callKey);
+            EmitAccessLog(server, protocol, info.WireName, "stream", "error", "ResponseTooLargeError", overshoot.Message, start, StatusCodes.Status200OK, callKey);
             if (stickyState is not null)
             {
                 FinishSticky(context, sticky!, stickyState);
@@ -2085,7 +2085,7 @@ public static class RpcHttpEndpoints
             return;
         }
 
-        EmitAccessLog(server, info.WireName, "stream", "ok", "", "", start, StatusCodes.Status200OK, callKey);
+        EmitAccessLog(server, protocol, info.WireName, "stream", "ok", "", "", start, StatusCodes.Status200OK, callKey);
         if (stickyState is not null)
         {
             FinishSticky(context, sticky!, stickyState);
@@ -2096,6 +2096,7 @@ public static class RpcHttpEndpoints
 
     private static async Task ErrorResultAsync(
         RpcServer server,
+        string protocol,
         string method,
         Exception exception,
         int httpStatusCode,
@@ -2106,8 +2107,7 @@ public static class RpcHttpEndpoints
         bool useCustomHeader,
         int? compressionLevel,
         string methodType = "unary",
-        string? streamId = null,
-        string? protocol = null)
+        string? streamId = null)
     {
         var start = Stopwatch.GetTimestamp();
         using var buffer = new MemoryStream();
@@ -2117,7 +2117,7 @@ public static class RpcHttpEndpoints
             await writer.WriteOwnedBatchAsync(ValueCodec.EmptyRow(schema), metadata).ConfigureAwait(false);
         }
 
-        EmitAccessLog(server, method, methodType, "error", exception.GetType().Name, exception.Message, start, httpStatusForLog, streamId, protocol);
+        EmitAccessLog(server, protocol, method, methodType, "error", exception.GetType().Name, exception.Message, start, httpStatusForLog, streamId);
 
         // Matches Python's _set_http_status: only a 500 gets folded into 200+header — 4xx/415
         // protocol-level rejections keep their real status code.
@@ -2232,14 +2232,42 @@ public static class RpcHttpEndpoints
     /// <summary><paramref name="protocol"/> names the protocol a namespaced route resolved to.
     /// It defaults to the application protocol: a record that labelled a reflection or identity
     /// call with the application's name would look plausible rather than failing.</summary>
-    private static void EmitAccessLog(RpcServer server, string method, string methodType, string status, string errorType, string errorMessage, long startTimestamp, int httpStatus, string? streamId = null, string? protocol = null)
+    /// <summary>
+    /// Write one access record for an HTTP dispatch, under the routing key the request path
+    /// resolved to — the binding that owns the dispatched method, never the server's primary.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Required, and placed next to <c>server</c>, because it used to be an optional
+    /// trailing parameter defaulting to <c>server.ProtocolName</c>, and five of the eight call
+    /// sites simply omitted it. Every one of them looked correct: for an application method the
+    /// primary <em>is</em> the owning binding, so the records were right by coincidence and would
+    /// have stayed right until the first co-hosted protocol declared a streaming method. A
+    /// default that is usually correct is worse than none — it produces a well-formed record,
+    /// passing the schema and grouping plausibly on a dashboard, while a consumer keying on
+    /// <c>protocol_hash</c> decodes it against the wrong description.
+    /// </para>
+    /// <para>
+    /// A required parameter rather than a convention the source-scanning guard checks: the guard
+    /// reads <c>new AccessLogRecord(...)</c>, and there is exactly one of those here, inside this
+    /// method. It was green throughout, because the site it inspects was never the site that was
+    /// wrong. The compiler can see what the scanner cannot.
+    /// </para>
+    /// <para>
+    /// The framework endpoints that belong to no protocol (<c>__upload_url__</c>) pass
+    /// <c>server.ProtocolName</c> explicitly — <c>access-log-spec.md</c> §3 prescribes the
+    /// server's primary for those, so it is the specified behaviour rather than a gap in it, and
+    /// it now says so at the call site instead of happening silently here.
+    /// </para>
+    /// </remarks>
+    private static void EmitAccessLog(RpcServer server, string protocol, string method, string methodType, string status, string errorType, string errorMessage, long startTimestamp, int httpStatus, string? streamId = null)
     {
         if (server.AccessLog is not { } sink)
         {
             return;
         }
 
-        var resolvedProtocol = protocol ?? server.ProtocolName;
+        var resolvedProtocol = LoggableProtocol(server, protocol);
         var durationMs = Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
         sink.Write(new AccessLogRecord(
             Timestamp: DateTimeOffset.UtcNow,
@@ -2262,6 +2290,21 @@ public static class RpcHttpEndpoints
             ServerVersion: server.ServerVersion,
             StreamId: streamId));
     }
+
+    /// <summary>
+    /// The routing key an access record may name: the request's, when this server actually hosts
+    /// it; otherwise the server's primary.
+    /// </summary>
+    /// <remarks>
+    /// The routing key arrives in the URL, so on the 404 path it is an arbitrary caller-supplied
+    /// string. A message goes to one caller and is gone; a log field is shared, retained, and
+    /// assumed to be of bounded cardinality by everything that groups on it. Echoing the
+    /// requested name would let any client mint unbounded label values in someone's metrics
+    /// backend. So the fallback is not a convenience -- it is the reason the record does not
+    /// simply repeat what it was asked for.
+    /// </remarks>
+    private static string LoggableProtocol(RpcServer server, string requested) =>
+        server.MethodsForProtocol(requested) is null ? server.ProtocolName : requested;
 
     /// <summary>Unwraps a reflection-invocation exception to the real one it wraps — matches
     /// <see cref="RpcServer"/>'s private helper of the same name (see that type for why one

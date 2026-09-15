@@ -69,6 +69,68 @@ public class RecordIdentitySourceGuardTests
         }
     }
 
+    /// <summary>
+    /// No HTTP emit site smuggles the server's primary in where a resolved routing key exists.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The guard above reads <c>new AccessLogRecord(...)</c>, and <c>RpcHttpEndpoints</c> has
+    /// exactly one of those — inside <c>EmitAccessLog</c>, which has always derived both fields
+    /// from one lookup. It was green the entire time five of that method's eight callers were
+    /// passing nothing at all, because the site it inspects was never the site that was wrong:
+    /// the routing key is chosen by the caller, and the omission was invisible one frame down.
+    /// </para>
+    /// <para>
+    /// Presence is now the compiler's job — <c>protocol</c> is a required parameter, so a new
+    /// emit site cannot forget it the way the old optional one let five sites forget. What no
+    /// compiler can catch is a site that passes <c>server.ProtocolName</c> while holding a real
+    /// routing key, which is the same bug wearing an explicit argument. So the exemption list is
+    /// pinned here by name: <c>__upload_url__</c> and <c>__transport_options__</c> belong to no
+    /// protocol and <c>access-log-spec.md</c> §3 prescribes the server's primary for exactly
+    /// those. A sixth site joining them has to say so here first.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void OnlyTheProtocolLessFrameworkEndpointsLogTheServersPrimary()
+    {
+        var file = Path.Combine(RepoRoot(), "src", "QueryFarm.VgiRpc.Http", "RpcHttpEndpoints.cs");
+        Assert.True(File.Exists(file), $"sources not found at {file}; this guard reads them and cannot be skipped");
+
+        var primarySites = File.ReadAllLines(file)
+            .Select((text, index) => (Text: text, Line: index + 1))
+            .Where(l => l.Text.Contains("EmitAccessLog(server, server.ProtocolName", StringComparison.Ordinal)
+                        || l.Text.Contains("ErrorResultAsync(server, server.ProtocolName", StringComparison.Ordinal)
+                        || l.Text.Contains("server, server.ProtocolName,", StringComparison.Ordinal))
+            .ToList();
+
+        foreach (var (text, line) in primarySites)
+        {
+            Assert.True(
+                text.Contains("__upload_url__", StringComparison.Ordinal)
+                    || text.Contains("__transport_options__", StringComparison.Ordinal),
+                $"RpcHttpEndpoints.cs:{line} logs the server's primary protocol, but is not one of the "
+                    + "framework endpoints that belong to no protocol (__upload_url__, "
+                    + "__transport_options__). access-log-spec.md §3 requires the record to name the "
+                    + "binding that owns the dispatched method. For an application method the primary "
+                    + "IS that binding, so this reads as correct and stays correct until the first "
+                    + "co-hosted protocol -- at which point the record names one protocol and carries "
+                    + $"another's digest, and nothing about it looks wrong. Offending line: {text.Trim()}");
+        }
+    }
+
+    /// <summary>The guard is only worth having if it can see the sites it is guarding.</summary>
+    [Fact]
+    public void TheHttpEmitSitesAreActuallyFound()
+    {
+        var file = Path.Combine(RepoRoot(), "src", "QueryFarm.VgiRpc.Http", "RpcHttpEndpoints.cs");
+        var calls = File.ReadAllLines(file)
+            .Count(l => l.Contains("EmitAccessLog(server,", StringComparison.Ordinal));
+
+        // Eight call sites today: two unary, four stream, the shared error path, and
+        // __upload_url__. A scan that matches nothing passes vacuously.
+        Assert.True(calls >= 8, $"expected at least the eight known HTTP emit sites, found {calls}");
+    }
+
     /// <summary>The text of one named argument in a record-construction argument list.</summary>
     private static string Argument(string args, string name)
     {
@@ -94,7 +156,13 @@ public class RecordIdentitySourceGuardTests
                 continue;
             }
 
-            var text = File.ReadAllText(file);
+            // Doc comments are dropped before scanning: prose that *names* the construction is not
+            // a construction, and a `<c>new AccessLogRecord(...)</c>` in a remark otherwise
+            // matches, yielding an argument list of "..." and a failure that blames the wrong
+            // thing entirely. Found exactly that way.
+            var text = string.Join(
+                "\n",
+                File.ReadAllLines(file).Where(l => !l.TrimStart().StartsWith("///", StringComparison.Ordinal)));
             const string Marker = "new AccessLogRecord(";
             for (var at = text.IndexOf(Marker, StringComparison.Ordinal); at >= 0;
                  at = text.IndexOf(Marker, at + 1, StringComparison.Ordinal))

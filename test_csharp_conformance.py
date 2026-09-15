@@ -291,6 +291,48 @@ def conformance_http_small_request_cap_port(worker_binary: Path) -> Iterator[int
     )
 
 
+@pytest.fixture
+def conformance_http_access_log(worker_binary: Path, tmp_path: Path) -> Iterator[tuple[int, Path]]:
+    """An HTTP worker writing JSONL access records, yielding ``(port, log_path)``.
+
+    This is the fixture the canonical ``TestRequestId`` group is gated on, and until it existed
+    every one of its log-reading cases silently did not run here: the group was never imported,
+    and the three cases that call ``request.getfixturevalue("conformance_http_access_log")``
+    skip themselves when a runner exposes no such fixture. Neither outcome is a failure, so the
+    absence of the whole access-log-correlation contract read as "fine" rather than "untested" --
+    which is the same shape as the bug the group exists to catch.
+
+    The cases it unlocks are the ones no schema check can make:
+
+    * the ``X-Request-ID`` on a response is the ``request_id`` in the log, so the trail a
+      responder hands a caller actually leads somewhere;
+    * a secondary protocol's record carries *its* name and digest, not the server's primary --
+      only a call to a non-primary protocol can see that, which is how three ports shipped the
+      bug with green suites;
+    * an HTTP stream emits one record per turn, init and every continuation, sharing a
+      ``stream_id``. A transport that logs unary calls and not streams drops exactly the calls
+      that run longest and move the most data, and a validator over the remaining records
+      passes on what is left.
+
+    Its own worker and its own ``tmp_path``: ``--access-log`` appends for the whole life of the
+    process, so a log shared with another test mixes two calls' turns together and the shape
+    assertions fail on traffic that was individually correct.
+    """
+    log_path = tmp_path / "access.jsonl"
+    gen = _spawn_http_worker_port(
+        worker_binary,
+        "--access-log",
+        str(log_path),
+        "--max-response-bytes",
+        str(8 * 1024 * 1024),
+    )
+    port = next(gen)
+    try:
+        yield port, log_path
+    finally:
+        next(gen, None)
+
+
 _CORS_ALLOWED_ORIGIN = "https://allowed.example.com"
 
 
@@ -753,10 +795,35 @@ def test_http_subset_conformant(http_worker: str) -> None:
     assert report["passed"] > 0, "Expected at least one HTTP test to run."
 
 
+#: The wire name of the protocol the conformance worker hosts. HTTP routes are
+#: ``{prefix}/{protocol}/{method}`` since co-hosted protocols became reachable, so a URL
+#: naming only the method resolves to nothing.
+_CONFORMANCE_PROTOCOL = "ConformanceService"
+
+
+def _rpc_url(base: str, method: str) -> str:
+    """The namespaced URL for a unary call on the conformance protocol.
+
+    Hand-built here because these groups drive raw HTTP rather than going through a client.
+    That is also how they came to be wrong: when routes gained the ``{protocol}`` segment,
+    every hand-written flat URL started answering 404, and a 404 on an auth test reads as
+    "the auth hook rejected it" until you look at the status code closely enough to notice it
+    is not a 401. Routed through one helper so the next route change has one site to fix.
+    """
+    return f"{base}/{_CONFORMANCE_PROTOCOL}/{method}"
+
+
 def _arrow_request_body(method: str) -> bytes:
     """Builds a minimal valid Arrow IPC request body for `method` — enough to reach the
     authenticate hook (which runs before method dispatch, so the body's actual content never
-    matters for these tests)."""
+    matters for these tests).
+
+    Stamps ``vgi_rpc.protocol`` alongside the method. Over HTTP the route segment already
+    carries the routing key so the server does not need it, but a request builder that omits
+    it is only accidentally correct: on the raw transports the metadata is the sole carrier,
+    and this same omission in the reference's own hand-built builders is what made a correct
+    server look broken to three ports.
+    """
     import pyarrow as pa
     from vgi_rpc.utils import new_ipc_stream
 
@@ -765,13 +832,17 @@ def _arrow_request_body(method: str) -> bytes:
     with new_ipc_stream(buf, schema) as writer:
         writer.write_batch(
             pa.RecordBatch.from_pydict({"value": ["x"]}, schema=schema),
-            custom_metadata={b"vgi_rpc.method": method.encode(), b"vgi_rpc.request_version": b"1"},
+            custom_metadata={
+                b"vgi_rpc.method": method.encode(),
+                b"vgi_rpc.request_version": b"1",
+                b"vgi_rpc.protocol": _CONFORMANCE_PROTOCOL.encode(),
+            },
         )
     return buf.getvalue()
 
 
 # M8 (see docs/roadmap.md): the normative cross-language contract is
-# ~/Development/vgi-rpc/docs/unauthorized-spec.md §7's TestUnauthorized table. Its own pytest
+# ~/Development/vgi-rpc-python/docs/unauthorized-spec.md §7's TestUnauthorized table. Its own pytest
 # fixtures (conformance_http_auth_port, etc.) are wired through that repo's own conftest
 # machinery that this repo doesn't hook into, so these check the same properties directly against
 # the real HTTP responses instead — reading straight off the spec doc rather than guessing.
@@ -782,7 +853,7 @@ class TestUnauthorized:
         import httpx2
 
         resp = httpx2.post(
-            f"{http_auth_worker}/echo_string",
+            _rpc_url(http_auth_worker, "echo_string"),
             content=_arrow_request_body("echo_string"),
             headers={"Content-Type": "application/vnd.apache.arrow.stream"},
         )
@@ -793,7 +864,7 @@ class TestUnauthorized:
         import httpx2
 
         resp = httpx2.post(
-            f"{http_auth_worker}/echo_string",
+            _rpc_url(http_auth_worker, "echo_string"),
             content=_arrow_request_body("echo_string"),
             headers={"Content-Type": "application/vnd.apache.arrow.stream"},
         )
@@ -811,7 +882,7 @@ class TestUnauthorized:
         import httpx2
 
         resp = httpx2.post(
-            f"{http_auth_worker}/echo_string",
+            _rpc_url(http_auth_worker, "echo_string"),
             content=_arrow_request_body("echo_string"),
             headers={"Content-Type": "application/vnd.apache.arrow.stream", "Accept": "*/*"},
         )
@@ -825,7 +896,7 @@ class TestUnauthorized:
         import httpx2
 
         resp = httpx2.post(
-            f"{http_auth_worker}/echo_string",
+            _rpc_url(http_auth_worker, "echo_string"),
             content=_arrow_request_body("echo_string"),
             headers={"Content-Type": "application/vnd.apache.arrow.stream", "Accept": "text/html"},
         )
@@ -836,7 +907,7 @@ class TestUnauthorized:
         import httpx2
 
         resp = httpx2.post(
-            f"{http_auth_worker}/echo_string",
+            _rpc_url(http_auth_worker, "echo_string"),
             content=_arrow_request_body("echo_string"),
             headers={"Content-Type": "application/vnd.apache.arrow.stream"},
         )
@@ -846,7 +917,7 @@ class TestUnauthorized:
         import httpx2
 
         resp = httpx2.post(
-            f"{http_auth_worker}/echo_string",
+            _rpc_url(http_auth_worker, "echo_string"),
             content=_arrow_request_body("echo_string"),
             headers={"Content-Type": "application/vnd.apache.arrow.stream"},
         )
@@ -857,7 +928,7 @@ class TestUnauthorized:
         import httpx2
 
         resp = httpx2.post(
-            f"{http_auth_proxy_worker}/echo_string",
+            _rpc_url(http_auth_proxy_worker, "echo_string"),
             content=_arrow_request_body("echo_string"),
             headers={"Content-Type": "application/vnd.apache.arrow.stream"},
         )
@@ -871,7 +942,7 @@ class TestUnauthorized:
         import httpx2
 
         resp = httpx2.post(
-            f"{http_auth_worker}/echo_string",
+            _rpc_url(http_auth_worker, "echo_string"),
             content=_arrow_request_body("echo_string"),
             headers={"Content-Type": "application/vnd.apache.arrow.stream", "X-Conformance-Auth-Reason": reason},
         )
@@ -882,7 +953,7 @@ class TestUnauthorized:
         import httpx2
 
         resp = httpx2.post(
-            f"{http_auth_worker}/echo_string",
+            _rpc_url(http_auth_worker, "echo_string"),
             content=_arrow_request_body("echo_string"),
             headers={"Content-Type": "application/vnd.apache.arrow.stream", "X-Conformance-Auth-Reason": "no-such-reason"},
         )
@@ -895,7 +966,7 @@ class TestUnauthorized:
         seen = set()
         for reason in reasons:
             resp = httpx2.post(
-                f"{http_auth_worker}/echo_string",
+                _rpc_url(http_auth_worker, "echo_string"),
                 content=_arrow_request_body("echo_string"),
                 headers={"Content-Type": "application/vnd.apache.arrow.stream", "X-Conformance-Auth-Reason": reason},
             )
@@ -908,7 +979,7 @@ class TestUnauthorized:
         import httpx2
 
         resp = httpx2.post(
-            f"{http_auth_worker}/echo_string",
+            _rpc_url(http_auth_worker, "echo_string"),
             content=_arrow_request_body("echo_string"),
             headers={"Content-Type": "application/vnd.apache.arrow.stream", "X-Conformance-Auth-Reason": "proxy_required"},
         )
@@ -993,7 +1064,7 @@ class TestMtls:
         import httpx2
 
         resp = httpx2.post(
-            f"{mtls_worker}/echo_string",
+            _rpc_url(mtls_worker, "echo_string"),
             content=_arrow_request_body("echo_string"),
             headers={
                 "Content-Type": "application/vnd.apache.arrow.stream",
@@ -1006,7 +1077,7 @@ class TestMtls:
         import httpx2
 
         resp = httpx2.post(
-            f"{mtls_worker}/echo_string",
+            _rpc_url(mtls_worker, "echo_string"),
             content=_arrow_request_body("echo_string"),
             headers={"Content-Type": "application/vnd.apache.arrow.stream"},
         )
@@ -1018,7 +1089,7 @@ class TestMtls:
         from urllib.parse import quote
 
         resp = httpx2.post(
-            f"{mtls_worker}/echo_string",
+            _rpc_url(mtls_worker, "echo_string"),
             content=_arrow_request_body("echo_string"),
             headers={
                 "Content-Type": "application/vnd.apache.arrow.stream",
@@ -1037,7 +1108,7 @@ class TestMtls:
         import httpx2
 
         resp = httpx2.post(
-            f"{mtls_worker}/echo_string",
+            _rpc_url(mtls_worker, "echo_string"),
             content=_arrow_request_body("echo_string"),
             headers={
                 "Content-Type": "application/vnd.apache.arrow.stream",
@@ -1064,7 +1135,38 @@ from vgi_rpc.conformance._pytest_suite import TestProxyProof, TestProxyProofOffM
 # M12: the canonical TestTokenIntrospection (+ TestTokenIntrospectionOffMode) groups, collected
 # against conformance_http_introspect_port (above) and conformance_http_port (M10's sticky
 # fixture) respectively.
-from vgi_rpc.conformance._pytest_suite import TestTokenIntrospection, TestTokenIntrospectionOffMode  # noqa: E402,F401
+#
+# Conditional because the reference deleted this group: introspection moved off the
+# POST {prefix}/__introspect_token__ HTTP JSON route and became the vgi_rpc.Identity.v1
+# protocol, reachable on every transport instead of one. This port still implements the HTTP
+# route, so the groups exist upstream only for as long as it has not migrated -- and the day it
+# does, these imports are what has to go, not something to restore.
+#
+# Guarded rather than deleted, and surfaced as a skip rather than swallowed: an import that
+# quietly stops collecting two groups looks exactly like two groups that pass. The skip reason
+# is the migration's name, so a run says what is missing and why.
+try:
+    from vgi_rpc.conformance._pytest_suite import (  # noqa: E402,F401
+        TestTokenIntrospection,
+        TestTokenIntrospectionOffMode,
+    )
+except ImportError:
+
+    @pytest.mark.skip(
+        reason="reference retired TestTokenIntrospection: introspection is now the "
+        "vgi_rpc.Identity.v1 protocol, not an HTTP JSON route. This port still serves "
+        "POST /__introspect_token__ and has not migrated."
+    )
+    def test_token_introspection_conformance_group_is_gone_upstream() -> None:
+        """Placeholder so the retired group shows up as a named skip, not as silence."""
+
+# The canonical TestRequestId group, collected against conformance_http_port (M10's fixture)
+# and conformance_http_access_log (above). Imported late, because until the access-log fixture
+# existed there was nothing for its correlation cases to read: three of its six cases resolve
+# that fixture by name and skip when a runner has none, so importing the group without it would
+# have added four passing header checks and two quiet skips, and left the half of the contract
+# that needs a log entirely unenforced.
+from vgi_rpc.conformance._pytest_suite import TestRequestId  # noqa: E402,F401
 
 # M13: the canonical TestExternalLocation + TestExternalizedResponseCap groups
 # (vgi_rpc.conformance._pytest_suite), collected against conformance_http_with_storage_port /

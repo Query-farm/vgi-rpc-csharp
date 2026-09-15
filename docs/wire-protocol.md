@@ -1,13 +1,22 @@
 # Wire protocol
 
 vgi-rpc-csharp implements the same wire protocol as every other vgi-rpc port. The normative,
-language-agnostic spec lives in the canonical Python repository, not here:
+language-agnostic spec lives in the canonical Python repository, not here.
 
-- `~/Development/vgi-rpc/docs/WIRE_PROTOCOL.md` — byte-level spec (framing, metadata keys, type
+**Which Python repository.** The canonical one is
+[`vgi-rpc-python`](https://github.com/Query-farm/vgi-rpc-python) — locally
+`~/Development/vgi-rpc-python`. A `~/Development/vgi-rpc` checkout is a *different, older* tree:
+it predates the multiservice work, so it has no routing key, flat rather than protocol-namespaced
+routes, and a live `__describe__`. Its version number is numerically **higher**, which makes it
+read as the newer of the two; it is not. Reading a spec there describes a protocol this port no
+longer speaks. Set `VGI_RPC_PYTHON` to pick the interpreter the test harness uses (see
+`conftest.py`), rather than relying on whichever sibling checkout happens to exist.
+
+- `~/Development/vgi-rpc-python/docs/WIRE_PROTOCOL.md` — byte-level spec (framing, metadata keys, type
   mapping, HTTP endpoints/headers/tokens, SHM header format).
-- `~/Development/vgi-rpc/docs/porting-guide.md` — the "port to a new language" checklist this repo
+- `~/Development/vgi-rpc-python/docs/porting-guide.md` — the "port to a new language" checklist this repo
   is being built against.
-- `~/Development/vgi-rpc/docs/access-log-spec.md`, `docs/sticky-sessions-spec.md`,
+- `~/Development/vgi-rpc-python/docs/access-log-spec.md`, `docs/sticky-sessions-spec.md`,
   `docs/proxy-proof-spec.md`, `docs/unauthorized-spec.md` — feature-specific normative specs.
 
 ## The one C#-specific wrinkle: Apache.Arrow can't write per-batch `custom_metadata`

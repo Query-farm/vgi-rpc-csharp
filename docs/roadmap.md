@@ -2,7 +2,7 @@
 
 This repo targets full feature parity with the other [vgi-rpc](https://github.com/Query-farm/vgi-rpc)
 ports (Go, Rust, TypeScript, Java). Everything below is in scope — this list orders *risk and
-dependency*, not what eventually ships. See `~/Development/vgi-rpc/docs/porting-guide.md` (in the
+dependency*, not what eventually ships. See `~/Development/vgi-rpc-python/docs/porting-guide.md` (in the
 canonical Python repo) for the language-agnostic porting checklist this plan is built on.
 
 - [x] **M0 — Wire spike.** A thin `QueryFarm.VgiRpc.Wire` layer over a vendored, patched
@@ -220,7 +220,7 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       test ever needs it.
 - [x] **M8 — Unauthorized-response spec + bearer auth.** `QueryFarm.VgiRpc.Http.Unauthorized.cs`
       implements the full cross-language contract in
-      `~/Development/vgi-rpc/docs/unauthorized-spec.md` — the generic reason-code/JSON-envelope
+      `~/Development/vgi-rpc-python/docs/unauthorized-spec.md` — the generic reason-code/JSON-envelope
       machinery every later auth feature (M9 mTLS/JWT, M11 proxy proof) reuses, built once as the
       plan called for. `AuthReason` (the closed 6-code set), `AuthFailure` (thrown by an
       authenticator to reject with a specific reason), `UnauthorizedResponseWriter` (headers +
@@ -233,7 +233,7 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       porting guide); any exception an authenticate delegate throws becomes a 401 (`AuthFailure`
       classified by its `Reason`, anything else falls to `Unauthorized` with an empty detail —
       never leaking the exception's own message, per §2's anti-oracle rule).
-      Verified against the real spec, not self-consistently: `~/Development/vgi-rpc/docs/unauthorized-spec.md`
+      Verified against the real spec, not self-consistently: `~/Development/vgi-rpc-python/docs/unauthorized-spec.md`
       §7's own `TestUnauthorized` table has its own pytest-fixture wiring this repo doesn't hook
       into, so `test_csharp_conformance.py`'s `TestUnauthorized` class checks the same 12
       properties directly against real HTTP responses (`httpx2`) from a worker started with the

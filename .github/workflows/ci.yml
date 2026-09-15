@@ -154,6 +154,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The reference is installed from a checkout of vgi-rpc-python, not from PyPI. A bare
+      # `pip install vgi-rpc` is a pin too -- it resolves to the newest *release*, which predates
+      # the multiservice work, so the whole suite runs against a reference that refuses every
+      # namespaced call. That failure reads as a broken worker, not as a wrong reference, and
+      # another port lost a day to exactly this before anyone looked at where the package came
+      # from. The other two conformance jobs below already check the repo out; this one did not.
+      - uses: actions/checkout@v4
+        with:
+          repository: Query-farm/vgi-rpc-python
+          path: _conformance/vgi-rpc
       - uses: actions/setup-dotnet@v4
         with:
           global-json-file: global.json
@@ -176,7 +186,7 @@ jobs:
       # threshold fails with ModuleNotFoundError, found via a real CI run (the local sibling
       # checkout's own dev venv already had aiohttp installed, which is exactly the trap this
       # comment on M9's identical mTLS/cryptography miss warned about repeating).
-      - run: pip install "vgi-rpc[conformance,http,external]" pytest cryptography
+      - run: pip install -e "./_conformance/vgi-rpc[conformance,http,external]" pytest cryptography
       # test_csharp_conformance.py's worker_binary fixture builds the worker itself.
       - run: python -m pytest test_csharp_conformance.py -v
 
