@@ -926,7 +926,13 @@ public static class RpcHttpEndpoints
             await ErrorResultAsync(
                 server,
                 method,
-                new MethodNotImplementedException($"Protocol '{protocol}' has no method '{method}'. Available methods: [{available}]"),
+                // `__describe__` is retired rather than merely absent, and the two are
+                // indistinguishable from the caller's side while needing opposite fixes. Same
+                // single special case the serve loop makes; every other name keeps the plain
+                // capability answer a client probing for an optional method needs.
+                method == RpcServer.RetiredDescribeMethodName
+                    ? new MethodNotImplementedException(RpcServer.RetiredDescribeMessage)
+                    : new MethodNotImplementedException($"Protocol '{protocol}' has no method '{method}'. Available methods: [{available}]"),
                 StatusCodes.Status404NotFound,
                 s_emptySchema,
                 httpStatusForLog: StatusCodes.Status404NotFound, context, encoding, useCustomHeader, compressionLevel, protocol: protocol).ConfigureAwait(false);
@@ -2238,8 +2244,15 @@ public static class RpcHttpEndpoints
         sink.Write(new AccessLogRecord(
             Timestamp: DateTimeOffset.UtcNow,
             ServerId: server.ServerId,
+            // One lookup feeds both fields, so a record cannot name one protocol and carry
+            // another's digest -- the shape the canonical Python implementation shipped, where
+            // the name was per-binding and the hash was the primary's. access-log-spec.md §3
+            // makes protocol_hash the registry key for decoding archived records, so a
+            // disagreeing pair decodes against the wrong description while looking entirely
+            // well-formed. See RpcServer.EmitAccessLogAsync, which is the same rule on the
+            // transports that dispatch through the serve loop.
             Protocol: resolvedProtocol,
-            ProtocolHash: resolvedProtocol == server.ProtocolName ? server.ProtocolHash : server.ProtocolHashFor(resolvedProtocol),
+            ProtocolHash: server.ProtocolHashFor(resolvedProtocol),
             Method: method,
             MethodType: methodType,
             Status: status,

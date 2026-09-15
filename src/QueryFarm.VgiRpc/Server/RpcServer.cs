@@ -1,5 +1,4 @@
-using System.Security.Cryptography;
-using System.Text;
+using System.Collections.Concurrent;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using QueryFarm.VgiRpc.AccessLog;
@@ -16,8 +15,9 @@ namespace QueryFarm.VgiRpc.Server;
 
 /// <summary>
 /// Dispatches RPC calls (unary and streaming) from a service interface to a plain
-/// implementation object. See docs/roadmap.md — auth and the `__describe__` synthetic method
-/// land in a later milestone; `__transport_options__` (M14) is implemented here.
+/// implementation object. See docs/roadmap.md — auth lands in a later milestone;
+/// `__transport_options__` (M14) is implemented here, and `__describe__` is retired (see
+/// <see cref="RetiredDescribeMethodName"/>).
 /// </summary>
 public sealed class RpcServer
 {
@@ -32,18 +32,42 @@ public sealed class RpcServer
     private readonly IReadOnlySet<string> _methodNames;
     private readonly IReadOnlySet<string> _identityMethodNames;
 
+    /// <summary>Memoised <see cref="BindingHashFor"/> results, keyed by protocol name.</summary>
+    /// <remarks>
+    /// Canonicalising and digesting a description is not free and the answer never changes for
+    /// the life of a server, while an access record wants it on every call. Only hosted names
+    /// are cached: the key would otherwise be chosen by whoever sent the request.
+    /// </remarks>
+    private readonly ConcurrentDictionary<string, string> _bindingHashes = new(StringComparer.Ordinal);
+
     /// <summary>The service interface's simple name — the access log's <c>protocol</c> field.</summary>
     public string ProtocolName { get; }
 
     /// <summary>
-    /// A SHA-256 hex digest derived from the registered methods' wire names and schemas —
-    /// the access log's <c>protocol_hash</c> field. Unlike the canonical Python implementation's
-    /// hash (computed from its `__describe__` payload, not yet implemented here), this is NOT
-    /// guaranteed byte-identical across ports — per the Python repo's own CLAUDE.md, that was
-    /// never the cross-language contract to begin with (protocol_version is); this hash only
-    /// needs to be a stable, real value for this one server process.
+    /// The canonical SHA-256 digest of the application protocol's description — the access log's
+    /// <c>protocol_hash</c> field for a call this server's own binding owns.
     /// </summary>
-    public string ProtocolHash { get; }
+    /// <remarks>
+    /// <para>
+    /// The same digest reflection reports for this protocol, computed the same way
+    /// (<see cref="Hash.ProtocolHash.ComputeProtocolHash"/>, WIRE_PROTOCOL.md §14), so it is
+    /// byte-identical to every other port hosting the same protocol. It used to be a port-local
+    /// digest over a StringBuilder of Arrow <c>TypeId</c>s, which was a stable, real value and
+    /// also a useless one: <c>access-log-spec.md</c> §3 makes <c>protocol_hash</c> "the registry
+    /// key when decoding archived records", and a registry is keyed by what
+    /// <c>list_protocols</c>/<c>describe</c> report. A record carrying the other digest names a
+    /// key that is in no registry, and nothing about it looks wrong -- it is 64 lowercase hex
+    /// characters, it passes the schema, it groups plausibly on a dashboard.
+    /// </para>
+    /// <para>
+    /// Computed once on first use rather than in the constructor: <see cref="Hash.TypeTokens"/>
+    /// refuses to spell an Arrow type it has no canonical token for, and that refusal belongs on
+    /// the call that asked rather than on every server's startup path. A server that cannot
+    /// produce this digest also cannot answer <c>list_protocols</c>, which every conformant
+    /// server hosts, so it is already broken rather than newly broken here.
+    /// </para>
+    /// </remarks>
+    public string ProtocolHash => BindingHashFor(ProtocolName);
 
     public string? ServerVersion { get; init; }
 
@@ -116,7 +140,6 @@ public sealed class RpcServer
         // The same derivation the clients use to address this server -- shared rather than
         // duplicated, so the two cannot drift into hosting and addressing different names.
         ProtocolName = WireNaming.ForProtocol(serviceInterface);
-        ProtocolHash = ComputeProtocolHash(_methods);
 
         // Identity is registered AFTER reflection (which this port hosts unconditionally, and
         // which is listed ahead of it in HostedProtocols below) so that it appears in
@@ -222,8 +245,15 @@ public sealed class RpcServer
     }
 
     /// <summary>The canonical hash of one hosted protocol — the access log's
-    /// <c>protocol_hash</c> for a call a transport dispatched itself.</summary>
-    internal string ProtocolHashFor(string protocolName) => BindingHashFor(protocolName);
+    /// <c>protocol_hash</c> for any call that protocol's binding owns.</summary>
+    /// <remarks>
+    /// The per-binding counterpart of <see cref="ProtocolHash"/> (which is this, for the
+    /// application protocol), and the accessor a transport dispatching outside the serve loop
+    /// reaches for so its records carry the digest of the protocol they name rather than the
+    /// server's primary. Mirrors the canonical Python implementation's
+    /// <c>RpcServer.protocol_hash_for</c>.
+    /// </remarks>
+    public string ProtocolHashFor(string protocolName) => BindingHashFor(protocolName);
 
     /// <summary>The methods hosted under <paramref name="protocolName"/>, or <see langword="null"/>
     /// if this server does not host that protocol.</summary>
@@ -239,30 +269,6 @@ public sealed class RpcServer
         if (protocolName == ReflectionProtocol.ProtocolName) return s_noMethods;
         if (protocolName == IdentityProtocol.ProtocolName && _identity is not null) return _identityMethods;
         return null;
-    }
-
-    private static string ComputeProtocolHash(IReadOnlyDictionary<string, RpcMethodInfo> methods)
-    {
-        var sb = new StringBuilder();
-        foreach (var name in methods.Keys.OrderBy(k => k, StringComparer.Ordinal))
-        {
-            var info = methods[name];
-            sb.Append(name).Append(':').Append(info.Kind).Append('|');
-            foreach (var field in info.ParamsSchema.FieldsList)
-            {
-                sb.Append(field.Name).Append(':').Append(field.DataType.TypeId).Append(field.IsNullable).Append(',');
-            }
-
-            sb.Append('>');
-            foreach (var field in info.ResultSchema.FieldsList)
-            {
-                sb.Append(field.Name).Append(':').Append(field.DataType.TypeId).Append(field.IsNullable).Append(',');
-            }
-
-            sb.Append(';');
-        }
-
-        return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(sb.ToString())));
     }
 
     /// <summary>Serves requests off <paramref name="transport"/> until the channel closes.</summary>
@@ -363,7 +369,20 @@ public sealed class RpcServer
         // it would deny the client the diagnosis it came for.
         if (request.GetMetadata(MetadataKeys.Protocol) == ReflectionProtocol.ProtocolName)
         {
-            _ = await ServeReflectionAsync(transport.Output, methodName, request, cancellationToken).ConfigureAwait(false);
+            var reflectionStart = System.Diagnostics.Stopwatch.GetTimestamp();
+            var reflectionOutcome = await ServeReflectionAsync(transport.Output, methodName, request, cancellationToken).ConfigureAwait(false);
+            // Logged here rather than inside ServeReflectionAsync because HTTP dispatches the
+            // same method itself and owns its own record (including the HTTP status the
+            // framework knows nothing about) -- the same split identity already uses. Logging it
+            // at all is the point: HTTP already produced a reflection record while this
+            // transport produced none, and two transports disagreeing about whether a call
+            // happened is how an audit trail comes to have a hole that looks like quiet traffic.
+            await EmitAccessLogAsync(
+                methodName, "unary", reflectionOutcome.Status, reflectionOutcome.ErrorType,
+                reflectionOutcome.ErrorMessage, reflectionStart,
+                requestForLog: request,
+                protocol: ReflectionProtocol.ProtocolName,
+                cancellationToken: cancellationToken).ConfigureAwait(false);
             return true;
         }
 
@@ -381,6 +400,24 @@ public sealed class RpcServer
             return true;
         }
 
+        // `__describe__` is *retired*, not merely absent, and the two are indistinguishable from
+        // the caller's side while needing opposite fixes -- update the client, or reconfigure the
+        // server. Answered here, ahead of both the routing check and the version gate, for the
+        // same reason reflection is: this is what a stale or mismatched client calls to find out
+        // what is wrong, so making it depend on naming a protocol it does not know about, or on
+        // already agreeing about versions, would withhold the diagnosis exactly when it is
+        // needed. Only this one reserved name is special-cased; every other keeps the plain
+        // "no such method" answer below, which is what a client probing for an optional method
+        // needs.
+        if (methodName == RetiredDescribeMethodName)
+        {
+            await WriteErrorStreamAsync(
+                transport.Output, s_emptySchema,
+                new MethodNotImplementedException(RetiredDescribeMessage),
+                cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+
         // Routing, before the version gate and before dispatch. On a byte-stream transport
         // `vgi_rpc.protocol` is the ONLY carrier there is -- no path segment, no header -- so an
         // absent key is genuinely unroutable and dispatching anyway means landing on whichever
@@ -393,7 +430,8 @@ public sealed class RpcServer
         // RpcHttpEndpoints.CheckProtocolAgreementAsync, which names what that gives up.)
         //
         // Reserved framework built-ins are server-level, owned by no protocol, and resolved
-        // without routing -- `__transport_options__` below, and `__describe__` when it lands.
+        // without routing -- `__transport_options__` below, and the retired `__describe__`
+        // above.
         // Requiring one of them to name a protocol would break the diagnostic path a mismatched
         // client uses to find out *what* mismatched.
         if (!IsReservedMethodName(methodName)
@@ -808,7 +846,6 @@ public sealed class RpcServer
         AnnotatedBatch? requestForLog = null,
         string? streamId = null,
         string? protocol = null,
-        string? protocolHash = null,
         CancellationToken cancellationToken = default)
     {
         if (_accessLog is null)
@@ -816,6 +853,9 @@ public sealed class RpcServer
             return;
         }
 
+        // A framework endpoint owned by no protocol (`__transport_options__`) logs the server's
+        // primary -- what access-log-spec.md §3 prescribes for those, rather than a gap in it.
+        var resolvedProtocol = protocol ?? ProtocolName;
         var durationMs = System.Diagnostics.Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
 
         string? requestData = null;
@@ -844,8 +884,17 @@ public sealed class RpcServer
             // A co-hosted framework protocol logs under its own name, not the application's:
             // a record saying an identity call happened on the application protocol would send
             // anyone auditing credential resolution to the wrong dashboard.
-            Protocol: protocol ?? ProtocolName,
-            ProtocolHash: protocolHash ?? ProtocolHash,
+            //
+            // The digest is derived from that same name rather than passed alongside it, so the
+            // two cannot disagree. They did in the canonical Python implementation -- the name
+            // was per-binding while the hash was the server's primary at every emit site, so a
+            // reflection record named one protocol and carried another's digest. That is worse
+            // than either field being wrong alone: access-log-spec.md §3 makes protocol_hash the
+            // registry key for decoding archived records, so such a record is decoded against
+            // the wrong description and nothing about it looks wrong. A call site here can get
+            // the protocol wrong; it can no longer get the pair inconsistent.
+            Protocol: resolvedProtocol,
+            ProtocolHash: BindingHashFor(resolvedProtocol),
             Method: method,
             MethodType: methodType,
             Status: status,
@@ -918,6 +967,32 @@ public sealed class RpcServer
         new Dictionary<string, RpcMethodInfo>(StringComparer.Ordinal);
 
     private const string TransportOptionsMethodName = "__transport_options__";
+
+    /// <summary>Introspection's retired predecessor, kept only so a stale caller can be told
+    /// where introspection went.</summary>
+    /// <remarks>
+    /// A caller told merely "no such method" cannot tell "retired" from "this server was built
+    /// without introspection", and those need opposite fixes -- update the client, or
+    /// reconfigure the server. The C++ port spent real time on the first while reading an error
+    /// describing the second.
+    /// </remarks>
+    internal const string RetiredDescribeMethodName = "__describe__";
+
+    /// <summary>The refusal <see cref="RetiredDescribeMethodName"/> earns: fixable from the
+    /// error text alone, without reading a changelog.</summary>
+    /// <remarks>
+    /// Both entry points are named because they are asked in order and answer different
+    /// questions -- <c>list_protocols</c> for what this server hosts, then <c>describe</c> for
+    /// one protocol's methods. The names are read off <see cref="ReflectionProtocol"/> rather
+    /// than spelled, which the canonical Python implementation cannot do (its reflection module
+    /// imports its server module, so the constant is duplicated there and pinned by a test); C#
+    /// has no such cycle, so the message cannot drift from the protocol it points at.
+    /// </remarks>
+    internal static readonly string RetiredDescribeMessage =
+        $"'{RetiredDescribeMethodName}' was retired. Introspection is now the "
+        + $"'{ReflectionProtocol.ProtocolName}' protocol: call '{ReflectionProtocol.ListProtocolsMethod}' "
+        + $"for what this server hosts, then '{ReflectionProtocol.DescribeMethod}' for one "
+        + "protocol's methods.";
 
     /// <summary>Attaches to a client-advertised SHM segment named in <paramref name="request"/>'s
     /// own metadata (WIRE_PROTOCOL.md §11 "SHM segment identity in request metadata"), or returns
@@ -1065,7 +1140,6 @@ public sealed class RpcServer
                     info.WireName, "unary", status, errorType, errorMessage, start,
                     requestForLog: request,
                     protocol: IdentityProtocol.ProtocolName,
-                    protocolHash: BindingHashFor(IdentityProtocol.ProtocolName),
                     cancellationToken: cancellationToken).ConfigureAwait(false);
             }
         }
@@ -1125,8 +1199,13 @@ public sealed class RpcServer
     /// spell an Arrow type it has no canonical token for, and that refusal belongs on the call
     /// that asked for a description, not on every server's startup path.
     /// </remarks>
-    private string BindingHashFor(string protocolName) =>
-        ReflectionProtocol.BindingHash(protocolName, MethodsForProtocol(protocolName) ?? s_noMethods);
+    private string BindingHashFor(string protocolName)
+    {
+        var methods = MethodsForProtocol(protocolName);
+        return methods is null
+            ? ReflectionProtocol.BindingHash(protocolName, s_noMethods)
+            : _bindingHashes.GetOrAdd(protocolName, name => ReflectionProtocol.BindingHash(name, methods));
+    }
 
     /// <summary>Read the <c>protocol</c> argument off a <c>describe</c> request batch.</summary>
     private static string ReadProtocolArgument(AnnotatedBatch request)

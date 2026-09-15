@@ -124,6 +124,14 @@ async Task HandleUnaryAsync(string op, JsonObject request)
     string method;
     if (op == "describe")
     {
+        // The one `__describe__` call left anywhere in this repo, and it is a *client* call: the
+        // driving harness (the Rust repo's rust_client_proxy.describe, reached through
+        // VGI_CLIENT_DRIVER) still asks for the retired batch shape and parses it with
+        // parse_describe_batch, which reflection's payload is not. Moving this to
+        // list_protocols/describe is a change to that harness's contract, not to this file
+        // alone, so it moves when the harness does. Every server in the fleet now refuses this,
+        // and the refusal says where introspection went -- which is the whole point of the
+        // refusal carrying text.
         batch = ValueCodec.EmptyRow(new Schema([], null));
         metadata = null;
         method = "__describe__";
@@ -131,7 +139,12 @@ async Task HandleUnaryAsync(string op, JsonObject request)
     else
     {
         (batch, metadata) = await ReadOneAsync(request["request_b64"]!.GetValue<string>());
-        method = metadata?.GetValueOrDefault(MetadataKeys.Method) ?? "__describe__";
+        // A unary request always names its method. Defaulting to `__describe__` sent a retired
+        // method under a request that had simply lost its routing metadata, so the answer named
+        // the wrong problem entirely.
+        method = metadata?.GetValueOrDefault(MetadataKeys.Method)
+            ?? throw new InvalidOperationException(
+                $"unary op '{op}': the request batch carries no {MetadataKeys.Method} metadata.");
     }
 
     using (batch)

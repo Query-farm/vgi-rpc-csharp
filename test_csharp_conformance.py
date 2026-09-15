@@ -623,6 +623,12 @@ def test_full_suite_status(worker_binary: Path) -> None:
 # to re-run the whole IMPLEMENTED_FILTER twice per --access-log posture below.
 _ACCESS_LOG_FILTER = "scalar_echo.*,dataclass.echo_point,producer_stream.*,exchange_stream.echo,errors.*"
 
+# The canonical digest of ConformanceService, shared by every port that hosts it (the Python
+# reference pins the same value in tests/golden/protocol_hash_vector.json). Pinned literally
+# rather than recomputed from the worker, because recomputing it here would just re-derive
+# whatever this port happens to do and assert that it equals itself.
+_CONFORMANCE_PROTOCOL_HASH = "5cc768771c2e8a54e19ebb7546c97c119823eb13e20a5ff62ca5ce7ed2a1334e"
+
 
 @pytest.mark.parametrize("debug", [False, True], ids=["info", "debug"])
 def test_access_log_conforms(worker_binary: Path, tmp_path: Path, debug: bool) -> None:
@@ -662,6 +668,21 @@ def test_access_log_conforms(worker_binary: Path, tmp_path: Path, debug: bool) -
     violations = validate_access_logs(entries)
     assert not violations, "access log violations:\n" + "\n".join(
         f"  entry {v.entry_index} ({v.method}) {v.path}: {v.message}" for v in violations
+    )
+
+    # protocol_hash must be the CANONICAL digest (WIRE_PROTOCOL.md §14) -- the one
+    # `describe` reports and every other port computes for this same protocol. The schema only
+    # checks the shape, and a port-local digest is also 64 lowercase hex characters, so nothing
+    # above catches the difference. It matters because access-log-spec.md §3 makes this field
+    # "the registry key when decoding archived records" and a registry is built from what
+    # `describe` reports: the wrong digest is a key into nothing, on records that look entirely
+    # well-formed. This port logged a port-local digest until it was fixed; Go shipped the same
+    # bug independently.
+    app = [e for e in entries if e.get("protocol") == "ConformanceService"]
+    assert app, f"no ConformanceService records; saw protocols {sorted({str(e.get('protocol')) for e in entries})}"
+    assert {e.get("protocol_hash") for e in app} == {_CONFORMANCE_PROTOCOL_HASH}, (
+        f"ConformanceService records carry {sorted({str(e.get('protocol_hash')) for e in app})}, "
+        f"not the canonical {_CONFORMANCE_PROTOCOL_HASH}"
     )
 
 
