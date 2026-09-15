@@ -45,6 +45,16 @@ public sealed class RpcMethodInfo
     /// (with or without a result) and dispatch must await it.</summary>
     public bool IsAsync { get; }
 
+    /// <summary>The record type this stream method declares as its per-stream header, or null.</summary>
+    /// <remarks>
+    /// Declared via <see cref="Attributes.StreamHeaderAttribute"/> because this port supplies the
+    /// header value at run time, which leaves the method signature silent about whether one
+    /// exists. <c>has_header</c> and the header schema are part of the wire surface and therefore
+    /// of the protocol hash, so a port that cannot state them statically cannot agree with any
+    /// other port about what protocol it speaks.
+    /// </remarks>
+    public Type? HeaderClrType { get; }
+
     public RpcMethodInfo(MethodInfo method)
     {
         Method = method;
@@ -61,6 +71,7 @@ public sealed class RpcMethodInfo
         ParamsSchema = new Schema(paramFields, metadata: null);
 
         (ResultClrType, IsAsync) = UnwrapReturnType(method.ReturnType);
+        HeaderClrType = method.GetCustomAttribute<Attributes.StreamHeaderAttribute>()?.HeaderType;
         _invoke = CompileInvoker(method);
         if (method.ReturnType.IsGenericType)
         {
@@ -87,7 +98,7 @@ public sealed class RpcMethodInfo
             Kind = RpcMethodKind.Unary;
             ResultSchema = ResultClrType == typeof(void)
                 ? new Schema([], metadata: null)
-                : new Schema([SchemaDerivation.FieldFor("result", ResultClrType, method.ReturnParameter.IsDefined(typeof(LargeWidthAttribute)))], metadata: null);
+                : new Schema([SchemaDerivation.FieldForReturn("result", method, ResultClrType)], metadata: null);
         }
     }
 

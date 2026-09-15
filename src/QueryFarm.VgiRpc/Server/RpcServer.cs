@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using Apache.Arrow;
+using Apache.Arrow.Types;
 using QueryFarm.VgiRpc.AccessLog;
 using QueryFarm.VgiRpc.Errors;
 using QueryFarm.VgiRpc.Identity;
@@ -213,6 +214,17 @@ public sealed class RpcServer
                 s_emptySchema,
                 new VersionException(nameof(VersionException), $"Unsupported request_version '{requestVersion}' (expected '{MetadataKeys.CurrentRequestVersion}')."),
                 cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+
+        // Reflection is a co-hosted protocol, routed by the same key as
+        // everything else and appearing in its own output. Handled before the
+        // version gate because it is exempt from it: this is what a
+        // version-mismatched client calls to learn what mismatched, and gating
+        // it would deny the client the diagnosis it came for.
+        if (request.GetMetadata(MetadataKeys.Protocol) == ReflectionProtocol.ProtocolName)
+        {
+            await ServeReflectionAsync(transport, methodName, request, cancellationToken).ConfigureAwait(false);
             return true;
         }
 
@@ -735,6 +747,98 @@ public sealed class RpcServer
     /// ready to write back on the wire. Mirrors the canonical Python <c>_check_protocol_version</c>
     /// message shape exactly, including its four distinct "direction" phrasings, so cross-language
     /// error text stays recognizable regardless of which side authored the mismatch.</summary>
+    /// <summary>Serve one call to <c>vgi_rpc.Reflection.v1</c>.</summary>
+    /// <remarks>
+    /// Two methods, deliberately. <c>list_protocols</c> is the cheap question -- what is here,
+    /// and has it changed -- and the only one a client needs on a warm path, because the hash
+    /// answers "has it changed" without transferring any schema. <c>describe</c> is the
+    /// expensive one, asked once.
+    ///
+    /// <para>Self-description is not special-cased: reflection appears in its own output, so a
+    /// client discovers it the same way it discovers everything else.</para>
+    /// </remarks>
+    private async Task ServeReflectionAsync(
+        IRpcTransport transport, string methodName, AnnotatedBatch request, CancellationToken cancellationToken)
+    {
+        var appHash = ReflectionProtocol.BindingHash(ProtocolName, _methods);
+        // Reflection describes itself with no methods of its own in the table:
+        // they are framework-owned rather than registered, so the honest hash is
+        // over an empty method set.
+        var reflectionMethods = new Dictionary<string, RpcMethodInfo>();
+        var reflHash = ReflectionProtocol.BindingHash(ReflectionProtocol.ProtocolName, reflectionMethods);
+
+        byte[] payload;
+        if (methodName == "list_protocols")
+        {
+            payload = ReflectionProtocol.BuildProtocolList(
+                _serverId,
+                "",
+                MetadataKeys.CurrentRequestVersion,
+                [
+                    new ReflectionProtocol.Summary(ProtocolName, _expectedProtocolVersion ?? "", appHash),
+                    new ReflectionProtocol.Summary(ReflectionProtocol.ProtocolName, "", reflHash),
+                ]);
+        }
+        else if (methodName == "describe")
+        {
+            var requested = ReadProtocolArgument(request);
+            if (requested == ProtocolName)
+            {
+                payload = ReflectionProtocol.BuildServiceDescription(
+                    ProtocolName, _expectedProtocolVersion ?? "", appHash, _methods);
+            }
+            else if (requested == ReflectionProtocol.ProtocolName)
+            {
+                payload = ReflectionProtocol.BuildServiceDescription(
+                    ReflectionProtocol.ProtocolName, "", reflHash, reflectionMethods);
+            }
+            else
+            {
+                // Named, not silently empty: an empty description reads as
+                // "this protocol has no methods".
+                await WriteErrorStreamAsync(
+                    transport.Output, s_emptySchema,
+                    new RpcException("RpcException",
+                        $"This server does not host protocol '{requested}'. Hosted: [{ProtocolName}, {ReflectionProtocol.ProtocolName}]"),
+                    cancellationToken).ConfigureAwait(false);
+                return;
+            }
+        }
+        else
+        {
+            await WriteErrorStreamAsync(
+                transport.Output, s_emptySchema,
+                new RpcException("RpcException",
+                    $"Protocol '{ReflectionProtocol.ProtocolName}' has no method '{methodName}'. Available: [describe, list_protocols]"),
+                cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        // The framework's ordinary convention for a structured return: the
+        // payload rides as serialized bytes in a single `result` binary column.
+        var schema = new Schema.Builder()
+            .Field(new Field("result", BinaryType.Default, nullable: false))
+            .Build();
+        var builder = new BinaryArray.Builder();
+        builder.Append((ReadOnlySpan<byte>)payload);
+        var batch = new RecordBatch(schema, [builder.Build()], 1);
+        var md = new Dictionary<string, string>
+        {
+            [MetadataKeys.ServerId] = _serverId,
+            [MetadataKeys.RequestVersion] = MetadataKeys.CurrentRequestVersion,
+        };
+        await using var writer = new WireWriter(transport.Output, schema);
+        await writer.WriteOwnedBatchAsync(batch, md, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Read the <c>protocol</c> argument off a <c>describe</c> request batch.</summary>
+    private static string ReadProtocolArgument(AnnotatedBatch request)
+    {
+        var col = request.Batch.Column("protocol");
+        if (col is not StringArray sa || sa.Length == 0 || sa.IsNull(0)) return "";
+        return sa.GetString(0) ?? "";
+    }
+
     private static ProtocolVersionException? CheckProtocolVersion(AnnotatedBatch request, string serverVersion)
     {
         var clientVersion = request.GetMetadata(MetadataKeys.ProtocolVersion);

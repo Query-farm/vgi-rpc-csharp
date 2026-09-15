@@ -77,6 +77,30 @@ public static class SchemaDerivation
     public static Field FieldForParameter(string wireName, ParameterInfo parameter) =>
         FieldForMember(wireName, parameter.ParameterType, new NullabilityInfoContext().Create(parameter), nested: false, largeWidth: parameter.IsDefined(typeof(LargeWidthAttribute)));
 
+    /// <summary>
+    /// The unary <c>result</c> field, resolved from the method's actual return annotation.
+    /// </summary>
+    /// <remarks>
+    /// Reads the nullable-reference-type annotation rather than guessing from "is a reference
+    /// type": guessing made every <c>string</c>/<c>byte[]</c>/collection return nullable, which
+    /// is a <em>different Arrow type</em> from what the reference declares for the same method.
+    /// No comparison of method names could surface that; only the protocol hash does.
+    ///
+    /// <para>For an async method the annotation describes <c>Task&lt;T&gt;</c>, so the inner
+    /// argument is the one that describes the value the caller actually receives.</para>
+    /// </remarks>
+    public static Field FieldForReturn(string wireName, MethodInfo method, Type resultClrType)
+    {
+        var info = new NullabilityInfoContext().Create(method.ReturnParameter);
+        if (method.ReturnType != resultClrType && info.GenericTypeArguments.Length == 1)
+        {
+            info = info.GenericTypeArguments[0];
+        }
+        return FieldForMember(
+            wireName, resultClrType, info, nested: false,
+            largeWidth: method.ReturnParameter.IsDefined(typeof(LargeWidthAttribute)));
+    }
+
     /// <summary>Same as <see cref="FieldForParameter"/>, for a property of a dataclass-equivalent's own fields.</summary>
     public static Field FieldForProperty(string wireName, PropertyInfo property) =>
         FieldForMember(wireName, property.PropertyType, new NullabilityInfoContext().Create(property), nested: true, largeWidth: false);
@@ -247,13 +271,16 @@ public static class SchemaDerivation
     /// top-level-parameter behavior).</summary>
     private static Field ElementField(string name, Type elementType, bool nested, bool forceNonNullable)
     {
-        if (Nullable.GetUnderlyingType(elementType) is { } underlying)
-        {
-            return new Field(name, ArrowTypeForNonNullable(underlying, nested), nullable: !forceNonNullable);
-        }
-
-        var nullable = !forceNonNullable && (elementType.IsClass || elementType.IsInterface);
-        return new Field(name, ArrowTypeForNonNullable(elementType, nested), nullable);
+        var underlying = Nullable.GetUnderlyingType(elementType);
+        var type = ArrowTypeForNonNullable(underlying ?? elementType, nested);
+        // A list item and a map value are nullable by Arrow's convention,
+        // regardless of the CLR element type -- which describes the *values*, not
+        // the type. Deriving nullability from `IsClass` instead made
+        // `List<long>` produce `list<item: int64 not null>`, a *different Arrow
+        // type* from what every other port produces for the same protocol, and
+        // one that no comparison of method names could ever have surfaced. Only
+        // a map's key is forced non-nullable: Arrow forbids a null map key.
+        return new Field(name, type, nullable: !forceNonNullable);
     }
 
     /// <summary>List/set element type: <c>T[]</c>, <c>List&lt;T&gt;</c>, <c>IEnumerable&lt;T&gt;</c>,

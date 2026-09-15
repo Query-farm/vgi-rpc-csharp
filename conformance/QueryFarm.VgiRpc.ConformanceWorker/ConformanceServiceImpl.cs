@@ -2,6 +2,7 @@ using System.Globalization;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using QueryFarm.VgiRpc.Conformance;
+using QueryFarm.VgiRpc.Reflection;
 using QueryFarm.VgiRpc.Conformance.Errors;
 using QueryFarm.VgiRpc.Conformance.Types;
 using QueryFarm.VgiRpc.Logging;
@@ -43,7 +44,7 @@ public sealed class ConformanceServiceImpl : IConformanceService
 
     public Task<int?> EchoAnnotatedOptionalIntAsync(int? value) => Task.FromResult(value);
 
-    public Task<int?> EchoOuterOptionalNonNullAsync(int? value) => Task.FromResult(value);
+    public Task<int> EchoOuterOptionalNonNullAsync(int value) => Task.FromResult(value);
 
     public Task<Point> EchoPointAsync(Point point) => Task.FromResult(point);
 
@@ -114,7 +115,8 @@ public sealed class ConformanceServiceImpl : IConformanceService
         return Task.FromResult(new byte[targetBytes]);
     }
 
-    public Task<string> EchoLargeStringAsync(string value) => Task.FromResult(value);
+    [return: LargeWidth]
+    public Task<string> EchoLargeStringAsync([LargeWidth] string value) => Task.FromResult(value);
 
     public Task<LargeBytesBuffer> EchoLargeBinaryAsync(LargeBytesBuffer value) => Task.FromResult(value);
 

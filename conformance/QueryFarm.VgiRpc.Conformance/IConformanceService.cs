@@ -1,3 +1,4 @@
+using QueryFarm.VgiRpc.Attributes;
 using QueryFarm.VgiRpc.Conformance.Types;
 using QueryFarm.VgiRpc.Reflection;
 using QueryFarm.VgiRpc.Server;
@@ -54,14 +55,16 @@ public interface IConformanceService
 
     Task<Point?> EchoOptionalPointAsync(Point? point);
 
-    // Python declares these two as `Annotated[int | None, ArrowType(pa.int32())]` and
-    // `Annotated[int, ArrowType(pa.int32(), nullable=False)] | None` respectively — testing
-    // Optional-vs-Annotated resolution order that has no distinct C# equivalent (a nullable CLR
-    // value type already maps to a nullable Arrow field regardless of where "the" nullability
-    // marker sits), so both are simply nullable-int32 echoes on the wire.
+    // Python declares these as `Annotated[int | None, ArrowType(pa.int32())]` and
+    // `Annotated[int, ArrowType(pa.int32(), nullable=False)] | None`, testing
+    // Optional-vs-Annotated resolution order. They resolve to *different Arrow
+    // types* -- nullable int32 and non-nullable int32 -- so the distinction is
+    // not a Python-only subtlety to collapse: declaring both nullable here made
+    // this port describe a wire surface the reference does not have, which only
+    // the protocol hash could surface.
     Task<int?> EchoAnnotatedOptionalIntAsync(int? value);
 
-    Task<int?> EchoOuterOptionalNonNullAsync(int? value);
+    Task<int> EchoOuterOptionalNonNullAsync(int value);
 
     // -- Dataclass round-trip ------------------------------------------------
 
@@ -130,10 +133,13 @@ public interface IConformanceService
     /// but wire-named <c>echo_large_string</c> to match the canonical Python method conformance
     /// tests drive with genuinely large payloads to trigger server-response externalization. The
     /// reference declares this over <c>pa.large_string()</c> (64-bit offsets); this port has no
-    /// attribute-based Arrow-type-width override yet (see docs/roadmap.md), so it reuses the
-    /// default <c>Utf8Type</c> (32-bit offsets) — functionally equivalent for every payload size
-    /// the external-storage conformance suite actually exercises (tens of KB).</summary>
-    Task<string> EchoLargeStringAsync(string value);
+    /// 64-bit-offset <c>large_utf8</c>, declared through <see cref="LargeWidthAttribute"/>.
+    /// It reused the default 32-bit <c>Utf8Type</c> until that attribute existed, on the
+    /// reasoning that the two are functionally equivalent at conformance payload sizes -- true
+    /// of the payloads, and false of the protocol: they are different Arrow types, so the port
+    /// was describing a surface the reference does not have.</summary>
+    [return: LargeWidth]
+    Task<string> EchoLargeStringAsync([LargeWidth] string value);
 
     // -- Large payload (M17) --------------------------------------------------
 
@@ -221,16 +227,22 @@ public interface IConformanceService
 
     // -- Stream headers -------------------------------------------------------
 
+    [StreamHeader(typeof(ConformanceHeader))]
     Task<RpcStream<StreamState>> ProduceWithHeaderAsync(long count);
 
+    [StreamHeader(typeof(ConformanceHeader))]
     Task<RpcStream<StreamState>> ProduceWithHeaderAndLogsAsync(long count, ICallContext? ctx = null);
 
+    [StreamHeader(typeof(ConformanceHeader))]
     Task<RpcStream<StreamState>> ExchangeWithHeaderAsync(double factor);
 
+    [StreamHeader(typeof(RichHeader))]
     Task<RpcStream<StreamState>> ProduceWithRichHeaderAsync(long seed, long count);
 
+    [StreamHeader(typeof(RichHeader))]
     Task<RpcStream<StreamState>> ExchangeWithRichHeaderAsync(long seed, double factor);
 
+    [StreamHeader(typeof(RichHeader))]
     Task<RpcStream<StreamState>> ProduceDynamicSchemaAsync(long seed, long count, bool includeStrings, bool includeFloats);
 
     // -- Sticky Sessions (HTTP-only; capability-gated tests — see docs/roadmap.md M10) ---------
