@@ -53,6 +53,9 @@ static async Task RunHttpClientAsync(CliArguments arguments)
         : null;
     await using var client = new HttpRpcClient(new Uri(arguments.Required("url")), new HttpRpcClientOptions
     {
+        // The server maps IConformanceService, so that is the protocol on the wire —
+        // ITailnetEvidenceService is only this client's typed view of a subset of it.
+        Protocol = "ConformanceService",
         TcpProxy = arguments.Optional("proxy"),
         ConnectTimeout = arguments.Timeout,
         DefaultHeaders = headers,

@@ -115,3 +115,47 @@ public sealed class ServerDrainingException : RpcException
     {
     }
 }
+
+/// <summary>The request named no protocol — no <c>vgi_rpc.protocol</c> routing key.
+/// <para>
+/// Required on every request, including against a server hosting exactly one protocol. An
+/// exemption would cost the property that makes routing safe: an intermediary that rebuilds a
+/// request and drops the field gets a loud rejection instead of silently landing on whichever
+/// protocol happened to be registered first.
+/// </para>
+/// <para>
+/// Named "...Exception" per C# convention (see this file's own doc comment), but its wire
+/// <see cref="RpcException.ErrorType"/> is the literal <c>"ProtocolNotSpecifiedError"</c> —
+/// same reasoning as <see cref="SessionLostException"/>: routing failures are part of the closed
+/// cross-language vocabulary every port spells identically.
+/// </para></summary>
+public sealed class ProtocolNotSpecifiedException : RpcException
+{
+    public const string ErrorKindConst = Wire.MetadataKeys.ErrorKinds.ProtocolNotSpecified;
+
+    public ProtocolNotSpecifiedException(string message)
+        : base("ProtocolNotSpecifiedError", message, errorKind: ErrorKindConst)
+    {
+    }
+}
+
+/// <summary>The named protocol is not hosted by this server.
+/// <para>
+/// Deliberately distinct from <see cref="MethodNotImplementedException"/>: "I do not speak that
+/// protocol" and "I speak it but not that method" are different answers, and a client probing for
+/// an optional protocol has to tell them apart. Maps to HTTP 404, matching unknown-method — gRPC
+/// likewise answers UNIMPLEMENTED for both. Also the answer when the two carriers of the protocol
+/// disagree (there, HTTP 400: the request is malformed rather than unroutable).
+/// </para>
+/// <para>Wire <see cref="RpcException.ErrorType"/> is the literal
+/// <c>"ProtocolNotSupportedError"</c> — see <see cref="ProtocolNotSpecifiedException"/>.</para>
+/// </summary>
+public sealed class ProtocolNotSupportedException : RpcException
+{
+    public const string ErrorKindConst = Wire.MetadataKeys.ErrorKinds.ProtocolNotSupported;
+
+    public ProtocolNotSupportedException(string message)
+        : base("ProtocolNotSupportedError", message, errorKind: ErrorKindConst)
+    {
+    }
+}

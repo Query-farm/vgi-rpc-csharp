@@ -29,6 +29,8 @@ public sealed class RpcServer
     private readonly string? _expectedProtocolVersion;
     private readonly IdentityImpl? _identity;
     private readonly IReadOnlyDictionary<string, RpcMethodInfo> _identityMethods;
+    private readonly IReadOnlySet<string> _methodNames;
+    private readonly IReadOnlySet<string> _identityMethodNames;
 
     /// <summary>The service interface's simple name — the access log's <c>protocol</c> field.</summary>
     public string ProtocolName { get; }
@@ -130,6 +132,8 @@ public sealed class RpcServer
         _identityMethods = offered is { Count: > 0 }
             ? IdentityProtocol.MethodsFor(offered)
             : new Dictionary<string, RpcMethodInfo>(StringComparer.Ordinal);
+        _methodNames = new HashSet<string>(_methods.Keys, StringComparer.Ordinal);
+        _identityMethodNames = new HashSet<string>(_identityMethods.Keys, StringComparer.Ordinal);
     }
 
     /// <summary>The protocols this server hosts, in registration order.</summary>
@@ -144,6 +148,80 @@ public sealed class RpcServer
         _identity is null
             ? [ProtocolName, ReflectionProtocol.ProtocolName]
             : [ProtocolName, ReflectionProtocol.ProtocolName, IdentityProtocol.ProtocolName];
+
+    /// <summary>The method names <paramref name="protocolName"/> answers, or <see langword="null"/>
+    /// if this server does not host that protocol.</summary>
+    /// <remarks>
+    /// Deliberately not <c>MethodsForProtocol(...)?.Keys</c>: reflection's two methods are
+    /// framework-owned rather than registered, so its <i>method table</i> is honestly empty (that
+    /// is what its hash is taken over) while its <i>dispatchable names</i> are the two it
+    /// answers. Routing needs the latter — this is the accessor a transport resolves a path
+    /// against, and the one that lets "protocol not hosted" (404) and "hosted, no such method"
+    /// (404, different <c>error_kind</c>) stay distinguishable, which is the documented
+    /// capability-probe signal.
+    /// </remarks>
+    public IReadOnlySet<string>? MethodNamesForProtocol(string protocolName)
+    {
+        if (protocolName == ProtocolName) return _methodNames;
+        if (protocolName == ReflectionProtocol.ProtocolName) return ReflectionProtocol.MethodNames;
+        if (protocolName == IdentityProtocol.ProtocolName && _identity is not null) return _identityMethodNames;
+        return null;
+    }
+
+    /// <summary>Whether <paramref name="protocolName"/> is served by the framework itself
+    /// (reflection, identity) rather than by the application implementation.</summary>
+    /// <remarks>
+    /// A framework protocol is served by the framework on every transport, so nothing about
+    /// hosting it can perturb what the application protocol puts on the wire. Transports that
+    /// dispatch outside <see cref="ServeOneAsync"/> — HTTP — branch on this to route into
+    /// <see cref="ServeFrameworkUnaryAsync"/> instead of invoking
+    /// <see cref="Implementation"/>.
+    /// </remarks>
+    internal static bool IsFrameworkProtocol(string protocolName) =>
+        protocolName == ReflectionProtocol.ProtocolName || protocolName == IdentityProtocol.ProtocolName;
+
+    /// <summary>The outcome of one framework-protocol dispatch: the schema the response stream
+    /// was written with, plus what to record about it. Handed back rather than logged here
+    /// because a transport that dispatches on its own (HTTP) owns its own access record —
+    /// including the HTTP status the framework knows nothing about.</summary>
+    internal readonly record struct FrameworkDispatch(Schema Schema, string Status, string ErrorType, string ErrorMessage)
+    {
+        public static FrameworkDispatch Ok(Schema schema) => new(schema, "ok", "", "");
+
+        public static FrameworkDispatch Failed(Schema schema, string errorType, string errorMessage) =>
+            new(schema, "error", errorType, errorMessage);
+    }
+
+    /// <summary>Serves one unary call to a framework-owned protocol, writing the complete IPC
+    /// response (result or in-band error batch) into <paramref name="output"/>.</summary>
+    /// <remarks>
+    /// The transport-neutral half of <see cref="ServeOneAsync"/>'s reflection/identity branches,
+    /// extracted so HTTP — which has one request body in and one response body out, and so cannot
+    /// drive a serve loop — reaches the same code rather than a second copy of it. The caller
+    /// supplies the <see cref="ICallContext"/>, which is how the caller's authenticated identity
+    /// reaches identity's guards: on HTTP that identity comes from the request, not from a
+    /// connection-scoped peer.
+    /// </remarks>
+    internal Task<FrameworkDispatch> ServeFrameworkUnaryAsync(
+        string protocolName, string methodName, AnnotatedBatch request, ICallContext callContext,
+        Stream output, CancellationToken cancellationToken)
+    {
+        if (protocolName == ReflectionProtocol.ProtocolName)
+        {
+            return ServeReflectionAsync(output, methodName, request, cancellationToken);
+        }
+
+        if (protocolName == IdentityProtocol.ProtocolName && _identity is not null)
+        {
+            return ServeIdentityAsync(output, methodName, request, callContext, emitAccessLog: false, cancellationToken);
+        }
+
+        throw new ArgumentException($"'{protocolName}' is not a framework protocol hosted here.", nameof(protocolName));
+    }
+
+    /// <summary>The canonical hash of one hosted protocol — the access log's
+    /// <c>protocol_hash</c> for a call a transport dispatched itself.</summary>
+    internal string ProtocolHashFor(string protocolName) => BindingHashFor(protocolName);
 
     /// <summary>The methods hosted under <paramref name="protocolName"/>, or <see langword="null"/>
     /// if this server does not host that protocol.</summary>
@@ -283,7 +361,7 @@ public sealed class RpcServer
         // it would deny the client the diagnosis it came for.
         if (request.GetMetadata(MetadataKeys.Protocol) == ReflectionProtocol.ProtocolName)
         {
-            await ServeReflectionAsync(transport, methodName, request, cancellationToken).ConfigureAwait(false);
+            _ = await ServeReflectionAsync(transport.Output, methodName, request, cancellationToken).ConfigureAwait(false);
             return true;
         }
 
@@ -295,7 +373,9 @@ public sealed class RpcServer
         // depend on whether it had been upgraded in lockstep with the application.
         if (_identity is not null && request.GetMetadata(MetadataKeys.Protocol) == IdentityProtocol.ProtocolName)
         {
-            await ServeIdentityAsync(transport, methodName, request, cancellationToken).ConfigureAwait(false);
+            _ = await ServeIdentityAsync(
+                transport.Output, methodName, request, new BufferedCallContext(),
+                emitAccessLog: true, cancellationToken).ConfigureAwait(false);
             return true;
         }
 
@@ -831,11 +911,11 @@ public sealed class RpcServer
     /// <para>Self-description is not special-cased: reflection appears in its own output, so a
     /// client discovers it the same way it discovers everything else.</para>
     /// </remarks>
-    private async Task ServeReflectionAsync(
-        IRpcTransport transport, string methodName, AnnotatedBatch request, CancellationToken cancellationToken)
+    private async Task<FrameworkDispatch> ServeReflectionAsync(
+        Stream output, string methodName, AnnotatedBatch request, CancellationToken cancellationToken)
     {
         byte[] payload;
-        if (methodName == "list_protocols")
+        if (methodName == ReflectionProtocol.ListProtocolsMethod)
         {
             // Every hosted protocol, in registration order -- which is how identity comes to
             // appear here without reflection knowing anything about it.
@@ -845,20 +925,20 @@ public sealed class RpcServer
             payload = ReflectionProtocol.BuildProtocolList(
                 _serverId, "", MetadataKeys.CurrentRequestVersion, summaries);
         }
-        else if (methodName == "describe")
+        else if (methodName == ReflectionProtocol.DescribeMethod)
         {
             var requested = ReadProtocolArgument(request);
             var requestedMethods = MethodsForProtocol(requested);
             if (requestedMethods is null)
             {
                 // Named, not silently empty: an empty description reads as
-                // "this protocol has no methods".
-                await WriteErrorStreamAsync(
-                    transport.Output, s_emptySchema,
-                    new RpcException("RpcException",
-                        $"This server does not host protocol '{requested}'. Hosted: [{string.Join(", ", HostedProtocols)}]"),
-                    cancellationToken).ConfigureAwait(false);
-                return;
+                // "this protocol has no methods". Typed, too -- "I do not speak that protocol"
+                // carries its own error_kind, distinct from "I speak it but not that method",
+                // and a client probing for an optional protocol depends on the difference.
+                var unhosted = new ProtocolNotSupportedException(
+                    $"This server does not host protocol '{requested}'. Hosted: [{string.Join(", ", HostedProtocols)}]");
+                await WriteErrorStreamAsync(output, s_emptySchema, unhosted, cancellationToken).ConfigureAwait(false);
+                return FrameworkDispatch.Failed(s_emptySchema, unhosted.GetType().Name, unhosted.Message);
             }
 
             payload = ReflectionProtocol.BuildServiceDescription(
@@ -866,12 +946,11 @@ public sealed class RpcServer
         }
         else
         {
-            await WriteErrorStreamAsync(
-                transport.Output, s_emptySchema,
-                new RpcException("RpcException",
-                    $"Protocol '{ReflectionProtocol.ProtocolName}' has no method '{methodName}'. Available: [describe, list_protocols]"),
-                cancellationToken).ConfigureAwait(false);
-            return;
+            var unknown = new MethodNotImplementedException(
+                $"Protocol '{ReflectionProtocol.ProtocolName}' has no method '{methodName}'. "
+                + $"Available: [{string.Join(", ", ReflectionProtocol.MethodNames.OrderBy(k => k, StringComparer.Ordinal))}]");
+            await WriteErrorStreamAsync(output, s_emptySchema, unknown, cancellationToken).ConfigureAwait(false);
+            return FrameworkDispatch.Failed(s_emptySchema, unknown.GetType().Name, unknown.Message);
         }
 
         // The framework's ordinary convention for a structured return: the
@@ -887,8 +966,12 @@ public sealed class RpcServer
             [MetadataKeys.ServerId] = _serverId,
             [MetadataKeys.RequestVersion] = MetadataKeys.CurrentRequestVersion,
         };
-        await using var writer = new WireWriter(transport.Output, schema);
-        await writer.WriteOwnedBatchAsync(batch, md, cancellationToken).ConfigureAwait(false);
+        await using (var writer = new WireWriter(output, schema))
+        {
+            await writer.WriteOwnedBatchAsync(batch, md, cancellationToken).ConfigureAwait(false);
+        }
+
+        return FrameworkDispatch.Ok(schema);
     }
 
     /// <summary>Serve one call to <c>vgi_rpc.Identity.v1</c>.</summary>
@@ -902,8 +985,9 @@ public sealed class RpcServer
     /// guards and to put the answer -- or the refusal, carrying its <c>error_kind</c> -- back on
     /// the wire.</para>
     /// </remarks>
-    private async Task ServeIdentityAsync(
-        IRpcTransport transport, string methodName, AnnotatedBatch request, CancellationToken cancellationToken)
+    private async Task<FrameworkDispatch> ServeIdentityAsync(
+        Stream output, string methodName, AnnotatedBatch request, ICallContext callContext,
+        bool emitAccessLog, CancellationToken cancellationToken)
     {
         if (!_identityMethods.TryGetValue(methodName, out var info))
         {
@@ -911,12 +995,10 @@ public sealed class RpcServer
             // configure is not hosted, so it is "no such method" rather than a refusal from a
             // method that exists.
             var available = string.Join(", ", _identityMethods.Keys.OrderBy(k => k, StringComparer.Ordinal));
-            await WriteErrorStreamAsync(
-                transport.Output, s_emptySchema,
-                new MethodNotImplementedException(
-                    $"Protocol '{IdentityProtocol.ProtocolName}' has no method '{methodName}'. Available: [{available}]"),
-                cancellationToken).ConfigureAwait(false);
-            return;
+            var unknown = new MethodNotImplementedException(
+                $"Protocol '{IdentityProtocol.ProtocolName}' has no method '{methodName}'. Available: [{available}]");
+            await WriteErrorStreamAsync(output, s_emptySchema, unknown, cancellationToken).ConfigureAwait(false);
+            return FrameworkDispatch.Failed(s_emptySchema, unknown.GetType().Name, unknown.Message);
         }
 
         var start = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -926,11 +1008,11 @@ public sealed class RpcServer
         Exception? hookError = null;
         var hookInfo = new DispatchHookInfo(info.WireName, "unary", IdentityProtocol.ProtocolName, _serverId);
         var hookToken = _dispatchHook?.OnDispatchStart(hookInfo);
-        await using var writer = new WireWriter(transport.Output, info.ResultSchema);
+        await using var writer = new WireWriter(output, info.ResultSchema);
         try
         {
             var args = ValueCodec.ExtractRow(request.Batch, info.ParameterTypes);
-            var result = await info.InvokeAsync(_identity!, args, new BufferedCallContext()).ConfigureAwait(false);
+            var result = await info.InvokeAsync(_identity!, args, callContext).ConfigureAwait(false);
             var resultBatch = ValueCodec.BuildRow(info.ResultSchema, [result]);
             using var resultOwner = new RecordBatchOwner(resultBatch);
             await writer.WriteBatchAsync(new AnnotatedBatch(resultBatch, null), cancellationToken).ConfigureAwait(false);
@@ -953,13 +1035,18 @@ public sealed class RpcServer
         finally
         {
             _dispatchHook?.OnDispatchEnd(hookToken, hookInfo, hookError);
-            await EmitAccessLogAsync(
-                info.WireName, "unary", status, errorType, errorMessage, start,
-                requestForLog: request,
-                protocol: IdentityProtocol.ProtocolName,
-                protocolHash: BindingHashFor(IdentityProtocol.ProtocolName),
-                cancellationToken: cancellationToken).ConfigureAwait(false);
+            if (emitAccessLog)
+            {
+                await EmitAccessLogAsync(
+                    info.WireName, "unary", status, errorType, errorMessage, start,
+                    requestForLog: request,
+                    protocol: IdentityProtocol.ProtocolName,
+                    protocolHash: BindingHashFor(IdentityProtocol.ProtocolName),
+                    cancellationToken: cancellationToken).ConfigureAwait(false);
+            }
         }
+
+        return new FrameworkDispatch(info.ResultSchema, status, errorType, errorMessage);
     }
 
     /// <summary>The version a hosted protocol declares, or "" when it declares none.</summary>

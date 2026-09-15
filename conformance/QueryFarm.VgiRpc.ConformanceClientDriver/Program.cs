@@ -309,8 +309,15 @@ static async Task<(RpcClient? Native, HttpRpcClient? Http)> ConnectAsync(JsonObj
         case "http":
             var headers = request["headers"]?.Deserialize<Dictionary<string, string>>();
             var compressionLevel = request.ContainsKey("compression_level") ? request["compression_level"]?.GetValue<int?>() : 3;
+            // RPC paths are namespaced by protocol. The harness may name one (to drive a
+            // co-hosted framework protocol); absent that, this driver addresses the conformance
+            // service, which is the only application protocol a conformance worker hosts.
+            var httpProtocol = request["protocol"]?.GetValue<string>() is { Length: > 0 } named
+                ? named
+                : "ConformanceService";
             return (null, new HttpRpcClient(new Uri(request["target"]!.GetValue<string>()), new HttpRpcClientOptions
             {
+                Protocol = httpProtocol,
                 CompressionLevel = compressionLevel,
                 DefaultHeaders = headers,
                 OnLog = logs.Add,

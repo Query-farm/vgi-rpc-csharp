@@ -21,6 +21,11 @@ namespace QueryFarm.VgiRpc.Http.Tests;
 public sealed class PythonClientWorkerTests
 {
     private const string Prefix = "/vgi";
+
+    /// <summary>The protocol the Python client-conformance worker hosts
+    /// (<c>vgi_rpc.conformance.client_worker.ClientConformanceService</c>) — every RPC path
+    /// against it is <c>{Prefix}/{WorkerProtocol}/{method}</c>.</summary>
+    private const string WorkerProtocol = "ClientConformanceService";
     private static readonly Schema s_emptySchema = new([], null);
     private static readonly Schema s_producerSchema = new(
         [
@@ -34,7 +39,7 @@ public sealed class PythonClientWorkerTests
     public async Task HttpTypedExchange_PreservesDeclaredSchemaForAllNullValues()
     {
         await using var worker = await PythonWorker.StartHttpAsync(Prefix);
-        await using var client = new HttpRpcClient(worker.Address, new HttpRpcClientOptions { Prefix = Prefix });
+        await using var client = new HttpRpcClient(worker.Address, new HttpRpcClientOptions { Prefix = Prefix, Protocol = WorkerProtocol });
         using var parameters = EmptyParameters();
         await using var exchange = await client.OpenExchangeAsync(
             "typed_exchange",
@@ -55,7 +60,7 @@ public sealed class PythonClientWorkerTests
     public async Task HttpTypedExchange_RoundTripsNestedLogicalTypes()
     {
         await using var worker = await PythonWorker.StartHttpAsync(Prefix);
-        await using var client = new HttpRpcClient(worker.Address, new HttpRpcClientOptions { Prefix = Prefix });
+        await using var client = new HttpRpcClient(worker.Address, new HttpRpcClientOptions { Prefix = Prefix, Protocol = WorkerProtocol });
         using var parameters = EmptyParameters();
         await using var exchange = await client.OpenExchangeAsync(
             "typed_exchange",
@@ -80,7 +85,7 @@ public sealed class PythonClientWorkerTests
     public async Task HttpTypedExchange_RejectsAnInferredAllNullWireSchema()
     {
         await using var worker = await PythonWorker.StartHttpAsync(Prefix);
-        await using var client = new HttpRpcClient(worker.Address, new HttpRpcClientOptions { Prefix = Prefix });
+        await using var client = new HttpRpcClient(worker.Address, new HttpRpcClientOptions { Prefix = Prefix, Protocol = WorkerProtocol });
         using var parameters = EmptyParameters();
         await using var exchange = await client.OpenExchangeAsync(
             "typed_exchange",
@@ -104,7 +109,7 @@ public sealed class PythonClientWorkerTests
     public async Task HttpProducer_HandlesContinuationZeroRowAndTerminalTurns()
     {
         await using var worker = await PythonWorker.StartHttpAsync(Prefix, "--producer-turn-bytes", "65536");
-        await using var client = new HttpRpcClient(worker.Address, new HttpRpcClientOptions { Prefix = Prefix });
+        await using var client = new HttpRpcClient(worker.Address, new HttpRpcClientOptions { Prefix = Prefix, Protocol = WorkerProtocol });
 
         using (var parameters = LongParameters(("count", 2), ("payload_bytes", 4)))
         await using (var producer = await client.OpenProducerAsync(
@@ -158,7 +163,7 @@ public sealed class PythonClientWorkerTests
     public async Task HttpStickySession_OpensResumesClosesAndRejectsStaleToken()
     {
         await using var worker = await PythonWorker.StartHttpAsync(Prefix, "--sticky");
-        await using var client = new HttpRpcClient(worker.Address, new HttpRpcClientOptions { Prefix = Prefix });
+        await using var client = new HttpRpcClient(worker.Address, new HttpRpcClientOptions { Prefix = Prefix, Protocol = WorkerProtocol });
         var capabilities = await client.GetCapabilitiesAsync(TestContext.Current.CancellationToken);
         Assert.True(capabilities.StickyEnabled);
         Assert.Equal(60, capabilities.StickyDefaultTtl);
@@ -193,6 +198,7 @@ public sealed class PythonClientWorkerTests
             new HttpRpcClientOptions
             {
                 Prefix = Prefix,
+                Protocol = WorkerProtocol,
                 ExternalLocation = new ClientExternalConfig { UrlValidator = null },
             });
         var capabilities = await client.GetCapabilitiesAsync(TestContext.Current.CancellationToken);
@@ -220,7 +226,7 @@ public sealed class PythonClientWorkerTests
     public async Task HttpsWorker_RequiresAndAcceptsItsPublishedTrustRoot()
     {
         await using var worker = await PythonWorker.StartHttpsAsync(Prefix);
-        await using (var untrusted = new HttpRpcClient(worker.Address, new HttpRpcClientOptions { Prefix = Prefix }))
+        await using (var untrusted = new HttpRpcClient(worker.Address, new HttpRpcClientOptions { Prefix = Prefix, Protocol = WorkerProtocol }))
         {
             await Assert.ThrowsAsync<HttpRequestException>(
                 () => untrusted.GetCapabilitiesAsync(TestContext.Current.CancellationToken));
@@ -244,7 +250,7 @@ public sealed class PythonClientWorkerTests
             },
         };
         using var http = new System.Net.Http.HttpClient(handler) { BaseAddress = worker.Address };
-        await using var trusted = new HttpRpcClient(http, new HttpRpcClientOptions { Prefix = Prefix });
+        await using var trusted = new HttpRpcClient(http, new HttpRpcClientOptions { Prefix = Prefix, Protocol = WorkerProtocol });
 
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         while (true)

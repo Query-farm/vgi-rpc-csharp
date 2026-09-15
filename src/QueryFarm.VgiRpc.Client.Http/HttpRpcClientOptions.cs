@@ -9,6 +9,29 @@ public sealed class HttpRpcClientOptions
     public const long DefaultAcceptedMaxResponseBytes = 256L << 20;
     public string Prefix { get; init; } = "";
 
+    /// <summary>
+    /// Routing key of the hosted protocol every RPC call on this client addresses — e.g.
+    /// <c>"ConformanceService"</c>, <c>"vgi_rpc.Reflection.v1"</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Required: RPC paths are <c>{Prefix}/{Protocol}/{method}</c> and every request batch also
+    /// carries the name as <c>vgi_rpc.protocol</c>. There is no default and no single-protocol
+    /// exemption — a client that does not say which protocol it is addressing would be relying on
+    /// the server to guess, which is precisely the guess the routing rules exist to remove.
+    /// </para>
+    /// <para>
+    /// A client addressing two protocols on one worker (the application's, plus
+    /// <c>vgi_rpc.Reflection.v1</c> to discover it) uses one instance per protocol; they are
+    /// cheap, and an <see cref="System.Net.Http.HttpClient"/> can be shared between them.
+    /// </para>
+    /// <para>
+    /// The server-level reserved endpoints (<c>__upload_url__</c>, the sticky-session route,
+    /// capability discovery) are not protocol-scoped and ignore this.
+    /// </para>
+    /// </remarks>
+    public string Protocol { get; init; } = "";
+
     public int? CompressionLevel { get; init; } = 1;
 
     public ContentEncoding PreferredEncoding { get; init; } = ContentEncoding.Zstd;

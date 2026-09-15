@@ -201,6 +201,31 @@ public static class PeerIdentityAuthentication
         };
     }
 
+    /// <summary>
+    /// Publishes <paramref name="auth"/> as this request's authentication result, so a custom
+    /// <c>authenticate</c> delegate can hand the dispatcher a full <see cref="AuthContext"/> —
+    /// claims included — rather than only a domain/principal pair.
+    /// </summary>
+    /// <remarks>
+    /// Claims are what makes this worth a public entry point. <c>vgi_rpc.Identity.v1</c>'s
+    /// freshness guard reads <c>auth_time</c>, which exists only on an OIDC/JWT credential; a
+    /// delegate that could publish nothing but a principal could never let <c>issue_grant</c>
+    /// succeed. Mirrors what the peer-identity authenticator already does internally, including
+    /// the <see cref="AuthIdentity"/> projection the sticky-session and stream-token AADs bind
+    /// to.
+    /// </remarks>
+    public static void SetAuth(HttpContext context, AuthContext auth)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        ArgumentNullException.ThrowIfNull(auth);
+        context.Items[AuthItem] = auth;
+        var binding = EvidenceBinding(auth);
+        if (auth.Authenticated || binding is not null)
+        {
+            AuthIdentity.SetOn(context, auth.Domain, auth.Principal ?? "", binding, auth.Authenticated);
+        }
+    }
+
     public static AuthContext GetAuth(HttpContext context) => context.Items[AuthItem] as AuthContext
         ?? (AuthIdentity.GetFrom(context) is { } identity
             ? new AuthContext(identity.Domain, identity.Authenticated, identity.Principal)

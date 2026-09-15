@@ -14,7 +14,7 @@ public sealed class IrohHttpClientTests
         var provider = new FakeProvider(Id);
         await using var client = HttpRpcClient.ConnectIroh($"httpi://{Id}/vgi",
             new IrohConnectOptions { RelayUrls = ["https://relay.example.test"] },
-            new HttpRpcClientOptions { AcceptedMaxResponseBytes = 64L << 10 }, provider);
+            new HttpRpcClientOptions { Protocol = "Service", AcceptedMaxResponseBytes = 64L << 10 }, provider);
 
         var capabilities = await client.GetCapabilitiesAsync(TestContext.Current.CancellationToken);
 

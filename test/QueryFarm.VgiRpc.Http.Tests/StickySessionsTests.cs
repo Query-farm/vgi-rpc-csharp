@@ -103,10 +103,29 @@ public class StickySessionsTests
     {
         var identity = new AuthIdentity("d", "alice", "binding-a");
 
-        Assert.NotEqual(StickySessions.ComputeAad(identity), StickySessions.ComputeCallAad(identity));
+        Assert.NotEqual(StickySessions.ComputeAad(identity), StickySessions.ComputeCallAad(identity, "Svc"));
         Assert.NotEqual(
-            StickySessions.ComputeCallAad(identity),
-            StickySessions.ComputeCallAad(identity with { PeerEvidenceBinding = "binding-b" }));
+            StickySessions.ComputeCallAad(identity, "Svc"),
+            StickySessions.ComputeCallAad(identity with { PeerEvidenceBinding = "binding-b" }, "Svc"));
+    }
+
+    [Fact]
+    public void ComputeCallAad_IsProtocolScoped()
+    {
+        // A continuation must stay on the protocol its stream started on. Binding the protocol
+        // into the AAD is what makes a cross-protocol continuation fail the AEAD tag check
+        // instead of relying on a comparison somewhere in the dispatcher.
+        var identity = new AuthIdentity("d", "alice");
+
+        Assert.NotEqual(
+            StickySessions.ComputeCallAad(identity, "Svc"),
+            StickySessions.ComputeCallAad(identity, "vgi_rpc.Identity.v1"));
+
+        // The scope is a suffix on an otherwise unchanged AAD, so it cannot collide with a
+        // principal whose name happens to end in the protocol's.
+        Assert.NotEqual(
+            StickySessions.ComputeCallAad(new AuthIdentity("d", "alice"), "b"),
+            StickySessions.ComputeCallAad(new AuthIdentity("d", "alice\0b"), ""));
     }
 
     [Fact]

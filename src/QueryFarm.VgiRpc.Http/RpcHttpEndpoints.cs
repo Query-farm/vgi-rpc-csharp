@@ -4,6 +4,7 @@ using System.Security.Cryptography;
 using Apache.Arrow;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Routing;
 using QueryFarm.VgiRpc.AccessLog;
 using QueryFarm.VgiRpc.Errors;
@@ -19,11 +20,27 @@ namespace QueryFarm.VgiRpc.Http;
 /// <summary>
 /// Maps an <see cref="RpcServer"/> onto ASP.NET Core minimal-API routes, mirroring the canonical
 /// Python repo's Falcon resources (<c>vgi_rpc/http/server/_resources.py</c>): <c>POST
-/// {prefix}/{method}</c> for unary calls (plus <c>__describe__</c>), <c>GET/HEAD {prefix}/health</c>
-/// for the mandatory auth-exempt discovery endpoint. Streaming (<c>/init</c>/<c>/exchange</c>) and
-/// everything auth/cap/compression/external-storage-related are later milestones — see
-/// docs/roadmap.md M6+; those two routes are registered now (structurally matching the porting
-/// guide's endpoint contract) but answer a clear "not yet implemented" error rather than 404.
+/// {prefix}/{protocol}/{method}</c> for unary calls, the same path plus <c>/init</c> and
+/// <c>/exchange</c> for streams, and <c>GET/HEAD/OPTIONS {prefix}/health</c> for the mandatory
+/// auth-exempt discovery endpoint.
+///
+/// <para>
+/// <b>RPC paths are namespaced by protocol; reserved framework endpoints are not.</b>
+/// <c>{prefix}/health</c>, <c>{prefix}/__session__</c>, <c>{prefix}/__introspect_token__</c> and
+/// <c>{prefix}/__upload_url__/init</c> belong to the server rather than to any one protocol, so
+/// they stay flat. Introspection is not a special path either way — it is
+/// <c>{prefix}/vgi_rpc.Reflection.v1/list_protocols</c>, reached the same way as anything else.
+/// </para>
+///
+/// <para>
+/// <b>Metadata is canonical; the path is a required faithful projection of it.</b> The protocol
+/// rides twice on HTTP — in <c>vgi_rpc.protocol</c> on the request batch and as a path segment —
+/// and the metadata field is the authority because it is the only carrier on the stdio, unix and
+/// named-pipe transports. The path segment exists so an edge device can act on the protocol
+/// without an Arrow parser, is required, and must agree; disagreement is refused, a percent sign
+/// in it is refused without being decoded, and a protocol this server does not host is 404. See
+/// <see cref="ResolveProtocolAsync"/> and <see cref="CheckProtocolAgreementAsync"/>.
+/// </para>
 ///
 /// Dispatch here is necessarily a separate code path from <see cref="RpcServer.ServeOneAsync"/>,
 /// not a reuse of it: HTTP is one request body in, one response body out, with no persistent
@@ -144,9 +161,16 @@ public static class RpcHttpEndpoints
             context.Response, effectiveMaxRequestBytes, effectiveMaxResponseBytes);
         var health = endpoints.MapMethods($"{prefix}/health", ["GET", "HEAD"], (HttpContext context) => { Stamp(context); return HandleHealthAsync(server, context, proxyProofRequired); });
         var capabilities = endpoints.MapMethods($"{prefix}/health", ["OPTIONS"], (HttpContext context) => { Stamp(context); return HandleCapabilitiesAsync(server, context, effectiveMaxResponseBytes, sticky, proxyProofRequired, introspectEnabled, externalization, effectiveMaxRequestBytes, authenticate, proxyHint); });
-        var unary = endpoints.MapPost($"{prefix}/{{method}}", (string method, HttpContext context) => { Stamp(context); return HandleUnaryAsync(server, method, context, compressionLevel, effectiveMaxResponseBytes, authenticate, proxyHint, sticky, tokenKey, externalization, effectiveMaxRequestBytes, preferredResponseBytes); });
-        var init = endpoints.MapPost($"{prefix}/{{method}}/init", (string method, HttpContext context) => { Stamp(context); return HandleStreamInitAsync(server, method, context, compressionLevel, tokenKey, registry, effectiveMaxResponseBytes, authenticate, proxyHint, sticky, externalization, effectiveMaxRequestBytes, preferredResponseBytes); });
-        var exchange = endpoints.MapPost($"{prefix}/{{method}}/exchange", (string method, HttpContext context) => { Stamp(context); return HandleStreamExchangeAsync(server, method, context, compressionLevel, tokenKey, registry, effectiveMaxResponseBytes, authenticate, proxyHint, sticky, externalization, effectiveMaxRequestBytes, preferredResponseBytes); });
+        // RPC paths are namespaced by protocol: {prefix}/{protocol}/{method}[/init|/exchange].
+        // The reserved framework endpoints above and below are deliberately NOT namespaced —
+        // they belong to the server rather than to any one protocol (WIRE_PROTOCOL.md §10).
+        // ASP.NET matches literal segments ahead of parameterised ones, so `/health`,
+        // `/__session__`, `/__introspect_token__` and `/__upload_url__/init` keep winning over
+        // these routes rather than being swallowed as a {protocol} named "__upload_url__".
+        var prefixSegments = PathSegmentCount(prefix);
+        var unary = endpoints.MapPost($"{prefix}/{{protocol}}/{{method}}", (string protocol, string method, HttpContext context) => { Stamp(context); return HandleUnaryAsync(server, protocol, method, prefixSegments, context, compressionLevel, effectiveMaxResponseBytes, authenticate, proxyHint, sticky, tokenKey, externalization, effectiveMaxRequestBytes, preferredResponseBytes); });
+        var init = endpoints.MapPost($"{prefix}/{{protocol}}/{{method}}/init", (string protocol, string method, HttpContext context) => { Stamp(context); return HandleStreamInitAsync(server, protocol, method, prefixSegments, context, compressionLevel, tokenKey, registry, effectiveMaxResponseBytes, authenticate, proxyHint, sticky, externalization, effectiveMaxRequestBytes, preferredResponseBytes); });
+        var exchange = endpoints.MapPost($"{prefix}/{{protocol}}/{{method}}/exchange", (string protocol, string method, HttpContext context) => { Stamp(context); return HandleStreamExchangeAsync(server, protocol, method, prefixSegments, context, compressionLevel, tokenKey, registry, effectiveMaxResponseBytes, authenticate, proxyHint, sticky, externalization, effectiveMaxRequestBytes, preferredResponseBytes); });
         if (corsPolicyName is not null)
         {
             health.RequireCors(corsPolicyName);
@@ -420,6 +444,171 @@ public static class RpcHttpEndpoints
         context.Response.StatusCode = StatusCodes.Status204NoContent;
     }
 
+    /// <summary>Counts the path segments in a mount prefix ("" → 0, "/vgi" → 1).</summary>
+    private static int PathSegmentCount(string prefix) =>
+        prefix.Split('/', StringSplitOptions.RemoveEmptyEntries).Length;
+
+    /// <summary>
+    /// Whether the <b>raw, undecoded</b> protocol segment of this request's target carries a
+    /// percent sign.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The protocol name charset (<c>[A-Za-z_][A-Za-z0-9_.]*</c>) never requires
+    /// percent-encoding, so a percent sign is a bug or an attempt to make the edge and the worker
+    /// read different strings — the Content-Length/Transfer-Encoding shape, where a proxy applies
+    /// policy to one protocol while the worker dispatches another. It is therefore rejected
+    /// without being decoded: compare raw bytes, never decoded-against-raw (a decoded comparison
+    /// is itself the bug, since <c>%2E</c> and <c>.</c> compare equal after decoding).
+    /// </para>
+    /// <para>
+    /// ASP.NET's route-bound <c>{protocol}</c> value is already decoded, so this deliberately
+    /// reads <see cref="IHttpRequestFeature.RawTarget"/> instead — the request target exactly as
+    /// it arrived. Segment <i>position</i> is what identifies the protocol, not a match against
+    /// the decoded value: a <c>%2F</c> would give the decoded path an extra segment, and indexing
+    /// the raw target by position sees that for what it is.
+    /// </para>
+    /// <para>
+    /// When a host supplies no raw target (some in-memory test servers), this falls back to the
+    /// decoded path — which still catches an encoded <c>%25</c>, and cannot catch an encoding
+    /// that decoded to an ordinary character. Kestrel always supplies one.
+    /// </para>
+    /// </remarks>
+    private static bool RawProtocolSegmentHasPercent(HttpContext context, int prefixSegments)
+    {
+        var raw = context.Features.Get<IHttpRequestFeature>()?.RawTarget;
+        if (string.IsNullOrEmpty(raw))
+        {
+            var decoded = context.Request.Path.Value ?? "";
+            return decoded.Contains('%', StringComparison.Ordinal);
+        }
+
+        // An origin-form target is the common case; absolute-form ("http://host/path") is legal
+        // in a request line and a proxy may forward one, so strip the authority before indexing.
+        var path = raw;
+        var cut = path.IndexOfAny(['?', '#']);
+        if (cut >= 0) path = path[..cut];
+        var schemeEnd = path.IndexOf("://", StringComparison.Ordinal);
+        if (schemeEnd >= 0)
+        {
+            var authorityEnd = path.IndexOf('/', schemeEnd + 3);
+            path = authorityEnd < 0 ? "" : path[authorityEnd..];
+        }
+
+        var segments = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        return segments.Length > prefixSegments
+            && segments[prefixSegments].Contains('%', StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Resolves the <c>{protocol}</c> path segment to the set of method names that protocol
+    /// answers, or writes the routing refusal and returns <see langword="null"/>.
+    /// </summary>
+    /// <remarks>
+    /// Routing runs <b>before</b> the content-type check: a request naming a protocol this server
+    /// does not host is unroutable whatever its body is, and 404 is the answer a caller can act
+    /// on — 415 reads as "fix your header and retry", which would loop forever against a path
+    /// that will never resolve. The name grammar is checked before the lookup, so a string that
+    /// could never be a protocol name never reaches an error message at all; the access record
+    /// is never labelled with a caller-supplied name, valid or not.
+    /// </remarks>
+    private static async Task<IReadOnlySet<string>?> ResolveProtocolAsync(
+        RpcServer server, string protocol, string method, int prefixSegments, HttpContext context,
+        ContentEncoding? encoding, bool useCustomHeader, int? compressionLevel, string methodType)
+    {
+        if (RawProtocolSegmentHasPercent(context, prefixSegments))
+        {
+            await ErrorResultAsync(
+                server, method,
+                new ProtocolNotSpecifiedException(
+                    "The protocol path segment contains a percent sign. The protocol charset never "
+                    + "requires encoding, so this is rejected rather than decoded."),
+                StatusCodes.Status404NotFound, s_emptySchema, StatusCodes.Status404NotFound,
+                context, encoding, useCustomHeader, compressionLevel, methodType).ConfigureAwait(false);
+            return null;
+        }
+
+        if (!WireNaming.IsValidProtocolName(protocol))
+        {
+            await ErrorResultAsync(
+                server, method,
+                new ProtocolNotSupportedException("The protocol path segment is not a protocol name."),
+                StatusCodes.Status404NotFound, s_emptySchema, StatusCodes.Status404NotFound,
+                context, encoding, useCustomHeader, compressionLevel, methodType).ConfigureAwait(false);
+            return null;
+        }
+
+        var methodNames = server.MethodNamesForProtocol(protocol);
+        if (methodNames is null)
+        {
+            // The name is echoed in the message but the access record is deliberately NOT
+            // labelled with it: a message goes back to the one caller that sent it, while a log
+            // field and a metric label are shared, retained, and of bounded cardinality by
+            // assumption. The record carries the protocol this server actually serves.
+            await ErrorResultAsync(
+                server, method,
+                new ProtocolNotSupportedException(
+                    $"This server does not host protocol '{protocol}'. Hosted: [{string.Join(", ", server.HostedProtocols)}]"),
+                StatusCodes.Status404NotFound, s_emptySchema, StatusCodes.Status404NotFound,
+                context, encoding, useCustomHeader, compressionLevel, methodType).ConfigureAwait(false);
+            return null;
+        }
+
+        return methodNames;
+    }
+
+    /// <summary>
+    /// Requires the request batch's <c>vgi_rpc.protocol</c> to be present and to name the same
+    /// protocol the path did, or writes the refusal and returns <see langword="false"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>The metadata field is canonical; the path segment is a required faithful projection.</b>
+    /// Metadata is the authority because it is the <i>only</i> carrier on the stdio, unix and
+    /// named-pipe transports; the path exists so an edge device can act on the protocol without
+    /// an Arrow parser. Left unchecked, the two may disagree — and then edge policy is applied to
+    /// one protocol while the worker runs another.
+    /// </para>
+    /// <para>
+    /// Absent is refused too, with no single-protocol exemption: an intermediary that rebuilds a
+    /// request and drops the field gets a loud rejection instead of landing silently on whichever
+    /// protocol happened to be registered first. Mirrors the <c>vgi_rpc.method</c> check the same
+    /// dispatchers already make.
+    /// </para>
+    /// </remarks>
+    private static async Task<bool> CheckProtocolAgreementAsync(
+        RpcServer server, AnnotatedBatch requestBatch, string protocol, string method, HttpContext context,
+        Schema schema, ContentEncoding? encoding, bool useCustomHeader, int? compressionLevel, string methodType)
+    {
+        var declared = requestBatch.GetMetadata(MetadataKeys.Protocol);
+        if (string.IsNullOrEmpty(declared))
+        {
+            await ErrorResultAsync(
+                server, method,
+                new ProtocolNotSpecifiedException(
+                    $"Request carries no '{MetadataKeys.Protocol}' routing key. Every request must name the "
+                    + $"protocol it addresses, including against a server hosting exactly one. This server hosts: "
+                    + $"[{string.Join(", ", server.HostedProtocols)}]."),
+                StatusCodes.Status400BadRequest, schema, StatusCodes.Status400BadRequest,
+                context, encoding, useCustomHeader, compressionLevel, methodType, protocol: protocol).ConfigureAwait(false);
+            return false;
+        }
+
+        if (!string.Equals(declared, protocol, StringComparison.Ordinal))
+        {
+            await ErrorResultAsync(
+                server, method,
+                new ProtocolNotSupportedException(
+                    $"Protocol mismatch: the request path resolved to '{protocol}' but the Arrow IPC "
+                    + $"custom_metadata '{MetadataKeys.Protocol}' says '{declared}'. These must agree."),
+                StatusCodes.Status400BadRequest, schema, StatusCodes.Status400BadRequest,
+                context, encoding, useCustomHeader, compressionLevel, methodType, protocol: protocol).ConfigureAwait(false);
+            return false;
+        }
+
+        return true;
+    }
+
     /// <summary>Rejects a request by throwing <see cref="AuthFailure"/> (any other exception is
     /// treated as <see cref="AuthReason.Unauthorized"/>), or returns normally to let dispatch
     /// proceed. Mirrors Python's <c>authenticate</c> callback contract.</summary>
@@ -683,7 +872,7 @@ public static class RpcHttpEndpoints
         return context.Response.Body.WriteAsync(body, context.RequestAborted).AsTask();
     }
 
-    private static async Task HandleUnaryAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky, byte[] tokenKey, ExternalizationOptions? externalization, long? maxRequestBytes, long? preferredResponseBytes)
+    private static async Task HandleUnaryAsync(RpcServer server, string protocol, string method, int prefixSegments, HttpContext context, int? compressionLevel, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky, byte[] tokenKey, ExternalizationOptions? externalization, long? maxRequestBytes, long? preferredResponseBytes)
     {
         if (await TryRejectUnauthenticatedAsync(context, authenticate, proxyHint).ConfigureAwait(false))
         {
@@ -705,6 +894,13 @@ public static class RpcHttpEndpoints
         var (encoding, useCustomHeader) = ContentEncodingNegotiation.PickResponseEncoding(
             request, compressionLevel is null ? s_noEncodings : s_producibleEncodings);
 
+        var methodNames = await ResolveProtocolAsync(
+            server, protocol, method, prefixSegments, context, encoding, useCustomHeader, compressionLevel, "unary").ConfigureAwait(false);
+        if (methodNames is null)
+        {
+            return;
+        }
+
         if (request.ContentType != ArrowContentType)
         {
             await ErrorResultAsync(
@@ -713,22 +909,32 @@ public static class RpcHttpEndpoints
                 new RpcException("TypeError", $"Expected Content-Type: '{ArrowContentType}', got '{request.ContentType}'. All vgi-rpc HTTP requests must use Content-Type: {ArrowContentType}"),
                 StatusCodes.Status415UnsupportedMediaType,
                 s_emptySchema,
-                httpStatusForLog: StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
+                httpStatusForLog: StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, protocol: protocol).ConfigureAwait(false);
             return;
         }
 
-        if (!server.Methods.TryGetValue(method, out var info))
+        if (!methodNames.Contains(method))
         {
-            var available = string.Join(", ", server.Methods.Keys.OrderBy(k => k, StringComparer.Ordinal));
+            var available = string.Join(", ", methodNames.OrderBy(k => k, StringComparer.Ordinal));
             await ErrorResultAsync(
                 server,
                 method,
-                new MethodNotImplementedException($"Unknown method: '{method}'. Available methods: [{available}]"),
+                new MethodNotImplementedException($"Protocol '{protocol}' has no method '{method}'. Available methods: [{available}]"),
                 StatusCodes.Status404NotFound,
                 s_emptySchema,
-                httpStatusForLog: StatusCodes.Status404NotFound, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
+                httpStatusForLog: StatusCodes.Status404NotFound, context, encoding, useCustomHeader, compressionLevel, protocol: protocol).ConfigureAwait(false);
             return;
         }
+
+        if (RpcServer.IsFrameworkProtocol(protocol))
+        {
+            await HandleFrameworkUnaryAsync(
+                server, protocol, method, context, compressionLevel, encoding, useCustomHeader,
+                responseLimitBytes, maxRequestBytes).ConfigureAwait(false);
+            return;
+        }
+
+        var info = server.Methods[method];
 
         if (info.Kind == RpcMethodKind.Stream)
         {
@@ -800,7 +1006,14 @@ public static class RpcHttpEndpoints
                 new RpcException("TypeError", $"Method name mismatch: URL path has '{method}' but Arrow IPC custom_metadata 'vgi_rpc.method' has '{ipcMethod}'. These must match."),
                 StatusCodes.Status400BadRequest,
                 info.ResultSchema,
-                httpStatusForLog: StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
+                httpStatusForLog: StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, protocol: protocol).ConfigureAwait(false);
+            return;
+        }
+
+        if (!await CheckProtocolAgreementAsync(
+                server, requestBatch, protocol, method, context, info.ResultSchema,
+                encoding, useCustomHeader, compressionLevel, "unary").ConfigureAwait(false))
+        {
             return;
         }
 
@@ -950,7 +1163,151 @@ public static class RpcHttpEndpoints
     }
 
     /// <summary>
-    /// <c>POST {prefix}/{method}/init</c> — dispatches a stream method and registers it under a
+    /// <c>POST {prefix}/{protocol}/{method}</c> where <c>{protocol}</c> is a framework-owned one
+    /// (<c>vgi_rpc.Reflection.v1</c>, <c>vgi_rpc.Identity.v1</c>).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Kept as its own branch rather than folded into the application path because a framework
+    /// protocol is served by the framework on every transport: it never touches
+    /// <see cref="RpcServer.Implementation"/>, and reflection's methods are not registered at all
+    /// (its method table is honestly empty — that is what its hash is taken over). What this
+    /// method owns is everything the framework cannot know about: the HTTP body, the negotiated
+    /// encoding, the response budget, and the caller's <see cref="AuthContext"/>.
+    /// </para>
+    /// <para>
+    /// That last one is the point of the exercise. <c>vgi_rpc.Identity.v1</c>'s freshness guard
+    /// requires an <c>auth_time</c> claim, which arrives only on an OIDC/JWT credential — i.e.
+    /// over HTTP. Peer identity on TCP/unix authenticates a principal but carries no
+    /// <c>auth_time</c>, so before this route existed <c>issue_grant</c> was reachable only on
+    /// the transports where it must refuse by design.
+    /// </para>
+    /// <para>
+    /// Request externalization is deliberately not applied here: these requests are a method
+    /// name and at most a short string, so there is nothing to externalize and no reason to make
+    /// the bootstrap surface depend on an object store being reachable.
+    /// </para>
+    /// </remarks>
+    private static async Task HandleFrameworkUnaryAsync(
+        RpcServer server, string protocol, string method, HttpContext context, int? compressionLevel,
+        ContentEncoding? encoding, bool useCustomHeader, long? responseLimitBytes, long? maxRequestBytes)
+    {
+        var request = context.Request;
+        var cancellationToken = context.RequestAborted;
+
+        Stream requestBody;
+        try
+        {
+            requestBody = OpenRequestBody(request, maxRequestBytes);
+        }
+        catch (NotSupportedException exc)
+        {
+            await ErrorResultAsync(server, method, new RpcException("TypeError", exc.Message), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, protocol: protocol).ConfigureAwait(false);
+            return;
+        }
+        catch (RequestTooLargeException exc)
+        {
+            await Write413Async(context, exc, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        AnnotatedBatch? requestBatch;
+        try
+        {
+            using var reader = new WireReader(requestBody);
+            _ = await reader.ReadSchemaAsync(cancellationToken).ConfigureAwait(false);
+            requestBatch = await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (RequestTooLargeException exc)
+        {
+            await Write413Async(context, exc, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+        catch (Exception exc)
+        {
+            await ErrorResultAsync(server, method, exc, StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, protocol: protocol).ConfigureAwait(false);
+            return;
+        }
+        finally
+        {
+            if (!ReferenceEquals(requestBody, request.Body))
+            {
+                await requestBody.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+
+        if (requestBatch is null)
+        {
+            await ErrorResultAsync(server, method, new RpcException("RpcException", "Request body carried no batch."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, protocol: protocol).ConfigureAwait(false);
+            return;
+        }
+
+        using var requestBatchOwner = new RecordBatchOwner(requestBatch.Batch);
+
+        var ipcMethod = requestBatch.GetMetadata(MetadataKeys.Method);
+        if (ipcMethod != method)
+        {
+            await ErrorResultAsync(server, method, new RpcException("TypeError", $"Method name mismatch: URL path has '{method}' but Arrow IPC custom_metadata 'vgi_rpc.method' has '{ipcMethod}'. These must match."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, protocol: protocol).ConfigureAwait(false);
+            return;
+        }
+
+        if (!await CheckProtocolAgreementAsync(
+                server, requestBatch, protocol, method, context, s_emptySchema,
+                encoding, useCustomHeader, compressionLevel, "unary").ConfigureAwait(false))
+        {
+            return;
+        }
+
+        var start = Stopwatch.GetTimestamp();
+        var callContext = new BufferedHttpCallContext(
+            null,
+            PeerIdentityAuthentication.GetAuth(context),
+            PeerIdentityAuthentication.GetEvidence(context),
+            responseLimitBytes,
+            null);
+
+        var responseBuffer = new MemoryStream();
+        RpcServer.FrameworkDispatch outcome;
+        try
+        {
+            outcome = await server.ServeFrameworkUnaryAsync(
+                protocol, method, requestBatch, callContext, responseBuffer, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exc)
+        {
+            var actual = Unwrap(exc);
+            await ErrorResultAsync(server, method, actual, StatusCodes.Status500InternalServerError, s_emptySchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, protocol: protocol).ConfigureAwait(false);
+            return;
+        }
+
+        var status = outcome.Status;
+        var errorType = outcome.ErrorType;
+        var errorMessage = outcome.ErrorMessage;
+
+        if (status == "ok" && responseLimitBytes is { } cap && responseBuffer.Length > cap)
+        {
+            var overshoot = new RpcException("ResponseTooLargeError", $"method '{method}' exceeds max_response_bytes ({responseBuffer.Length} > {cap})");
+            status = "error";
+            errorType = "ResponseTooLargeError";
+            errorMessage = overshoot.Message;
+            responseBuffer = new MemoryStream();
+            await using var errWriter = new WireWriter(responseBuffer, outcome.Schema);
+            var errMetadata = LogMessage.FromException(overshoot).AddToMetadata();
+            await errWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outcome.Schema), errMetadata, cancellationToken).ConfigureAwait(false);
+        }
+
+        EmitAccessLog(server, method, "unary", status, errorType, errorMessage, start, StatusCodes.Status200OK, protocol: protocol);
+
+        if (status == "error")
+        {
+            context.Response.Headers[RpcErrorHeader] = "true";
+        }
+
+        await WriteBytesAsync(context, StatusCodes.Status200OK, WrittenMemory(responseBuffer), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// <c>POST {prefix}/{protocol}/{method}/init</c> — dispatches a stream method and registers it under a
     /// fresh call id (see <see cref="StreamCallRegistry"/>), returning (optional header stream +)
     /// a zero-row sentinel batch carrying the sealed call-id token on both
     /// <see cref="MetadataKeys.StreamState"/> and <see cref="MetadataKeys.CallState"/> — the real
@@ -961,7 +1318,7 @@ public static class RpcHttpEndpoints
     /// happens via <see cref="HandleStreamExchangeAsync"/> — which the client's generic init-response
     /// reader handles correctly regardless (it just sees zero data batches this turn).
     /// </summary>
-    private static async Task HandleStreamInitAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky, ExternalizationOptions? externalization, long? maxRequestBytes, long? preferredResponseBytes)
+    private static async Task HandleStreamInitAsync(RpcServer server, string protocol, string method, int prefixSegments, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky, ExternalizationOptions? externalization, long? maxRequestBytes, long? preferredResponseBytes)
     {
         if (await TryRejectUnauthenticatedAsync(context, authenticate, proxyHint).ConfigureAwait(false))
         {
@@ -983,24 +1340,37 @@ public static class RpcHttpEndpoints
         var (encoding, useCustomHeader) = ContentEncodingNegotiation.PickResponseEncoding(
             request, compressionLevel is null ? s_noEncodings : s_producibleEncodings);
 
+        var methodNames = await ResolveProtocolAsync(
+            server, protocol, method, prefixSegments, context, encoding, useCustomHeader, compressionLevel, "stream").ConfigureAwait(false);
+        if (methodNames is null)
+        {
+            return;
+        }
+
         if (request.ContentType != ArrowContentType)
         {
-            await ErrorResultAsync(server, method, new RpcException("TypeError", $"Expected Content-Type: '{ArrowContentType}', got '{request.ContentType}'. All vgi-rpc HTTP requests must use Content-Type: {ArrowContentType}"), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            await ErrorResultAsync(server, method, new RpcException("TypeError", $"Expected Content-Type: '{ArrowContentType}', got '{request.ContentType}'. All vgi-rpc HTTP requests must use Content-Type: {ArrowContentType}"), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", protocol: protocol).ConfigureAwait(false);
             return;
         }
 
-        if (!server.Methods.TryGetValue(method, out var info))
+        if (!methodNames.Contains(method))
         {
-            var available = string.Join(", ", server.Methods.Keys.OrderBy(k => k, StringComparer.Ordinal));
-            await ErrorResultAsync(server, method, new MethodNotImplementedException($"Unknown method: '{method}'. Available methods: [{available}]"), StatusCodes.Status404NotFound, s_emptySchema, StatusCodes.Status404NotFound, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            var available = string.Join(", ", methodNames.OrderBy(k => k, StringComparer.Ordinal));
+            await ErrorResultAsync(server, method, new MethodNotImplementedException($"Protocol '{protocol}' has no method '{method}'. Available methods: [{available}]"), StatusCodes.Status404NotFound, s_emptySchema, StatusCodes.Status404NotFound, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", protocol: protocol).ConfigureAwait(false);
             return;
         }
 
-        if (info.Kind != RpcMethodKind.Stream)
+        // The framework protocols are unary-only, so a /init against one is the same answer a
+        // unary application method gets here: the method exists, this is the wrong endpoint for
+        // it. Checked before the application method table is consulted at all, since reflection's
+        // methods are never in it.
+        if (RpcServer.IsFrameworkProtocol(protocol) || server.Methods[method].Kind != RpcMethodKind.Stream)
         {
-            await ErrorResultAsync(server, method, new RpcException("TypeError", $"Method '{method}' is not a stream — call it as a plain unary POST /{method} instead."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            await ErrorResultAsync(server, method, new RpcException("TypeError", $"Method '{method}' is not a stream — call it as a plain unary POST {{prefix}}/{protocol}/{method} instead."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", protocol: protocol).ConfigureAwait(false);
             return;
         }
+
+        var info = server.Methods[method];
 
         Stream requestBody;
         try
@@ -1054,7 +1424,14 @@ public static class RpcHttpEndpoints
         var ipcMethod = requestBatch.GetMetadata(MetadataKeys.Method);
         if (ipcMethod != method)
         {
-            await ErrorResultAsync(server, method, new RpcException("TypeError", $"Method name mismatch: URL path has '{method}' but Arrow IPC custom_metadata 'vgi_rpc.method' has '{ipcMethod}'. These must match."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            await ErrorResultAsync(server, method, new RpcException("TypeError", $"Method name mismatch: URL path has '{method}' but Arrow IPC custom_metadata 'vgi_rpc.method' has '{ipcMethod}'. These must match."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", protocol: protocol).ConfigureAwait(false);
+            return;
+        }
+
+        if (!await CheckProtocolAgreementAsync(
+                server, requestBatch, protocol, method, context, s_emptySchema,
+                encoding, useCustomHeader, compressionLevel, "stream").ConfigureAwait(false))
+        {
             return;
         }
 
@@ -1129,10 +1506,13 @@ public static class RpcHttpEndpoints
         var callIdentity = AuthIdentity.GetFrom(context);
         var callPrincipalKey = StickySessions.PrincipalKey(callIdentity);
         var callKey = registry.Register(stream, callPrincipalKey, responseLimitBytes);
+        // The protocol rides in the token's AAD rather than in its plaintext, so a continuation
+        // presented on another protocol's path fails the AEAD tag check and is refused exactly as
+        // an invalid token is — with no comparison code to get wrong, and nothing to forget.
         var tokenBase64 = Convert.ToBase64String(Crypto.Seal(
             Convert.FromHexString(callKey),
             tokenKey,
-            StickySessions.ComputeCallAad(callIdentity)));
+            StickySessions.ComputeCallAad(callIdentity, protocol)));
 
         var responseBuffer = new MemoryStream();
 
@@ -1293,7 +1673,7 @@ public static class RpcHttpEndpoints
     }
 
     /// <summary>
-    /// <c>POST {prefix}/{method}/exchange</c> — runs exactly one lockstep turn against the stream
+    /// <c>POST {prefix}/{protocol}/{method}/exchange</c> — runs exactly one lockstep turn against the stream
     /// <see cref="HandleStreamInitAsync"/> registered, resolved from the request's echoed
     /// <see cref="MetadataKeys.StreamState"/> token. Handles both producer ticks (an empty-schema
     /// request batch — the HTTP analog of the pipe transport's <c>_TICK_BATCH</c>) and real
@@ -1315,7 +1695,7 @@ public static class RpcHttpEndpoints
     /// (unlike accumulate-until-cap) trivially supporting mid-stream cancel — see
     /// <see cref="StreamCallRegistry"/>'s doc comment for the same simplification's rationale.
     /// </summary>
-    private static async Task HandleStreamExchangeAsync(RpcServer server, string method, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky, ExternalizationOptions? externalization, long? maxRequestBytes, long? preferredResponseBytes)
+    private static async Task HandleStreamExchangeAsync(RpcServer server, string protocol, string method, int prefixSegments, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky, ExternalizationOptions? externalization, long? maxRequestBytes, long? preferredResponseBytes)
     {
         if (await TryRejectUnauthenticatedAsync(context, authenticate, proxyHint).ConfigureAwait(false))
         {
@@ -1336,15 +1716,23 @@ public static class RpcHttpEndpoints
         var (encoding, useCustomHeader) = ContentEncodingNegotiation.PickResponseEncoding(
             request, compressionLevel is null ? s_noEncodings : s_producibleEncodings);
 
-        if (request.ContentType != ArrowContentType)
+        var methodNames = await ResolveProtocolAsync(
+            server, protocol, method, prefixSegments, context, encoding, useCustomHeader, compressionLevel, "stream").ConfigureAwait(false);
+        if (methodNames is null)
         {
-            await ErrorResultAsync(server, method, new RpcException("TypeError", $"Expected Content-Type: '{ArrowContentType}', got '{request.ContentType}'. All vgi-rpc HTTP requests must use Content-Type: {ArrowContentType}"), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
         }
 
-        if (!server.Methods.TryGetValue(method, out var info) || info.Kind != RpcMethodKind.Stream)
+        if (request.ContentType != ArrowContentType)
         {
-            await ErrorResultAsync(server, method, new MethodNotImplementedException($"Unknown stream method: '{method}'."), StatusCodes.Status404NotFound, s_emptySchema, StatusCodes.Status404NotFound, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            await ErrorResultAsync(server, method, new RpcException("TypeError", $"Expected Content-Type: '{ArrowContentType}', got '{request.ContentType}'. All vgi-rpc HTTP requests must use Content-Type: {ArrowContentType}"), StatusCodes.Status415UnsupportedMediaType, s_emptySchema, StatusCodes.Status415UnsupportedMediaType, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", protocol: protocol).ConfigureAwait(false);
+            return;
+        }
+
+        if (RpcServer.IsFrameworkProtocol(protocol)
+            || !server.Methods.TryGetValue(method, out var info) || info.Kind != RpcMethodKind.Stream)
+        {
+            await ErrorResultAsync(server, method, new MethodNotImplementedException($"Protocol '{protocol}' has no stream method '{method}'."), StatusCodes.Status404NotFound, s_emptySchema, StatusCodes.Status404NotFound, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", protocol: protocol).ConfigureAwait(false);
             return;
         }
 
@@ -1410,10 +1798,14 @@ public static class RpcHttpEndpoints
         string callKey;
         try
         {
+            // The path's protocol is part of the AAD, so a token minted under another protocol
+            // fails here rather than being compared in application code — which also covers the
+            // continuation shape a proxy is most likely to see, since for a stream most requests
+            // are continuations.
             callKey = Convert.ToHexStringLower(Crypto.Open(
                 Convert.FromBase64String(tokenB64),
                 tokenKey,
-                StickySessions.ComputeCallAad(AuthIdentity.GetFrom(context))));
+                StickySessions.ComputeCallAad(AuthIdentity.GetFrom(context), protocol)));
         }
         catch (Exception)
         {
@@ -1701,7 +2093,8 @@ public static class RpcHttpEndpoints
         bool useCustomHeader,
         int? compressionLevel,
         string methodType = "unary",
-        string? streamId = null)
+        string? streamId = null,
+        string? protocol = null)
     {
         var start = Stopwatch.GetTimestamp();
         using var buffer = new MemoryStream();
@@ -1711,7 +2104,7 @@ public static class RpcHttpEndpoints
             await writer.WriteOwnedBatchAsync(ValueCodec.EmptyRow(schema), metadata).ConfigureAwait(false);
         }
 
-        EmitAccessLog(server, method, methodType, "error", exception.GetType().Name, exception.Message, start, httpStatusForLog, streamId);
+        EmitAccessLog(server, method, methodType, "error", exception.GetType().Name, exception.Message, start, httpStatusForLog, streamId, protocol);
 
         // Matches Python's _set_http_status: only a 500 gets folded into 200+header — 4xx/415
         // protocol-level rejections keep their real status code.
@@ -1823,19 +2216,23 @@ public static class RpcHttpEndpoints
         return segment.AsMemory(0, checked((int)stream.Length));
     }
 
-    private static void EmitAccessLog(RpcServer server, string method, string methodType, string status, string errorType, string errorMessage, long startTimestamp, int httpStatus, string? streamId = null)
+    /// <summary><paramref name="protocol"/> names the protocol a namespaced route resolved to.
+    /// It defaults to the application protocol: a record that labelled a reflection or identity
+    /// call with the application's name would look plausible rather than failing.</summary>
+    private static void EmitAccessLog(RpcServer server, string method, string methodType, string status, string errorType, string errorMessage, long startTimestamp, int httpStatus, string? streamId = null, string? protocol = null)
     {
         if (server.AccessLog is not { } sink)
         {
             return;
         }
 
+        var resolvedProtocol = protocol ?? server.ProtocolName;
         var durationMs = Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
         sink.Write(new AccessLogRecord(
             Timestamp: DateTimeOffset.UtcNow,
             ServerId: server.ServerId,
-            Protocol: server.ProtocolName,
-            ProtocolHash: server.ProtocolHash,
+            Protocol: resolvedProtocol,
+            ProtocolHash: resolvedProtocol == server.ProtocolName ? server.ProtocolHash : server.ProtocolHashFor(resolvedProtocol),
             Method: method,
             MethodType: methodType,
             Status: status,

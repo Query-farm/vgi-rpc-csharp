@@ -10,6 +10,43 @@ namespace QueryFarm.VgiRpc.Reflection;
 /// </summary>
 public static class WireNaming
 {
+    /// <summary>The longest protocol name any server may host, in UTF-8 bytes
+    /// (WIRE_PROTOCOL.md §3.1). The grammar is ASCII-only, so bytes and chars coincide.</summary>
+    public const int MaxProtocolNameLength = 255;
+
+    /// <summary>
+    /// Whether <paramref name="name"/> matches the protocol-name grammar of WIRE_PROTOCOL.md
+    /// §3.1 — <c>[A-Za-z_][A-Za-z0-9_.]*</c>, at most <see cref="MaxProtocolNameLength"/> bytes.
+    /// </summary>
+    /// <remarks>
+    /// Checked <b>before</b> a name is looked up anywhere, so a request-supplied string never
+    /// reaches an error message, a log field or a metric label. Hand-rolled rather than a
+    /// <c>Regex</c> because it runs on the dispatch path of every HTTP request.
+    /// </remarks>
+    public static bool IsValidProtocolName(string? name)
+    {
+        if (string.IsNullOrEmpty(name) || name.Length > MaxProtocolNameLength)
+        {
+            return false;
+        }
+
+        var first = name[0];
+        if (!(char.IsAsciiLetter(first) || first == '_'))
+        {
+            return false;
+        }
+
+        foreach (var c in name)
+        {
+            if (!(char.IsAsciiLetterOrDigit(c) || c == '_' || c == '.'))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     /// <summary>Wire name for an RPC method: an explicit <see cref="RpcNameAttribute"/>, else the
     /// method name with a trailing "Async" stripped, converted to snake_case.</summary>
     public static string ForMethod(MethodInfo method)

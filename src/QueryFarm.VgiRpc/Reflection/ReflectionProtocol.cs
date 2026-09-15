@@ -39,6 +39,22 @@ public static class ReflectionProtocol
     /// </remarks>
     public const string ProtocolName = "vgi_rpc.Reflection.v1";
 
+    /// <summary>The cheap question: what protocols are here, and have they changed.</summary>
+    public const string ListProtocolsMethod = "list_protocols";
+
+    /// <summary>The expensive question, asked once: the full surface of one protocol.</summary>
+    public const string DescribeMethod = "describe";
+
+    /// <summary>The two method names this protocol answers.</summary>
+    /// <remarks>
+    /// Deliberately not the same thing as <c>RpcServer.MethodsForProtocol(ProtocolName)</c>,
+    /// which is empty: these methods are framework-owned rather than registered, so the honest
+    /// hash is taken over an empty method table, while routing still has to know the two names
+    /// exist. One is what the protocol <i>is</i>; the other is what it is <i>described as</i>.
+    /// </remarks>
+    public static readonly IReadOnlySet<string> MethodNames =
+        new HashSet<string>([ListProtocolsMethod, DescribeMethod], StringComparer.Ordinal);
+
     /// <summary>The default <c>idempotency</c>: a caller must assume the worst.</summary>
     public const string IdempotencyUnknown = "unknown";
 

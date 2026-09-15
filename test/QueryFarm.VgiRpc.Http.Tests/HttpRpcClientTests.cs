@@ -22,6 +22,11 @@ public sealed class HttpRpcClientTests
 {
     private static readonly Schema s_valueSchema = new([new Field("value", Int64Type.Default, false)], null);
 
+    /// <summary>The routing key <see cref="IService"/> is hosted under — the interface name with
+    /// C#'s <c>I</c> prefix stripped, which is what <see cref="RpcServer.ProtocolName"/> reports
+    /// and what every namespaced RPC path here is built from.</summary>
+    private const string TestProtocol = "Service";
+
     public interface IService
     {
         Task<string> EchoAsync(string value);
@@ -107,7 +112,7 @@ public sealed class HttpRpcClientTests
         await using var host = await StartHostAsync();
         await using var client = new HttpRpcClient(
             host.Address,
-            new HttpRpcClientOptions { PreferredEncoding = encoding });
+            new HttpRpcClientOptions { Protocol = TestProtocol, PreferredEncoding = encoding });
 
         var parametersSchema = new Schema([new Field("value", StringType.Default, false)], null);
         using var parameters = new RecordBatch(parametersSchema, [new StringArray.Builder().Append("hello").Build()], 1);
@@ -172,7 +177,7 @@ public sealed class HttpRpcClientTests
         await using var host = await StartHostAsync();
         using var handler = new RejectFirstCompressedRequestHandler();
         using var http = new System.Net.Http.HttpClient(handler) { BaseAddress = host.Address };
-        await using var client = new HttpRpcClient(http);
+        await using var client = new HttpRpcClient(http, new HttpRpcClientOptions { Protocol = TestProtocol });
         var schema = new Schema([new Field("value", StringType.Default, false)], null);
         using var parameters = new RecordBatch(schema, [new StringArray.Builder().Append("fallback").Build()], 1);
 
@@ -189,7 +194,7 @@ public sealed class HttpRpcClientTests
     public async Task ResponseBudget_IsDiscoveredAdvertisedAndStrictlyEnforced()
     {
         await using var host = await StartHostAsync(maxResponseBytes: 64L << 10);
-        await using var client = new HttpRpcClient(host.Address);
+        await using var client = new HttpRpcClient(host.Address, new HttpRpcClientOptions { Protocol = TestProtocol });
         var capabilities = await client.GetCapabilitiesAsync(TestContext.Current.CancellationToken);
         Assert.True(capabilities.AcceptMaxResponseBytesSupport);
         Assert.Equal(64L << 10, capabilities.MaxResponseBytes);
@@ -212,7 +217,7 @@ public sealed class HttpRpcClientTests
             BaseAddress = new Uri("http://127.0.0.1"),
         };
         await using var client = new HttpRpcClient(http,
-            new HttpRpcClientOptions { AcceptedMaxResponseBytes = 64L << 10 });
+            new HttpRpcClientOptions { Protocol = TestProtocol, AcceptedMaxResponseBytes = 64L << 10 });
 
         var capabilities = await client.GetCapabilitiesAsync(TestContext.Current.CancellationToken);
         Assert.True(capabilities.AcceptMaxResponseBytesSupport);
@@ -230,7 +235,7 @@ public sealed class HttpRpcClientTests
         {
             BaseAddress = new Uri("http://127.0.0.1"),
         };
-        await using var client = new HttpRpcClient(http);
+        await using var client = new HttpRpcClient(http, new HttpRpcClientOptions { Protocol = TestProtocol });
         using var parameters = new RecordBatch(new Schema([], null), [], 1);
 
         var error = await Assert.ThrowsAsync<RpcException>(() => client.CallUnaryAsync(
@@ -251,7 +256,7 @@ public sealed class HttpRpcClientTests
             BaseAddress = new Uri("http://127.0.0.1"),
         };
         await using var client = new HttpRpcClient(http,
-            new HttpRpcClientOptions { AcceptedMaxResponseBytes = 64L << 10 });
+            new HttpRpcClientOptions { Protocol = TestProtocol, AcceptedMaxResponseBytes = 64L << 10 });
         using var parameters = new RecordBatch(new Schema([], null), [], 1);
 
         var error = await Assert.ThrowsAsync<RpcException>(() => client.CallUnaryAsync(
@@ -279,7 +284,7 @@ public sealed class HttpRpcClientTests
                 BaseAddress = new Uri("http://127.0.0.1"),
             };
             await using var client = new HttpRpcClient(http,
-                new HttpRpcClientOptions { AcceptedMaxResponseBytes = 128L << 10 });
+                new HttpRpcClientOptions { Protocol = TestProtocol, AcceptedMaxResponseBytes = 128L << 10 });
             using var parameters = new RecordBatch(new Schema([], null), [], 1);
 
             var error = await Assert.ThrowsAsync<RpcException>(() => client.CallUnaryAsync(
@@ -305,7 +310,7 @@ public sealed class HttpRpcClientTests
             {
                 BaseAddress = new Uri("http://127.0.0.1"),
             };
-            await using var client = new HttpRpcClient(http);
+            await using var client = new HttpRpcClient(http, new HttpRpcClientOptions { Protocol = TestProtocol });
             var error = await Assert.ThrowsAsync<RpcException>(() =>
                 client.GetCapabilitiesAsync(TestContext.Current.CancellationToken));
             Assert.Equal("ProtocolError", error.ErrorType);
@@ -320,7 +325,7 @@ public sealed class HttpRpcClientTests
         {
             BaseAddress = new Uri("http://127.0.0.1"),
         };
-        await using var responseClient = new HttpRpcClient(responseHttp);
+        await using var responseClient = new HttpRpcClient(responseHttp, new HttpRpcClientOptions { Protocol = TestProtocol });
         using var parameters = new RecordBatch(new Schema([], null), [], 1);
         var responseError = await Assert.ThrowsAsync<RpcException>(() =>
             responseClient.CallUnaryAsync("echo", parameters,
@@ -389,7 +394,7 @@ public sealed class HttpRpcClientTests
             UploadUrlProvider = new LongUploadUrlProvider(),
         });
         await using var client = new HttpRpcClient(host.Address,
-            new HttpRpcClientOptions { AcceptedMaxResponseBytes = 64L << 10 });
+            new HttpRpcClientOptions { Protocol = TestProtocol, AcceptedMaxResponseBytes = 64L << 10 });
 
         var error = await Assert.ThrowsAsync<RpcException>(() => client.RequestUploadUrlsAsync(
             64, TestContext.Current.CancellationToken));
@@ -405,7 +410,7 @@ public sealed class HttpRpcClientTests
         {
             BaseAddress = new Uri("http://127.0.0.1"),
         };
-        await using var client = new HttpRpcClient(http);
+        await using var client = new HttpRpcClient(http, new HttpRpcClientOptions { Protocol = TestProtocol });
         using var parameters = new RecordBatch(new Schema([], null), [], 1);
 
         var error = await Assert.ThrowsAsync<HttpRequestException>(

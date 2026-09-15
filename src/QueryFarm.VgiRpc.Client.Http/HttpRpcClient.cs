@@ -26,6 +26,10 @@ public sealed partial class HttpRpcClient : IRpcClient
     private readonly bool _ownsHttpClient;
     private readonly HttpRpcClientOptions _options;
     private readonly string _prefix;
+    // The protocol is folded into the prefix once, at construction, so every call site stays
+    // "{_rpcPrefix}/{method}" — the route shape lives in one place rather than at each of them.
+    private readonly string _rpcPrefix;
+    private readonly string _protocol;
     private readonly Stack<SessionSnapshot> _sessionScopes = new();
     private string? _sessionToken;
     private bool _acceptNewSession;
@@ -44,6 +48,8 @@ public sealed partial class HttpRpcClient : IRpcClient
         _http = new System.Net.Http.HttpClient(handler) { BaseAddress = baseAddress };
         _ownsHttpClient = true;
         _prefix = NormalizePrefix(_options.Prefix);
+        _protocol = RequireProtocol(_options.Protocol);
+        _rpcPrefix = $"{_prefix}/{Uri.EscapeDataString(_protocol)}";
         _acceptNewSession = _options.AcceptNewSession;
         ValidateAcceptedMaxResponseBytes(_options.AcceptedMaxResponseBytes);
         ValidateNoBudgetHeaderOverride(_options.DefaultHeaders);
@@ -75,6 +81,8 @@ public sealed partial class HttpRpcClient : IRpcClient
         _options = options ?? new HttpRpcClientOptions();
         _ownsHttpClient = ownsHttpClient;
         _prefix = NormalizePrefix(_options.Prefix);
+        _protocol = RequireProtocol(_options.Protocol);
+        _rpcPrefix = $"{_prefix}/{Uri.EscapeDataString(_protocol)}";
         _acceptNewSession = _options.AcceptNewSession;
         ValidateAcceptedMaxResponseBytes(_options.AcceptedMaxResponseBytes);
         ValidateNoBudgetHeaderOverride(_options.DefaultHeaders);
@@ -213,7 +221,7 @@ public sealed partial class HttpRpcClient : IRpcClient
         CancellationToken cancellationToken = default)
     {
         var responseBody = await PostBatchAsync(
-            $"{_prefix}/{Uri.EscapeDataString(method)}",
+            $"{_rpcPrefix}/{Uri.EscapeDataString(method)}",
             parameters,
             RequestMetadata(method, metadata),
             cancellationToken).ConfigureAwait(false);
@@ -228,7 +236,7 @@ public sealed partial class HttpRpcClient : IRpcClient
         CancellationToken cancellationToken = default)
     {
         var body = await PostBatchAsync(
-            $"{_prefix}/{Uri.EscapeDataString(method)}/init",
+            $"{_rpcPrefix}/{Uri.EscapeDataString(method)}/init",
             parameters,
             RequestMetadata(method, metadata),
             cancellationToken).ConfigureAwait(false);
@@ -244,7 +252,7 @@ public sealed partial class HttpRpcClient : IRpcClient
         CancellationToken cancellationToken = default)
     {
         var body = await PostBatchAsync(
-            $"{_prefix}/{Uri.EscapeDataString(method)}/init",
+            $"{_rpcPrefix}/{Uri.EscapeDataString(method)}/init",
             parameters,
             RequestMetadata(method, metadata),
             cancellationToken).ConfigureAwait(false);
@@ -304,7 +312,7 @@ public sealed partial class HttpRpcClient : IRpcClient
         var body = await PostBatchAsync(
             $"{_prefix}/__upload_url__/init",
             request,
-            RequestMetadata("__upload_url__", null),
+            RequestMetadata("__upload_url__", null, protocolScoped: false),
             cancellationToken,
             allowExternalize: false).ConfigureAwait(false);
         using var stream = new MemoryStream(body);
@@ -364,7 +372,7 @@ public sealed partial class HttpRpcClient : IRpcClient
         RecordBatch batch,
         IReadOnlyDictionary<string, string> metadata,
         CancellationToken cancellationToken) =>
-        await PostBatchAsync($"{_prefix}/{Uri.EscapeDataString(method)}/exchange", batch, metadata, cancellationToken).ConfigureAwait(false);
+        await PostBatchAsync($"{_rpcPrefix}/{Uri.EscapeDataString(method)}/exchange", batch, metadata, cancellationToken).ConfigureAwait(false);
 
     private async Task<byte[]> PostBatchAsync(
         string path,
@@ -678,14 +686,35 @@ public sealed partial class HttpRpcClient : IRpcClient
         DispatchLog(batch);
     }
 
-    private Dictionary<string, string> RequestMetadata(string method, IReadOnlyDictionary<string, string>? metadata)
+    /// <summary>The framework metadata every request batch carries.</summary>
+    /// <remarks>
+    /// <paramref name="protocolScoped"/> is false only for the server-level reserved endpoints
+    /// (<c>__upload_url__</c>), which belong to no protocol: stamping a routing key on one would
+    /// claim it is addressed to a protocol that does not host it.
+    /// </remarks>
+    private Dictionary<string, string> RequestMetadata(string method, IReadOnlyDictionary<string, string>? metadata, bool protocolScoped = true)
     {
         var result = metadata is null ? new Dictionary<string, string>() : new Dictionary<string, string>(metadata);
         result[MetadataKeys.Method] = method;
+        if (protocolScoped)
+        {
+            // Sent alongside the path segment, and canonical relative to it: the path is a
+            // projection an edge can read without an Arrow parser, and the server refuses a
+            // request whose two carriers disagree.
+            result[MetadataKeys.Protocol] = _protocol;
+        }
+
         result[MetadataKeys.RequestVersion] = MetadataKeys.CurrentRequestVersion;
         result.TryAdd(MetadataKeys.RequestId, Guid.NewGuid().ToString("n"));
         return result;
     }
+
+    private static string RequireProtocol(string protocol) =>
+        string.IsNullOrWhiteSpace(protocol)
+            ? throw new ArgumentException(
+                "HttpRpcClientOptions.Protocol is required: RPC paths are {Prefix}/{Protocol}/{method} "
+                + "and every request names the protocol it addresses.", nameof(protocol))
+            : protocol;
 
     private void AddCommonHeaders(HttpRequestMessage request)
     {

@@ -71,9 +71,25 @@ public static class StickySessions
         => ComputeIdentityAad(identity, s_aadPrefix, s_boundAadPrefix);
 
     /// <summary>Computes principal/evidence AAD for stream call tokens. Its distinct prefix
-    /// prevents a call token from being accepted as a state/sticky token.</summary>
-    public static byte[] ComputeCallAad(AuthIdentity? identity)
-        => ComputeIdentityAad(identity, s_callAadPrefix, s_boundCallAadPrefix);
+    /// prevents a call token from being accepted as a state/sticky token, and the trailing
+    /// protocol scope binds the token to the protocol its stream started on.</summary>
+    /// <param name="identity">The issuing/presenting request's identity.</param>
+    /// <param name="protocol">Wire name of the protocol that owns this stream.</param>
+    /// <remarks>
+    /// The protocol is part of the AAD rather than the token plaintext so that a cross-protocol
+    /// continuation fails the AEAD tag check and is refused exactly as an invalid token is. That
+    /// leaves no comparison in application code to get wrong — and, unlike a check, it cannot be
+    /// forgotten on one of the several paths a continuation can take.
+    ///
+    /// <para>Sticky-session tokens deliberately do <b>not</b> carry this scope
+    /// (<see cref="ComputeAad"/>): a session belongs to the server and its principal, and may
+    /// legitimately span calls to more than one hosted protocol.</para>
+    /// </remarks>
+    public static byte[] ComputeCallAad(AuthIdentity? identity, string protocol)
+    {
+        ArgumentNullException.ThrowIfNull(protocol);
+        return [.. ComputeIdentityAad(identity, s_callAadPrefix, s_boundCallAadPrefix), 0, .. System.Text.Encoding.UTF8.GetBytes(protocol)];
+    }
 
     private static byte[] ComputeIdentityAad(AuthIdentity? identity, byte[] legacyPrefix, byte[] boundPrefix)
     {

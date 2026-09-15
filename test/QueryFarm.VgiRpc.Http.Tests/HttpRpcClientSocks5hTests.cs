@@ -42,6 +42,7 @@ public sealed class HttpRpcClientSocks5hTests
             await using var client = new HttpRpcClient(new Uri("http://worker.invalid"),
                 new HttpRpcClientOptions
                 {
+                    Protocol = "Service",
                     TcpProxy = $"socks5h://127.0.0.1:{port}",
                     ConnectTimeout = TimeSpan.FromSeconds(2),
                 });
