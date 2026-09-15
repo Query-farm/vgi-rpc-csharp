@@ -24,6 +24,12 @@ public static class IdentityGuards
     /// asker may itself have rejected (expired, wrong audience) to a third party that might
     /// accept it, which turns introspection into a laundering step.
     /// </summary>
+    /// <remarks>
+    /// Always matched against the <em>trimmed</em> credential -- see
+    /// <see cref="RejectJwsShaped"/>. .NET's <c>$</c> means "end of string, or immediately before
+    /// a <c>\n</c> at the end of the string", which is a dialect quirk this guard must not depend
+    /// on, in either direction.
+    /// </remarks>
     private static readonly Regex s_jwsShaped =
         new(@"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$", RegexOptions.Compiled);
 
@@ -84,13 +90,46 @@ public static class IdentityGuards
         return caller;
     }
 
-    /// <summary>Refuses an empty, over-long, or JWS-shaped subject before it reaches a resolver.</summary>
-    /// <param name="token">The subject credential.</param>
+    /// <summary>Refuses a blank, over-long, or JWS-shaped subject before it reaches a resolver.</summary>
+    /// <param name="token">The subject credential, exactly as the caller sent it.</param>
     /// <exception cref="TokenUnresolvedException">Uniform with "unknown" and "expired" -- see
     /// <see cref="TokenUnresolvedException"/>.</exception>
+    /// <remarks>
+    /// <para>
+    /// <b>The shape test runs against the whitespace-trimmed credential, and the resolver still
+    /// receives what the caller actually sent.</b> Trimming can only add refusals, never remove
+    /// one, and it closes a padding bypass that anchor semantics alone cannot: to a strict
+    /// matcher <c>"a.b.c\n"</c> is not JWS-shaped, so it gets routed onward -- precisely what
+    /// this guard exists to stop.
+    /// </para>
+    /// <para>
+    /// This port happened to refuse a single trailing newline before the change, because .NET's
+    /// <c>$</c> matches before one -- the same accident the Python reference had, and just as
+    /// arbitrary: two trailing newlines slipped through, and so did <c>"a.b.c\r\n"</c>, which
+    /// matters on the Windows targets in this port's own CI matrix. Ports spelling the anchors
+    /// strictly (Go's <c>\A..\z</c>, JavaScript's unflagged <c>$</c>) diverged in the unsafe
+    /// direction. Trimming first is the rule that survives translation into seven regex dialects,
+    /// because it does not depend on any of them.
+    /// </para>
+    /// <para>
+    /// A whitespace-only credential is refused too: it is not a credential.
+    /// </para>
+    /// <para>
+    /// <b>Trimming is for the shape test only.</b> Rewriting a credential before resolving it
+    /// would make the worker answer about a string the caller never sent, so the length cap is
+    /// measured against the original and the original is what
+    /// <see cref="IdentityImpl.IntrospectToken"/> hands the resolver.
+    /// </para>
+    /// </remarks>
     public static void RejectJwsShaped(string token)
     {
-        if (string.IsNullOrEmpty(token) || token.Length > MaxTokenChars || s_jwsShaped.IsMatch(token))
+        if (string.IsNullOrEmpty(token) || token.Length > MaxTokenChars)
+        {
+            throw new TokenUnresolvedException("unresolved");
+        }
+
+        var candidate = token.Trim();
+        if (candidate.Length == 0 || s_jwsShaped.IsMatch(candidate))
         {
             throw new TokenUnresolvedException("unresolved");
         }

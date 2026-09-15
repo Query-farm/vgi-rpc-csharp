@@ -519,3 +519,82 @@ public class IdentityRateLimiterTests
         Assert.Equal(budget, admitted);
     }
 }
+
+/// <summary>Whitespace must not be a way to walk a JWS past the guard.</summary>
+/// <remarks>
+/// <para>
+/// The shape test runs against the trimmed credential while the resolver still receives what the
+/// caller sent, so trimming can only add refusals.
+/// </para>
+/// <para>
+/// This exists because the ports diverged here and the reference was the accident. Measured
+/// against this port before the fix: .NET's <c>$</c> matches before a single trailing newline, so
+/// <c>"a.b.c\n"</c> was refused -- while <c>"a.b.c\n\n"</c>, <c>"a.b.c\r\n"</c> and
+/// <c>"  a.b.c  "</c> all went straight to the resolver, which is the one outcome the guard
+/// exists to prevent. Python had the identical inconsistency; Go's <c>\A..\z</c> and
+/// JavaScript's unflagged <c>$</c> refused none of them. <c>"a.b.c\r\n"</c> is the one that
+/// should worry a .NET port specifically: CRLF is what its own Windows CI matrix runs on.
+/// Trimming first is the rule that means the same thing in seven regex dialects.
+/// </para>
+/// </remarks>
+public class JwsShapeTestSurvivesTranslationTests
+{
+    /// <summary>No amount of surrounding whitespace makes a JWS resolvable.</summary>
+    [Theory]
+    [InlineData("aaa.bbb.ccc")]
+    [InlineData("aaa.bbb.ccc\n")]
+    [InlineData("aaa.bbb.ccc\n\n")]
+    [InlineData("  aaa.bbb.ccc  ")]
+    [InlineData("\taaa.bbb.ccc\r\n")]
+    public void PaddingDoesNotSmuggleAJwsPastTheGuard(string token) =>
+        Assert.Throws<TokenUnresolvedException>(() => IdentityGuards.RejectJwsShaped(token));
+
+    /// <summary>Whitespace-only never reaches a resolver either.</summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\n")]
+    [InlineData("\t\r\n")]
+    public void ABlankCredentialIsNotACredential(string token) =>
+        Assert.Throws<TokenUnresolvedException>(() => IdentityGuards.RejectJwsShaped(token));
+
+    /// <summary>Trimming tightens the JWS test; it must not refuse ordinary tokens.</summary>
+    [Theory]
+    [InlineData("opaque-token")]
+    [InlineData("a.b.c.d")]
+    [InlineData("two.segments")]
+    [InlineData("sk_live_abc123")]
+    public void AnOpaqueCredentialStillReachesTheResolver(string token) =>
+        IdentityGuards.RejectJwsShaped(token);
+
+    /// <summary>The length cap is still measured against the original, not the trimmed form.</summary>
+    /// <remarks>
+    /// Trimming is a test-time view of the credential, never a rewrite of it -- so padding cannot
+    /// buy a caller room under the cap either.
+    /// </remarks>
+    [Fact]
+    public void TheLengthCapMeasuresTheOriginal()
+    {
+        var padded = "  " + new string('x', IdentityGuards.MaxTokenChars - 1) + "  ";
+        Assert.Equal(IdentityGuards.MaxTokenChars + 3, padded.Length);
+        Assert.Throws<TokenUnresolvedException>(() => IdentityGuards.RejectJwsShaped(padded));
+    }
+
+    /// <summary>Trimming is for the shape test only -- never for what is resolved.</summary>
+    /// <remarks>
+    /// Rewriting a credential before resolving it would make the worker answer about a string the
+    /// caller never sent.
+    /// </remarks>
+    [Fact]
+    public void TheResolverReceivesTheCredentialUnmodified()
+    {
+        var seen = new List<string>();
+        var impl = new IdentityImpl(
+            resolveToken: token => { seen.Add(token); return new TokenIdentity("p"); },
+            introspectPrincipals: ["proxy"]);
+
+        impl.IntrospectToken("  padded-opaque-token  ", IdentityTestDoubles.Ctx(IdentityTestDoubles.Auth("proxy")));
+
+        Assert.Equal(["  padded-opaque-token  "], seen);
+    }
+}
