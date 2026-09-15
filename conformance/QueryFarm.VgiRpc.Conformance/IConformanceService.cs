@@ -180,16 +180,22 @@ public interface IConformanceService
     // loosely while each impl method's concrete return narrows it; C# needs one shared
     // interface-level type since (unlike Python duck typing) it enforces exact signature
     // matching between interface and implementation, and RpcStream<TState> isn't covariant.
+    [StreamKind(StreamKind.Producer)]
     Task<RpcStream<StreamState>> ProduceNAsync(long count);
 
+    [StreamKind(StreamKind.Producer)]
     Task<RpcStream<StreamState>> ProduceTickMetadataAsync(long count);
 
+    [StreamKind(StreamKind.Producer)]
     Task<RpcStream<StreamState>> ProduceEmptyAsync();
 
+    [StreamKind(StreamKind.Producer)]
     Task<RpcStream<StreamState>> ProduceSingleAsync();
 
+    [StreamKind(StreamKind.Producer)]
     Task<RpcStream<StreamState>> ProduceWithLogsAsync(long count);
 
+    [StreamKind(StreamKind.Producer)]
     Task<RpcStream<StreamState>> ProduceErrorMidStreamAsync(long emitBeforeError);
 
     /// <summary>Emits one batch of <paramref name="rowsPerBatch"/> {index, value} rows, then
@@ -197,28 +203,37 @@ public interface IConformanceService
     /// and M7's <c>TestHttpResponseCapSoftWire</c>) to deliberately overshoot the operator-
     /// configured response cap for a single producer turn. The single-batch shape ensures the
     /// overshoot happens before any continuation-token boundary.</summary>
+    [StreamKind(StreamKind.Producer)]
     Task<RpcStream<StreamState>> ProduceOversizedBatchAsync(long rowsPerBatch);
 
     // -- Exchange streams --------------------------------------------------
 
+    [StreamKind(StreamKind.Exchange)]
     Task<RpcStream<StreamState>> ExchangeScaleAsync(double factor);
 
+    [StreamKind(StreamKind.Exchange)]
     Task<RpcStream<StreamState>> ExchangeAccumulateAsync();
 
+    [StreamKind(StreamKind.Exchange)]
     Task<RpcStream<StreamState>> ExchangeWithLogsAsync();
 
+    [StreamKind(StreamKind.Exchange)]
     Task<RpcStream<StreamState>> ExchangeErrorOnNthAsync(long failOn);
 
+    [StreamKind(StreamKind.Exchange)]
     Task<RpcStream<StreamState>> ExchangeCastCompatibleAsync();
 
     /// <summary>Companion to <see cref="OversizedUnaryAsync"/> for the lockstep exchange path —
     /// emits <paramref name="rowsPerBatch"/> rows for any input, sized to overshoot the response cap.</summary>
+    [StreamKind(StreamKind.Exchange)]
     Task<RpcStream<StreamState>> ExchangeOversizedAsync(long rowsPerBatch);
 
     // -- Cancellation ---------------------------------------------------------
 
+    [StreamKind(StreamKind.Producer)]
     Task<RpcStream<StreamState>> CancellableProducerAsync();
 
+    [StreamKind(StreamKind.Exchange)]
     Task<RpcStream<StreamState>> CancellableExchangeAsync();
 
     Task<List<long>> CancelProbeCountersAsync();
@@ -247,35 +262,45 @@ public interface IConformanceService
     // -- Streams that fail or degenerate --------------------------------------
 
     /// <summary>Raises during init, before any batch is produced.</summary>
+    [StreamKind(StreamKind.Producer)]
     Task<RpcStream<StreamState>> ProduceErrorOnInitAsync();
 
     /// <summary>Raises during init, before any exchange turn.</summary>
+    [StreamKind(StreamKind.Exchange)]
     Task<RpcStream<StreamState>> ExchangeErrorOnInitAsync();
 
     /// <summary>An exchange whose input and output schemas both have zero columns.</summary>
+    [StreamKind(StreamKind.Exchange)]
     Task<RpcStream<StreamState>> ExchangeZeroColumnsAsync();
 
     /// <summary>Produces <c>batchCount</c> batches of <c>rowsPerBatch</c> rows each.</summary>
+    [StreamKind(StreamKind.Producer)]
     Task<RpcStream<StreamState>> ProduceLargeBatchesAsync(long rowsPerBatch, long batchCount);
 
     // -- Stream headers -------------------------------------------------------
 
     [StreamHeader(typeof(ConformanceHeader))]
+    [StreamKind(StreamKind.Producer)]
     Task<RpcStream<StreamState>> ProduceWithHeaderAsync(long count);
 
     [StreamHeader(typeof(ConformanceHeader))]
+    [StreamKind(StreamKind.Producer)]
     Task<RpcStream<StreamState>> ProduceWithHeaderAndLogsAsync(long count, ICallContext? ctx = null);
 
     [StreamHeader(typeof(ConformanceHeader))]
+    [StreamKind(StreamKind.Exchange)]
     Task<RpcStream<StreamState>> ExchangeWithHeaderAsync(double factor);
 
     [StreamHeader(typeof(RichHeader))]
+    [StreamKind(StreamKind.Producer)]
     Task<RpcStream<StreamState>> ProduceWithRichHeaderAsync(long seed, long count);
 
     [StreamHeader(typeof(RichHeader))]
+    [StreamKind(StreamKind.Exchange)]
     Task<RpcStream<StreamState>> ExchangeWithRichHeaderAsync(long seed, double factor);
 
     [StreamHeader(typeof(RichHeader))]
+    [StreamKind(StreamKind.Producer)]
     Task<RpcStream<StreamState>> ProduceDynamicSchemaAsync(long seed, long count, bool includeStrings, bool includeFloats);
 
     // -- Sticky Sessions (HTTP-only; capability-gated tests — see docs/roadmap.md M10) ---------
@@ -309,10 +334,12 @@ public interface IConformanceService
     /// <summary>Emits <paramref name="count"/> increments of the sticky session counter via a
     /// producer stream. Each emitted batch carries the post-increment value of the counter bound
     /// via <see cref="ICallContext.Session"/>.</summary>
+    [StreamKind(StreamKind.Producer)]
     Task<RpcStream<StreamState>> StreamSessionCounterAsync(long count);
 
     /// <summary>Exchange stream adding each input <c>by</c> column to the sticky session counter.
     /// Each turn emits a single one-row batch with the post-update counter value.</summary>
+    [StreamKind(StreamKind.Exchange)]
     Task<RpcStream<StreamState>> ExchangeSessionCounterAsync();
 
     // TODO (later milestones — see docs/roadmap.md):

@@ -42,17 +42,27 @@ public static class ReflectionProtocol
     /// <summary>The default <c>idempotency</c>: a caller must assume the worst.</summary>
     public const string IdempotencyUnknown = "unknown";
 
-    /// <summary>
-    /// The stream kind this port can state: never more than "unknown".
-    /// </summary>
+    /// <summary>The fallback when a stream method declares no kind.</summary>
     /// <remarks>
-    /// Whether a stream is a producer or an exchange is decided per call here, by whether the
-    /// returned <c>RpcStream</c> sets an input schema -- so the protocol definition genuinely
-    /// cannot say. "unknown" is the honest answer and is sayable, which is why the field is a
-    /// string rather than a nullable boolean, and why <c>is_exchange</c> is not in the hash at
-    /// all.
+    /// This port decides per call, so a method that does not carry
+    /// <see cref="Attributes.StreamKindAttribute"/> genuinely cannot be classified. "unknown" is
+    /// the honest answer and is sayable, which is why the field is a string rather than a
+    /// nullable boolean -- and why <c>is_exchange</c> is not in the protocol hash at all: which
+    /// methods are undeclarable differs by port, so it cannot be a cross-language contract.
     /// </remarks>
     public const string StreamKindUnknown = "unknown";
+
+    /// <summary>The stream kind to report for <paramref name="info"/>, or "" for a unary method.</summary>
+    public static string StreamKindFor(RpcMethodInfo info)
+    {
+        if (info.Kind == RpcMethodKind.Unary) return "";
+        return info.DeclaredStreamKind switch
+        {
+            Attributes.StreamKind.Producer => "producer",
+            Attributes.StreamKind.Exchange => "exchange",
+            _ => StreamKindUnknown,
+        };
+    }
 
     private static Field Utf8(string name) => new(name, StringType.Default, nullable: false);
 
@@ -196,7 +206,7 @@ public static class ReflectionProtocol
             {
                 "name" => ordered[i].WireName,
                 "method_type" => ordered[i].Kind == RpcMethodKind.Unary ? "unary" : "stream",
-                "stream_kind" => ordered[i].Kind == RpcMethodKind.Unary ? "" : StreamKindUnknown,
+                "stream_kind" => StreamKindFor(ordered[i]),
                 "idempotency" => IdempotencyUnknown,
                 "deprecation_message" => "",
                 _ => null,

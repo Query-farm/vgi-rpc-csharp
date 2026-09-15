@@ -55,6 +55,14 @@ public sealed class RpcMethodInfo
     /// </remarks>
     public Type? HeaderClrType { get; }
 
+    /// <summary>The stream kind this method declares, or null when it declares none.</summary>
+    /// <remarks>
+    /// Declared via <see cref="Attributes.StreamKindAttribute"/> because this port decides per
+    /// call. It is the only field in a description that says whether a stream accepts input, so
+    /// leaving it unstated makes reflection unable to answer the question it exists for.
+    /// </remarks>
+    public Attributes.StreamKind? DeclaredStreamKind { get; }
+
     public RpcMethodInfo(MethodInfo method)
     {
         Method = method;
@@ -72,6 +80,7 @@ public sealed class RpcMethodInfo
 
         (ResultClrType, IsAsync) = UnwrapReturnType(method.ReturnType);
         HeaderClrType = method.GetCustomAttribute<Attributes.StreamHeaderAttribute>()?.HeaderType;
+        DeclaredStreamKind = method.GetCustomAttribute<Attributes.StreamKindAttribute>()?.Kind;
         _invoke = CompileInvoker(method);
         if (method.ReturnType.IsGenericType)
         {
