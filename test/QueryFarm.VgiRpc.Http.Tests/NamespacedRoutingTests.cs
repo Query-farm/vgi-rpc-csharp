@@ -235,21 +235,32 @@ public sealed class NamespacedRoutingTests
         Assert.Equal(MetadataKeys.ErrorKinds.ProtocolNotSupported, await ErrorKindAsync(response));
     }
 
-    /// <summary>The routing key is required, with no single-protocol exemption.</summary>
+    /// <summary>A request carrying no routing key at all is routed on the path.</summary>
     /// <remarks>
-    /// An intermediary that rebuilds a request and drops the field gets a loud rejection instead
-    /// of landing silently on whichever protocol happened to be registered first.
+    /// <para>
+    /// Pinned as a behaviour, not an omission. The shared cross-language conformance harness
+    /// requires it — <c>_adversarial_http.py</c>'s recovery probe expects 200 for exactly this
+    /// request — and the reference server's <c>check_protocol_agreement</c> is documented as a
+    /// no-op when the key is absent.
+    /// </para>
+    /// <para>
+    /// What it gives up: an intermediary that rewrites the <i>path</i> cannot reach inside the
+    /// Arrow body to match it, so a present key is what would make such a rewrite detectable.
+    /// Without one, this request is routed on the projection alone. The requirement belongs on
+    /// the raw transports, where metadata is the only carrier; here the path already resolved the
+    /// binding.
+    /// </para>
     /// </remarks>
     [Fact]
-    public async Task AbsentProtocolMetadata_IsRejected()
+    public async Task AbsentProtocolMetadata_IsRoutedOnThePath()
     {
         await using var host = await StartHostAsync();
         using var http = new System.Net.Http.HttpClient { BaseAddress = host.Address };
 
         using var response = await PostAsync(http, $"/{AppProtocol}/echo", "echo", declaredProtocol: null);
 
-        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-        Assert.Equal(MetadataKeys.ErrorKinds.ProtocolNotSpecified, await ErrorKindAsync(response));
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.False(response.Headers.Contains(RpcHttpEndpoints.RpcErrorHeader));
     }
 
     /// <summary>A percent sign in the protocol segment is refused without being decoded.</summary>
@@ -430,10 +441,18 @@ public sealed class NamespacedRoutingTests
     /// Builds a request URI that reaches the wire byte for byte.
     /// </summary>
     /// <remarks>
-    /// <see cref="Uri"/> canonicalisation would otherwise decode a percent-escaped
-    /// <em>unreserved</em> character — <c>%45</c> to <c>E</c> — client-side, so the very requests
-    /// the <c>%</c> rule exists to refuse would never leave as written. Disabling it is what makes
-    /// these cases test the server rather than <see cref="Uri"/>.
+    /// <para>
+    /// <b>Do not simplify this back to a plain string path.</b> <see cref="Uri"/> canonicalises a
+    /// percent-escaped <em>unreserved</em> character — <c>%45</c> to <c>E</c> — client-side, so
+    /// the very requests the <c>%</c> rule exists to refuse never leave as written. Measured, not
+    /// theorised: with an ordinary path string the three
+    /// <see cref="PercentInTheProtocolSegment_IsRejectedWithoutDecoding"/> cases passed against a
+    /// server whose check was never reached, because the escape was already gone by the time the
+    /// bytes hit the socket. Reverting this makes those assertions vacuous rather than red.
+    /// </para>
+    /// <para>
+    /// Any port whose HTTP client library normalises request targets has the same trap.
+    /// </para>
     /// </remarks>
     private static Uri RawUri(Uri baseAddress, string path)
     {

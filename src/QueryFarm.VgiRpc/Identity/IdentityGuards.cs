@@ -34,10 +34,21 @@ public static class IdentityGuards
         new(@"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$", RegexOptions.Compiled);
 
     /// <summary>
-    /// Cap on a credential this framework will even attempt to resolve. Anything longer is not a
-    /// bearer token; refusing early keeps a resolver from being handed megabytes.
+    /// Cap on a credential this framework will even attempt to resolve, <b>in UTF-8 bytes</b>.
+    /// Anything longer is not a bearer token; refusing early keeps a resolver from being handed
+    /// megabytes.
     /// </summary>
-    public const int MaxTokenChars = 4096;
+    /// <remarks>
+    /// <b>Bytes, not characters.</b> The ports reached for three different units here and bytes
+    /// is the one the purpose implies: "do not hand a resolver megabytes" is a statement about
+    /// what crosses the wire and what a store is asked to hold, and it is also the most
+    /// conservative of the three. In this port the distinction is not academic —
+    /// <see cref="string.Length"/> counts UTF-16 code units, so a credential made of multibyte
+    /// characters would otherwise get up to three times its intended allowance (four, counting
+    /// surrogate pairs by code unit). Measure with
+    /// <see cref="Encoding.GetByteCount(string)"/>.
+    /// </remarks>
+    public const int MaxTokenBytes = 4096;
 
     /// <summary>Returns a lowercase hex SHA-256 digest of <paramref name="token"/>, for diagnostics.</summary>
     /// <remarks>
@@ -120,10 +131,14 @@ public static class IdentityGuards
     /// measured against the original and the original is what
     /// <see cref="IdentityImpl.IntrospectToken"/> hands the resolver.
     /// </para>
+    /// <para>
+    /// The cap is counted in UTF-8 bytes — see <see cref="MaxTokenBytes"/> for why that is not
+    /// the same as <see cref="string.Length"/> on this runtime.
+    /// </para>
     /// </remarks>
     public static void RejectJwsShaped(string token)
     {
-        if (string.IsNullOrEmpty(token) || token.Length > MaxTokenChars)
+        if (string.IsNullOrEmpty(token) || Encoding.UTF8.GetByteCount(token) > MaxTokenBytes)
         {
             throw new TokenUnresolvedException("unresolved");
         }

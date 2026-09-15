@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Http;
+using QueryFarm.VgiRpc.Identity;
 
 namespace QueryFarm.VgiRpc.Http;
 
@@ -46,7 +47,6 @@ public static class TokenIntrospection
     public const string IntrospectEnabledHeader = "VGI-Token-Introspection";
 
     private const int MaxBodyBytes = 8192;
-    private const int MaxTokenChars = 4096;
 
     // Three dot-separated base64url segments — a JWS. Such a credential is validated locally
     // against a key set and MUST NOT be routed here: doing so sends a bearer token the asker may
@@ -206,8 +206,13 @@ public static class TokenIntrospection
                 return null;
             }
 
+            // The same cap, in the same unit, as the protocol method that supersedes this route
+            // (IdentityGuards.MaxTokenBytes -- UTF-8 bytes, not UTF-16 code units). Two spellings
+            // of one rule in one repo is how the units diverged across the ports in the first
+            // place, so this reads the shared constant rather than keeping a private copy.
             var token = tokenElement.GetString();
-            if (string.IsNullOrEmpty(token) || token.Length > MaxTokenChars)
+            if (string.IsNullOrEmpty(token)
+                || System.Text.Encoding.UTF8.GetByteCount(token) > IdentityGuards.MaxTokenBytes)
             {
                 return null;
             }

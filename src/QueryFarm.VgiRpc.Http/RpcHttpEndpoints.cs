@@ -33,13 +33,15 @@ namespace QueryFarm.VgiRpc.Http;
 /// </para>
 ///
 /// <para>
-/// <b>Metadata is canonical; the path is a required faithful projection of it.</b> The protocol
-/// rides twice on HTTP — in <c>vgi_rpc.protocol</c> on the request batch and as a path segment —
-/// and the metadata field is the authority because it is the only carrier on the stdio, unix and
-/// named-pipe transports. The path segment exists so an edge device can act on the protocol
-/// without an Arrow parser, is required, and must agree; disagreement is refused, a percent sign
-/// in it is refused without being decoded, and a protocol this server does not host is 404. See
-/// <see cref="ResolveProtocolAsync"/> and <see cref="CheckProtocolAgreementAsync"/>.
+/// <b>Metadata is canonical; the path is its projection.</b> The protocol rides twice on HTTP —
+/// in <c>vgi_rpc.protocol</c> on the request batch and as a path segment — and the metadata field
+/// is the authority because it is the only carrier on the stdio, unix and named-pipe transports.
+/// The path segment exists so an edge device can act on the protocol without an Arrow parser: it
+/// is required, a percent sign in it is refused without being decoded, and a protocol this server
+/// does not host is 404. A request that carries the metadata key must agree with the path, or it
+/// is refused; a request that carries no key at all is routed on the path, which is a gap named
+/// and justified on <see cref="CheckProtocolAgreementAsync"/>. See also
+/// <see cref="ResolveProtocolAsync"/>.
 /// </para>
 ///
 /// Dispatch here is necessarily a separate code path from <see cref="RpcServer.ServeOneAsync"/>,
@@ -558,22 +560,35 @@ public static class RpcHttpEndpoints
     }
 
     /// <summary>
-    /// Requires the request batch's <c>vgi_rpc.protocol</c> to be present and to name the same
-    /// protocol the path did, or writes the refusal and returns <see langword="false"/>.
+    /// Refuses a request whose <c>vgi_rpc.protocol</c> names a different protocol than the path
+    /// resolved to. A no-op when the request carries no routing key at all.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>The metadata field is canonical; the path segment is a required faithful projection.</b>
-    /// Metadata is the authority because it is the <i>only</i> carrier on the stdio, unix and
-    /// named-pipe transports; the path exists so an edge device can act on the protocol without
-    /// an Arrow parser. Left unchecked, the two may disagree — and then edge policy is applied to
-    /// one protocol while the worker runs another.
+    /// <b>The metadata field is canonical; the path segment is its projection.</b> Metadata is
+    /// the authority because it is the <i>only</i> carrier on the stdio, unix and named-pipe
+    /// transports; the path exists so an edge device can act on the protocol without an Arrow
+    /// parser. Left unchecked, the two may disagree — and then edge policy is applied to one
+    /// protocol while the worker runs another, which is the Content-Length/Transfer-Encoding
+    /// shape. So a disagreement is refused (400).
     /// </para>
     /// <para>
-    /// Absent is refused too, with no single-protocol exemption: an intermediary that rebuilds a
-    /// request and drops the field gets a loud rejection instead of landing silently on whichever
-    /// protocol happened to be registered first. Mirrors the <c>vgi_rpc.method</c> check the same
-    /// dispatchers already make.
+    /// <b>Absent is accepted, and that is a real gap taken deliberately.</b> On HTTP the path has
+    /// already resolved the binding, so there is no ambiguity to refuse — which is why the
+    /// requirement belongs on the raw transports, where the metadata is the only carrier and an
+    /// absent key genuinely is unroutable. What is given up here is narrower and worth naming:
+    /// requiring the key on HTTP is what would make a <i>path rewrite</i> by an intermediary
+    /// detectable, because an intermediary that rewrites the path cannot reach inside the Arrow
+    /// body to match it. Accepting absent means that, for such a request, this server is routing
+    /// on the projection alone.
+    /// </para>
+    /// <para>
+    /// It is taken because the shared cross-language conformance harness requires it: the
+    /// <c>_adversarial_http.py</c> recovery probe explicitly expects 200 for a namespaced request
+    /// carrying no <c>vgi_rpc.protocol</c>, and the reference's own
+    /// <c>check_protocol_agreement</c> is documented as a no-op when the key is absent. Tightening
+    /// it is a change that has to move the harness and every port together, not one a single port
+    /// can make. The Java port reached the same conclusion independently.
     /// </para>
     /// </remarks>
     private static async Task<bool> CheckProtocolAgreementAsync(
@@ -583,15 +598,7 @@ public static class RpcHttpEndpoints
         var declared = requestBatch.GetMetadata(MetadataKeys.Protocol);
         if (string.IsNullOrEmpty(declared))
         {
-            await ErrorResultAsync(
-                server, method,
-                new ProtocolNotSpecifiedException(
-                    $"Request carries no '{MetadataKeys.Protocol}' routing key. Every request must name the "
-                    + $"protocol it addresses, including against a server hosting exactly one. This server hosts: "
-                    + $"[{string.Join(", ", server.HostedProtocols)}]."),
-                StatusCodes.Status400BadRequest, schema, StatusCodes.Status400BadRequest,
-                context, encoding, useCustomHeader, compressionLevel, methodType, protocol: protocol).ConfigureAwait(false);
-            return false;
+            return true;
         }
 
         if (!string.Equals(declared, protocol, StringComparison.Ordinal))

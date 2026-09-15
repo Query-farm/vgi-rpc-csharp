@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using QueryFarm.VgiRpc.Errors;
 using QueryFarm.VgiRpc.Identity;
 using QueryFarm.VgiRpc.Logging;
@@ -37,6 +38,54 @@ public static class IdentityTestDoubles
 
     public static TokenIdentity? Resolver(string token) =>
         token == "good" ? new TokenIdentity("bob", "ci-key") : null;
+
+    /// <summary>
+    /// An <see cref="IdentityImpl"/> whose resolver resolves <b>anything</b> and records what it
+    /// was handed — the only shape in which a guard test can actually fail.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Uniform rejections make the obvious test vacuous.</b> Probing <c>IntrospectToken</c>
+    /// with a credential the ordinary resolver does not know cannot distinguish "the guard
+    /// refused it" from "the guard let it through and the resolver refused it": both answers are
+    /// the same <see cref="TokenUnresolvedException"/> with the same message, on purpose. A test
+    /// written that way stays green after the guard is deleted.
+    /// </para>
+    /// <para>
+    /// With a resolver that resolves everything, a guard that fires is the <em>only</em> thing
+    /// that can produce a refusal, and <see cref="Probe.Seen"/> says so positively. Verified by
+    /// mutation: each guard was broken in turn and the corresponding assertion went red.
+    /// </para>
+    /// </remarks>
+    public sealed class Probe
+    {
+        public List<string> Seen { get; } = [];
+
+        public IdentityImpl Impl { get; }
+
+        public Probe(int rateLimit = 20)
+        {
+            Impl = new IdentityImpl(
+                resolveToken: token =>
+                {
+                    Seen.Add(token);
+                    return new TokenIdentity("resolved-anything");
+                },
+                introspectPrincipals: ["proxy"],
+                introspectRateLimit: rateLimit);
+        }
+
+        /// <summary>Asserts the call refused <em>and</em> that the resolver was never reached.</summary>
+        public TException Refuses<TException>(string token, string principal = "proxy")
+            where TException : Exception
+        {
+            var before = Seen.Count;
+            var exc = Assert.Throws<TException>(
+                () => Impl.IntrospectToken(token, Ctx(Auth(principal))));
+            Assert.Equal(before, Seen.Count);
+            return exc;
+        }
+    }
 
     public static IssuedGrant Minter(string principal, string purpose, List<string> scopes, long ttlSeconds) =>
         new($"grant-for-{principal}", Now() + ttlSeconds, "g1");
@@ -134,7 +183,7 @@ public class IntrospectionIsLockedDownTests
     public void AuthorizationPrecedesTheLengthCheck() =>
         Assert.Throws<IntrospectionRefusedException>(
             () => Impl().IntrospectToken(
-                new string('x', IdentityGuards.MaxTokenChars + 1),
+                new string('x', IdentityGuards.MaxTokenBytes + 1),
                 IdentityTestDoubles.Ctx(IdentityTestDoubles.Auth("mallory"))));
 
     /// <summary>The rate limit also precedes the shape checks, for the same reason.</summary>
@@ -157,7 +206,7 @@ public class IntrospectionIsLockedDownTests
     [InlineData("oversized")]
     public void RejectionsAreUniform(string token)
     {
-        var subject = token == "oversized" ? new string('x', IdentityGuards.MaxTokenChars + 1) : token;
+        var subject = token == "oversized" ? new string('x', IdentityGuards.MaxTokenBytes + 1) : token;
         var exc = Assert.Throws<TokenUnresolvedException>(
             () => Impl().IntrospectToken(subject, IdentityTestDoubles.Ctx(IdentityTestDoubles.Auth("proxy"))));
         Assert.Equal("unresolved", exc.ErrorMessage);
@@ -537,6 +586,158 @@ public class IdentityRateLimiterTests
 /// Trimming first is the rule that means the same thing in seven regex dialects.
 /// </para>
 /// </remarks>
+/// <summary>
+/// Every guard, probed in the one form that can actually fail.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The refusals this module hands back are deliberately uniform — unknown, malformed, expired
+/// and over-long are all one answer, because distinguishing them would confirm that a guessed
+/// credential exists. That uniformity is correct and it is also what makes the obvious guard test
+/// vacuous: probe <c>IntrospectToken</c> with a credential the ordinary test resolver does not
+/// know and the assertion passes whether the guard fired or the resolver did. Delete the guard
+/// and the test stays green.
+/// </para>
+/// <para>
+/// So every case here uses <see cref="IdentityTestDoubles.Probe"/>, whose resolver resolves
+/// <em>anything</em>: a refusal can then only have come from a guard, and
+/// <see cref="IdentityTestDoubles.Probe.Seen"/> asserts positively that nothing downstream was
+/// reached. <b>Mutation-verified</b>: each guard was broken in turn and the matching case went
+/// red — see the per-test notes for which mutation was applied.
+/// </para>
+/// </remarks>
+public class GuardsAreNotVacuousTests
+{
+    /// <summary>Mutation: delete the <c>s_jwsShaped.IsMatch</c> branch. Goes red.</summary>
+    [Theory]
+    [InlineData("aaa.bbb.ccc")]
+    [InlineData("  aaa.bbb.ccc  ")]
+    [InlineData("aaa.bbb.")]
+    public void TheJwsTrapFiresRatherThanTheResolver(string token)
+    {
+        var probe = new IdentityTestDoubles.Probe();
+        probe.Refuses<TokenUnresolvedException>(token);
+    }
+
+    /// <summary>Mutation: drop the <c>GetByteCount &gt; MaxTokenBytes</c> test. Goes red.</summary>
+    [Fact]
+    public void TheLengthCapFiresRatherThanTheResolver()
+    {
+        var probe = new IdentityTestDoubles.Probe();
+        probe.Refuses<TokenUnresolvedException>(new string('x', IdentityGuards.MaxTokenBytes + 1));
+
+        // The same credential one byte shorter is resolved, so the case above is the cap firing
+        // and not something incidental about a long string.
+        Assert.Equal(
+            "resolved-anything",
+            probe.Impl.IntrospectToken(
+                new string('x', IdentityGuards.MaxTokenBytes),
+                IdentityTestDoubles.Ctx(IdentityTestDoubles.Auth("proxy"))).Principal);
+    }
+
+    /// <summary>Mutation: count UTF-16 code units instead of UTF-8 bytes. Goes red.</summary>
+    [Fact]
+    public void TheLengthCapFiresOnAMultibyteCredentialToo()
+    {
+        var probe = new IdentityTestDoubles.Probe();
+        var overByBytes = new string('\u4e16', (IdentityGuards.MaxTokenBytes / 3) + 1);
+
+        Assert.True(overByBytes.Length < IdentityGuards.MaxTokenBytes);
+        probe.Refuses<TokenUnresolvedException>(overByBytes);
+    }
+
+    /// <summary>Mutation: delete the blank test. Goes red.</summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\u00a0")]
+    public void TheBlankTestFiresRatherThanTheResolver(string token)
+    {
+        var probe = new IdentityTestDoubles.Probe();
+        probe.Refuses<TokenUnresolvedException>(token);
+    }
+
+    /// <summary>Mutation: make <c>CheckIntrospector</c> return the caller unconditionally. Goes red.</summary>
+    [Theory]
+    [InlineData("mallory")]
+    [InlineData("")]
+    public void TheAllowlistFiresRatherThanTheResolver(string caller)
+    {
+        var probe = new IdentityTestDoubles.Probe();
+        var exc = probe.Refuses<IntrospectionRefusedException>("good", principal: caller);
+        Assert.Equal(MetadataKeys.ErrorKinds.IntrospectionRefused, exc.ErrorKind);
+    }
+
+    /// <summary>Mutation: make <c>IdentityRateLimiter.Allow</c> always true. Goes red.</summary>
+    [Fact]
+    public void TheRateLimitFiresRatherThanTheResolver()
+    {
+        var probe = new IdentityTestDoubles.Probe(rateLimit: 1);
+        var ctx = IdentityTestDoubles.Ctx(IdentityTestDoubles.Auth("proxy"));
+
+        Assert.Equal("resolved-anything", probe.Impl.IntrospectToken("good", ctx).Principal);
+        Assert.Single(probe.Seen);
+
+        var exc = probe.Refuses<IntrospectionRefusedException>("good");
+        Assert.Contains("rate limit", exc.ErrorMessage, StringComparison.Ordinal);
+    }
+
+    /// <summary>Mutation: delete the <c>CheckFreshness</c> call. Goes red.</summary>
+    /// <remarks>
+    /// The issuance half of the same problem: a minter that mints for anyone is what makes
+    /// "the guard refused" distinguishable from "the worker declined".
+    /// </remarks>
+    [Fact]
+    public void FreshnessFiresRatherThanTheMinter()
+    {
+        var minted = new List<string>();
+        var impl = new IdentityImpl(
+            mintGrant: (principal, purpose, scopes, ttl) =>
+            {
+                minted.Add(principal);
+                return new IssuedGrant("granted-anyway", IdentityTestDoubles.Now() + ttl);
+            },
+            maxAuthAge: 900.0);
+
+        // No auth_time at all.
+        Assert.Throws<StaleAuthException>(
+            () => impl.IssueGrant("p", [], 60, IdentityTestDoubles.Ctx(IdentityTestDoubles.Auth("alice"))));
+        Assert.Empty(minted);
+
+        // Present but stale.
+        Assert.Throws<StaleAuthException>(
+            () => impl.IssueGrant("p", [], 60, IdentityTestDoubles.Ctx(
+                IdentityTestDoubles.Auth("alice", authTime: IdentityTestDoubles.Now() - 4000))));
+        Assert.Empty(minted);
+
+        // And fresh does reach the minter, so the cases above are the guard and not a minter
+        // that never runs.
+        Assert.Equal(
+            "granted-anyway",
+            impl.IssueGrant("p", [], 60, IdentityTestDoubles.Ctx(
+                IdentityTestDoubles.Auth("alice", authTime: IdentityTestDoubles.Now()))).Token);
+        Assert.Equal(["alice"], minted);
+    }
+
+    /// <summary>
+    /// The ordering claim, stated positively: an unauthorized caller presenting an over-long or
+    /// JWS-shaped credential still learns only that it is not an introspector.
+    /// </summary>
+    /// <remarks>
+    /// Mutation: move <c>CheckIntrospector</c> below <c>RejectJwsShaped</c>. Goes red — the
+    /// refusal type changes, which is exactly the leak. An unauthorized caller must not learn
+    /// anything about the subject credential, including how long looking at it took.
+    /// </remarks>
+    [Theory]
+    [InlineData("aaa.bbb.ccc")]
+    [InlineData("")]
+    public void AuthorizationStillPrecedesEveryLookAtTheCredential(string token)
+    {
+        var probe = new IdentityTestDoubles.Probe();
+        probe.Refuses<IntrospectionRefusedException>(token, principal: "mallory");
+    }
+}
+
 public class JwsShapeTestSurvivesTranslationTests
 {
     /// <summary>No amount of surrounding whitespace makes a JWS resolvable.</summary>
@@ -575,9 +776,64 @@ public class JwsShapeTestSurvivesTranslationTests
     [Fact]
     public void TheLengthCapMeasuresTheOriginal()
     {
-        var padded = "  " + new string('x', IdentityGuards.MaxTokenChars - 1) + "  ";
-        Assert.Equal(IdentityGuards.MaxTokenChars + 3, padded.Length);
+        var padded = "  " + new string('x', IdentityGuards.MaxTokenBytes - 1) + "  ";
+        Assert.Equal(IdentityGuards.MaxTokenBytes + 3, padded.Length);
         Assert.Throws<TokenUnresolvedException>(() => IdentityGuards.RejectJwsShaped(padded));
+    }
+
+    /// <summary>The cap is UTF-8 bytes, not <see cref="string.Length"/>.</summary>
+    /// <remarks>
+    /// The behavioural half of the unit fix, and it only bites on a multibyte credential: 2,048
+    /// three-byte characters are 6,144 bytes but only 2,048 UTF-16 code units, so a
+    /// <c>string.Length</c> cap would wave it straight through at a third of its intended
+    /// allowance. Pinned in both directions so neither a revert to code units nor an
+    /// over-correction to something stricter than the reference passes silently.
+    /// </remarks>
+    [Fact]
+    public void TheLengthCapCountsUtf8Bytes()
+    {
+        // U+4E16 encodes as three UTF-8 bytes.
+        var overByBytes = new string('\u4e16', (IdentityGuards.MaxTokenBytes / 3) + 1);
+        Assert.True(overByBytes.Length < IdentityGuards.MaxTokenBytes, "must be under the cap by code units");
+        Assert.True(Encoding.UTF8.GetByteCount(overByBytes) > IdentityGuards.MaxTokenBytes);
+        Assert.Throws<TokenUnresolvedException>(() => IdentityGuards.RejectJwsShaped(overByBytes));
+
+        // And a multibyte credential that fits in bytes is still allowed through.
+        var underByBytes = new string('\u4e16', IdentityGuards.MaxTokenBytes / 3);
+        Assert.True(Encoding.UTF8.GetByteCount(underByBytes) <= IdentityGuards.MaxTokenBytes);
+        IdentityGuards.RejectJwsShaped(underByBytes);
+    }
+
+    /// <summary>The exact set of characters the shape test's trim must strip.</summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="string.Trim()"/> delegates to <see cref="char.IsWhiteSpace(char)"/>, which
+    /// already covers all eight — including <c>U+0085</c> (NEL) and <c>U+00A0</c> (NBSP), the two
+    /// a hand-rolled trim built from a literal space/tab/CR/LF set misses. So this port is
+    /// correct today and this test buys nothing <em>now</em>; it exists so that swapping in such
+    /// a trim, here or in a port that copies this file, goes red instead of quietly re-opening
+    /// the padding bypass the trim was added to close.
+    /// </para>
+    /// <para>Floor, not ceiling: a runtime that strips more than these eight is fine.</para>
+    /// </remarks>
+    [Theory]
+    [InlineData('\u0009')]
+    [InlineData('\u000A')]
+    [InlineData('\u000B')]
+    [InlineData('\u000C')]
+    [InlineData('\u000D')]
+    [InlineData('\u0020')]
+    [InlineData('\u0085')]
+    [InlineData('\u00A0')]
+    public void TheTrimFloorStripsEveryEnumeratedWhitespaceCharacter(char whitespace)
+    {
+        var padded = whitespace + "aaa.bbb.ccc" + whitespace;
+
+        Assert.True(char.IsWhiteSpace(whitespace));
+        Assert.Throws<TokenUnresolvedException>(() => IdentityGuards.RejectJwsShaped(padded));
+
+        // Padding alone is not a credential either, by the same trim.
+        Assert.Throws<TokenUnresolvedException>(() => IdentityGuards.RejectJwsShaped(new string(whitespace, 3)));
     }
 
     /// <summary>Trimming is for the shape test only -- never for what is resolved.</summary>
