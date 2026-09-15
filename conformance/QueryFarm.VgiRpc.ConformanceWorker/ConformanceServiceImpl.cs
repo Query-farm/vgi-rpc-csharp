@@ -165,6 +165,44 @@ public sealed class ConformanceServiceImpl : IConformanceService
         return Task.FromResult(value);
     }
 
+    // -- Wide types and deep nesting ------------------------------------------
+
+    public Task<WideTypes> EchoWideTypesAsync(WideTypes data) => Task.FromResult(data);
+
+    public Task<DeepNested> EchoDeepNestedAsync(DeepNested data) => Task.FromResult(data);
+
+    public Task<ContainerWideTypes> EchoContainerWideTypesAsync(ContainerWideTypes data) =>
+        Task.FromResult(data);
+
+    public Task<EmbeddedArrow> EchoEmbeddedArrowAsync(EmbeddedArrow data) => Task.FromResult(data);
+
+    public Task<Status> EchoDictEncodedStringAsync(Status value) => Task.FromResult(value);
+
+    [return: FixedBinary(8)]
+    public Task<byte[]> EchoFixedBinaryAsync([FixedBinary(8)] byte[] value) => Task.FromResult(value);
+
+    // -- Streams that fail or degenerate --------------------------------------
+
+    public Task<RpcStream<StreamState>> ProduceErrorOnInitAsync() =>
+        throw new InvalidOperationException("intentional init error");
+
+    public Task<RpcStream<StreamState>> ExchangeErrorOnInitAsync() =>
+        throw new InvalidOperationException("intentional exchange init error");
+
+    public Task<RpcStream<StreamState>> ExchangeZeroColumnsAsync()
+    {
+        // A schema with no fields is legal Arrow, and the row count is then the
+        // only information a batch carries -- which the framing has to get right
+        // on both sides.
+        var empty = new Schema.Builder().Build();
+        return Task.FromResult(
+            new RpcStream<StreamState>(empty, new ZeroColumnExchangeState(), InputSchema: empty));
+    }
+
+    public Task<RpcStream<StreamState>> ProduceLargeBatchesAsync(long rowsPerBatch, long batchCount) =>
+        Task.FromResult(new RpcStream<StreamState>(
+            ConformanceStreamSchemas.Counter, new LargeProducerState(rowsPerBatch, batchCount)));
+
     public Task<RpcStream<StreamState>> ProduceNAsync(long count) =>
         Task.FromResult(new RpcStream<StreamState>(ConformanceStreamSchemas.Counter, new CounterState(count)));
 

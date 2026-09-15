@@ -225,6 +225,39 @@ public interface IConformanceService
 
     Task ResetCancelProbeAsync();
 
+    // -- Wide types and deep nesting ------------------------------------------
+
+    Task<WideTypes> EchoWideTypesAsync(WideTypes data);
+
+    Task<DeepNested> EchoDeepNestedAsync(DeepNested data);
+
+    Task<ContainerWideTypes> EchoContainerWideTypesAsync(ContainerWideTypes data);
+
+    Task<EmbeddedArrow> EchoEmbeddedArrowAsync(EmbeddedArrow data);
+
+    /// <summary>A dictionary-encoded string echoed as itself. Distinct from
+    /// <c>echo_enum</c>: the wire type is the same, but this one is not a closed set.</summary>
+    Task<Status> EchoDictEncodedStringAsync(Status value);
+
+    /// <summary>An 8-byte fixed-width binary echo -- <c>fixed_size_binary(8)</c>, not the
+    /// variable-width <c>binary</c> a bare byte[] infers.</summary>
+    [return: FixedBinary(8)]
+    Task<byte[]> EchoFixedBinaryAsync([FixedBinary(8)] byte[] value);
+
+    // -- Streams that fail or degenerate --------------------------------------
+
+    /// <summary>Raises during init, before any batch is produced.</summary>
+    Task<RpcStream<StreamState>> ProduceErrorOnInitAsync();
+
+    /// <summary>Raises during init, before any exchange turn.</summary>
+    Task<RpcStream<StreamState>> ExchangeErrorOnInitAsync();
+
+    /// <summary>An exchange whose input and output schemas both have zero columns.</summary>
+    Task<RpcStream<StreamState>> ExchangeZeroColumnsAsync();
+
+    /// <summary>Produces <c>batchCount</c> batches of <c>rowsPerBatch</c> rows each.</summary>
+    Task<RpcStream<StreamState>> ProduceLargeBatchesAsync(long rowsPerBatch, long batchCount);
+
     // -- Stream headers -------------------------------------------------------
 
     [StreamHeader(typeof(ConformanceHeader))]

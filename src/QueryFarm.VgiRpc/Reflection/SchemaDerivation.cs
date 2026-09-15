@@ -75,7 +75,10 @@ public static class SchemaDerivation
     /// Honors a <see cref="LargeWidthAttribute"/> on the parameter.
     /// </summary>
     public static Field FieldForParameter(string wireName, ParameterInfo parameter) =>
-        FieldForMember(wireName, parameter.ParameterType, new NullabilityInfoContext().Create(parameter), nested: false, largeWidth: parameter.IsDefined(typeof(LargeWidthAttribute)));
+        FieldForMember(
+            wireName, parameter.ParameterType, new NullabilityInfoContext().Create(parameter),
+            nested: false, largeWidth: parameter.IsDefined(typeof(LargeWidthAttribute)),
+            fixedBinaryWidth: parameter.GetCustomAttribute<FixedBinaryAttribute>()?.ByteWidth ?? 0);
 
     /// <summary>
     /// The unary <c>result</c> field, resolved from the method's actual return annotation.
@@ -98,26 +101,46 @@ public static class SchemaDerivation
         }
         return FieldForMember(
             wireName, resultClrType, info, nested: false,
-            largeWidth: method.ReturnParameter.IsDefined(typeof(LargeWidthAttribute)));
+            largeWidth: method.ReturnParameter.IsDefined(typeof(LargeWidthAttribute)),
+            fixedBinaryWidth:
+                method.ReturnParameter.GetCustomAttribute<FixedBinaryAttribute>()?.ByteWidth ?? 0);
     }
 
     /// <summary>Same as <see cref="FieldForParameter"/>, for a property of a dataclass-equivalent's own fields.</summary>
     public static Field FieldForProperty(string wireName, PropertyInfo property) =>
-        FieldForMember(wireName, property.PropertyType, new NullabilityInfoContext().Create(property), nested: true, largeWidth: false);
+        FieldForMember(
+            wireName, property.PropertyType, new NullabilityInfoContext().Create(property),
+            nested: true,
+            // Read from the property, not hardcoded false: a record field is as
+            // entitled to declare large or fixed width as a method parameter is,
+            // and silently ignoring the attribute made the declaration a no-op.
+            largeWidth: property.IsDefined(typeof(LargeWidthAttribute)),
+            fixedBinaryWidth: property.GetCustomAttribute<FixedBinaryAttribute>()?.ByteWidth ?? 0);
 
-    private static Field FieldForMember(string wireName, Type clrType, NullabilityInfo info, bool nested, bool largeWidth)
+    private static Field FieldForMember(
+        string wireName, Type clrType, NullabilityInfo info, bool nested, bool largeWidth,
+        int fixedBinaryWidth = 0)
     {
         if (Nullable.GetUnderlyingType(clrType) is { } underlying)
         {
-            return new Field(wireName, ArrowTypeForNonNullable(underlying, nested, largeWidth), nullable: true);
+            return new Field(wireName, ArrowTypeForNonNullable(underlying, nested, largeWidth, fixedBinaryWidth), nullable: true);
         }
 
         var nullable = info.WriteState is NullabilityState.Nullable || !clrType.IsValueType && info.WriteState != NullabilityState.NotNull;
-        return new Field(wireName, ArrowTypeForNonNullable(clrType, nested, largeWidth), nullable);
+        return new Field(wireName, ArrowTypeForNonNullable(clrType, nested, largeWidth, fixedBinaryWidth), nullable);
     }
 
-    private static IArrowType ArrowTypeForNonNullable(Type type, bool nested, bool largeWidth = false)
+    private static IArrowType ArrowTypeForNonNullable(
+        Type type, bool nested, bool largeWidth = false, int fixedBinaryWidth = 0)
     {
+        // A declared fixed width wins over the variable-width type a byte[]
+        // would otherwise infer: they are different Arrow types, and only the
+        // declaration says which one the protocol means.
+        if (fixedBinaryWidth > 0 && type == typeof(byte[]))
+        {
+            return new FixedSizeBinaryType(fixedBinaryWidth);
+        }
+
         if (type == typeof(string))
         {
             return largeWidth ? LargeStringType.Default : StringType.Default;

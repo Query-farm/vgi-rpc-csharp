@@ -96,3 +96,17 @@ public sealed class FailOnExchangeNState(long failOn) : ExchangeState
         return Task.CompletedTask;
     }
 }
+
+/// <summary>Echoes a zero-column batch back unchanged. Mirrors <c>ZeroColumnExchangeState</c>.</summary>
+/// <remarks>
+/// Both schemas have no fields, which is a legal Arrow schema and a shape the framing has to
+/// carry correctly: the row count is the only information in the batch.
+/// </remarks>
+public sealed class ZeroColumnExchangeState : ExchangeState
+{
+    public override Task ExchangeAsync(AnnotatedBatch input, OutputCollector output, ICallContext? ctx, CancellationToken cancellationToken)
+    {
+        output.Emit(new RecordBatch(input.Batch.Schema, [], input.Batch.Length));
+        return Task.CompletedTask;
+    }
+}

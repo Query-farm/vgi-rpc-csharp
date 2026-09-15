@@ -98,7 +98,12 @@ public sealed class RpcServer
         _accessLog = accessLog;
         _expectedProtocolVersion = expectedProtocolVersion;
         _dispatchHook = dispatchHooks is { Count: > 0 } ? new CompositeDispatchHook(dispatchHooks) : null;
-        ProtocolName = serviceInterface.Name;
+        // Strip C#'s interface `I` prefix: the protocol name is the wire
+        // identity, it is in the protocol hash, and every other port names this
+        // protocol `ConformanceService`. Carrying a language naming convention
+        // onto the wire makes this port speak a differently-named protocol from
+        // the one it is meant to implement.
+        ProtocolName = StripInterfacePrefix(serviceInterface.Name);
         ProtocolHash = ComputeProtocolHash(_methods);
     }
 
@@ -838,6 +843,14 @@ public sealed class RpcServer
         if (col is not StringArray sa || sa.Length == 0 || sa.IsNull(0)) return "";
         return sa.GetString(0) ?? "";
     }
+
+    /// <summary>Strip the conventional <c>I</c> prefix from an interface name.</summary>
+    /// <remarks>
+    /// Only when it is actually the convention -- <c>I</c> followed by another capital -- so a
+    /// protocol legitimately named <c>Inventory</c> keeps its name.
+    /// </remarks>
+    private static string StripInterfacePrefix(string name) =>
+        name.Length > 1 && name[0] == 'I' && char.IsUpper(name[1]) ? name[1..] : name;
 
     private static ProtocolVersionException? CheckProtocolVersion(AnnotatedBatch request, string serverVersion)
     {

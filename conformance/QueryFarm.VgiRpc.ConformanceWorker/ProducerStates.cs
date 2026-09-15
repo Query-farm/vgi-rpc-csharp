@@ -172,3 +172,33 @@ public sealed class ErrorAfterNState(long emitBeforeError) : ProducerState
         return Task.CompletedTask;
     }
 }
+
+/// <summary>Emits <c>batchCount</c> batches of <c>rowsPerBatch</c> {index, value} rows each.
+/// Mirrors <c>LargeProducerState</c>.</summary>
+public sealed class LargeProducerState(long rowsPerBatch, long batchCount) : ProducerState
+{
+    private long _emitted;
+
+    public override Task ProduceAsync(OutputCollector output, ICallContext? ctx, CancellationToken cancellationToken)
+    {
+        if (_emitted >= batchCount)
+        {
+            output.Finish();
+            return Task.CompletedTask;
+        }
+
+        var indexBuilder = new Int64Array.Builder();
+        var valueBuilder = new Int64Array.Builder();
+        for (long i = 0; i < rowsPerBatch; i++)
+        {
+            indexBuilder.Append(i);
+            valueBuilder.Append(i * 2);
+        }
+        output.Emit(new RecordBatch(
+            ConformanceStreamSchemas.Counter,
+            [indexBuilder.Build(), valueBuilder.Build()],
+            (int)rowsPerBatch));
+        _emitted++;
+        return Task.CompletedTask;
+    }
+}

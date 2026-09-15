@@ -18,5 +18,7 @@ namespace QueryFarm.VgiRpc.Reflection;
 /// Python usage of <c>pa.large_string()</c>/<c>pa.large_binary()</c>, which is likewise
 /// top-level-only in the conformance protocol.
 /// </summary>
-[AttributeUsage(AttributeTargets.Parameter | AttributeTargets.ReturnValue)]
+// Also valid on a property: a record field is as entitled to declare large
+// width as a method parameter is, and the derivation now reads it from both.
+[AttributeUsage(AttributeTargets.Parameter | AttributeTargets.ReturnValue | AttributeTargets.Property)]
 public sealed class LargeWidthAttribute : Attribute;

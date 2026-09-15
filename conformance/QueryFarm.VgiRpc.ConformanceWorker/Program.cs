@@ -24,7 +24,12 @@ if (options is null)
 }
 
 using var accessLog = options.AccessLogPath is { } accessLogPath ? new JsonlAccessLogSink(accessLogPath, debug: options.AccessLogDebug) : null;
-var server = new RpcServer(typeof(IConformanceService), new ConformanceServiceImpl(), accessLog: accessLog);
+// Matches the reference's ConformanceService.protocol_version. Declaring it
+// makes this worker enforce the version gate like every other port, and makes
+// the version it reports through reflection agree with theirs.
+var server = new RpcServer(
+    typeof(IConformanceService), new ConformanceServiceImpl(), accessLog: accessLog,
+    expectedProtocolVersion: "2.0.0");
 
 using var cts = new CancellationTokenSource();
 RegisterShutdownHandlers(cts);
