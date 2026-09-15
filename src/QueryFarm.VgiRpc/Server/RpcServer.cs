@@ -177,13 +177,11 @@ public sealed class RpcServer
     /// <summary>The method names <paramref name="protocolName"/> answers, or <see langword="null"/>
     /// if this server does not host that protocol.</summary>
     /// <remarks>
-    /// Deliberately not <c>MethodsForProtocol(...)?.Keys</c>: reflection's two methods are
-    /// framework-owned rather than registered, so its <i>method table</i> is honestly empty (that
-    /// is what its hash is taken over) while its <i>dispatchable names</i> are the two it
-    /// answers. Routing needs the latter — this is the accessor a transport resolves a path
-    /// against, and the one that lets "protocol not hosted" (404) and "hosted, no such method"
-    /// (404, different <c>error_kind</c>) stay distinguishable, which is the documented
-    /// capability-probe signal.
+    /// The names side of <see cref="MethodsForProtocol"/>, and for every hosted protocol —
+    /// reflection included — it is that table's keys: what a protocol dispatches and what it
+    /// describes are the same set. This is the accessor a transport resolves a path against, and
+    /// the one that lets "protocol not hosted" (404) and "hosted, no such method" (404, different
+    /// <c>error_kind</c>) stay distinguishable, which is the documented capability-probe signal.
     /// </remarks>
     public IReadOnlySet<string>? MethodNamesForProtocol(string protocolName)
     {
@@ -258,15 +256,16 @@ public sealed class RpcServer
     /// <summary>The methods hosted under <paramref name="protocolName"/>, or <see langword="null"/>
     /// if this server does not host that protocol.</summary>
     /// <remarks>
-    /// Reflection answers with an empty table: its two methods are framework-owned rather than
-    /// registered, so the honest answer is that it has no entries here -- which is also what its
-    /// own hash is taken over. Identity's table is the narrowed one, so asking this is how a
-    /// caller sees that a deployment hosts <c>introspect_token</c> and not <c>issue_grant</c>.
+    /// Reflection answers with its own two methods, like any other binding: self-description is
+    /// not special-cased, so <c>describe("vgi_rpc.Reflection.v1")</c> reports them and its
+    /// protocol hash is taken over them (see <see cref="Reflection.IReflectionProtocol"/>).
+    /// Identity's table is the narrowed one, so asking this is how a caller sees that a
+    /// deployment hosts <c>introspect_token</c> and not <c>issue_grant</c>.
     /// </remarks>
     public IReadOnlyDictionary<string, RpcMethodInfo>? MethodsForProtocol(string protocolName)
     {
         if (protocolName == ProtocolName) return _methods;
-        if (protocolName == ReflectionProtocol.ProtocolName) return s_noMethods;
+        if (protocolName == ReflectionProtocol.ProtocolName) return ReflectionProtocol.Methods;
         if (protocolName == IdentityProtocol.ProtocolName && _identity is not null) return _identityMethods;
         return null;
     }
@@ -961,8 +960,8 @@ public sealed class RpcServer
 
     private static readonly Schema s_emptySchema = new([], metadata: null);
 
-    /// <summary>The empty method table reflection describes itself with -- its methods are
-    /// framework-owned rather than registered, so the honest hash is over an empty set.</summary>
+    /// <summary>The empty method table a name this server does not host hashes over -- see
+    /// <see cref="BindingHashFor"/>, whose callers may name one on an error path.</summary>
     private static readonly IReadOnlyDictionary<string, RpcMethodInfo> s_noMethods =
         new Dictionary<string, RpcMethodInfo>(StringComparer.Ordinal);
 

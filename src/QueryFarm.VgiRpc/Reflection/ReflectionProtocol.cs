@@ -45,15 +45,28 @@ public static class ReflectionProtocol
     /// <summary>The expensive question, asked once: the full surface of one protocol.</summary>
     public const string DescribeMethod = "describe";
 
+    /// <summary>The methods this protocol hosts -- what <c>describe</c> reports for it, and what
+    /// its protocol hash is taken over.</summary>
+    /// <remarks>
+    /// Derived from <see cref="IReflectionProtocol"/> by the same <see cref="ServiceRegistry"/>
+    /// reflection every application protocol goes through, so reflection cannot come to describe
+    /// itself by a different rule than it describes everyone else. Nothing dispatches through
+    /// these: <c>RpcServer</c> still serves both methods itself. See
+    /// <see cref="IReflectionProtocol"/> for why the table is not empty.
+    /// </remarks>
+    public static readonly IReadOnlyDictionary<string, RpcMethodInfo> Methods =
+        ServiceRegistry.GetMethods(typeof(IReflectionProtocol));
+
     /// <summary>The two method names this protocol answers.</summary>
     /// <remarks>
-    /// Deliberately not the same thing as <c>RpcServer.MethodsForProtocol(ProtocolName)</c>,
-    /// which is empty: these methods are framework-owned rather than registered, so the honest
-    /// hash is taken over an empty method table, while routing still has to know the two names
-    /// exist. One is what the protocol <i>is</i>; the other is what it is <i>described as</i>.
+    /// The keys of <see cref="Methods"/>, not a second list: what reflection dispatches and what
+    /// it describes are the same two methods, so there is one source of truth for both. (They
+    /// were once separate, on the theory that a framework-owned method belonged to routing but
+    /// not to the method table. That put the protocol's own description out of step with the
+    /// protocol.)
     /// </remarks>
     public static readonly IReadOnlySet<string> MethodNames =
-        new HashSet<string>([ListProtocolsMethod, DescribeMethod], StringComparer.Ordinal);
+        new HashSet<string>(Methods.Keys, StringComparer.Ordinal);
 
     /// <summary>The default <c>idempotency</c>: a caller must assume the worst.</summary>
     public const string IdempotencyUnknown = "unknown";
