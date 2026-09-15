@@ -745,13 +745,6 @@ public sealed class RpcServer
     /// can't be attached. Never throws — matches Python's <c>_maybe_attach_shm</c>: a caller that
     /// advertises a bad segment just gets treated as if it advertised none at all, since SHM is
     /// purely the caller's own optimization, never a contract this port enforces.</summary>
-    /// <summary>The application-level protocol-version guard — see the constructor's
-    /// <c>expectedProtocolVersion</c> doc comment. Returns <see langword="null"/> when the
-    /// request's declared version shares its major AND minor with <paramref name="serverVersion"/>
-    /// (patch is deliberately ignored), else a populated <see cref="ProtocolVersionException"/>
-    /// ready to write back on the wire. Mirrors the canonical Python <c>_check_protocol_version</c>
-    /// message shape exactly, including its four distinct "direction" phrasings, so cross-language
-    /// error text stays recognizable regardless of which side authored the mismatch.</summary>
     /// <summary>Serve one call to <c>vgi_rpc.Reflection.v1</c>.</summary>
     /// <remarks>
     /// Two methods, deliberately. <c>list_protocols</c> is the cheap question -- what is here,
@@ -852,6 +845,13 @@ public sealed class RpcServer
     private static string StripInterfacePrefix(string name) =>
         name.Length > 1 && name[0] == 'I' && char.IsUpper(name[1]) ? name[1..] : name;
 
+    /// <summary>The application-level protocol-version guard — see the constructor's
+    /// <c>expectedProtocolVersion</c> doc comment. Returns <see langword="null"/> when the
+    /// request's declared version shares its major AND minor with <paramref name="serverVersion"/>
+    /// (patch is deliberately ignored), else a populated <see cref="ProtocolVersionException"/>
+    /// ready to write back on the wire. Mirrors the canonical Python <c>_check_protocol_version</c>
+    /// message shape exactly, including its four distinct "direction" phrasings, so cross-language
+    /// error text stays recognizable regardless of which side authored the mismatch.</summary>
     private static ProtocolVersionException? CheckProtocolVersion(AnnotatedBatch request, string serverVersion)
     {
         var clientVersion = request.GetMetadata(MetadataKeys.ProtocolVersion);
