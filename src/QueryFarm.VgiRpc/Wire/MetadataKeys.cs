@@ -58,5 +58,15 @@ public static class MetadataKeys
         public const string ProtocolVersionMismatch = "protocol_version_mismatch";
         public const string SessionLost = "session_lost";
         public const string ServerDraining = "server_draining";
+
+        // vgi_rpc.Identity.v1. These five are the whole definitive-vs-transient signal a caller
+        // gets: as protocol methods (rather than the HTTP JSON route they replace) every handler
+        // exception surfaces the same way, so the status code no longer carries the distinction.
+        // See QueryFarm.VgiRpc.Identity.IdentityErrors.
+        public const string IntrospectionRefused = "introspection_refused";
+        public const string TokenUnresolved = "token_unresolved";
+        public const string StaleAuth = "stale_auth";
+        public const string GrantRefused = "grant_refused";
+        public const string IdentityUnavailable = "identity_unavailable";
     }
 }
