@@ -8,6 +8,23 @@ namespace QueryFarm.VgiRpc.Wire;
 public static class MetadataKeys
 {
     public const string Method = "vgi_rpc.method";
+
+    /// <summary>Names the protocol a request addresses -- the routing key.</summary>
+    /// <remarks>
+    /// <para>
+    /// Dispatch resolves the pair <c>(protocol, method)</c>: a server hosts one or more protocols
+    /// and method names may collide across them, which is what lets protocols be authored
+    /// independently. Required on every request, including against a server hosting exactly one
+    /// protocol -- an exemption would let an intermediary that rebuilds a request and drops the
+    /// field land silently on whichever protocol happened to be first, rather than being told.
+    /// </para>
+    /// <para>
+    /// The major version is part of the protocol name (<c>vgi_rpc.Reflection.v1</c>), so an
+    /// incompatible major is a routing failure rather than a parse failure, and v1 and v2 can be
+    /// served side by side while clients migrate.
+    /// </para>
+    /// </remarks>
+    public const string Protocol = "vgi_rpc.protocol";
     public const string StreamState = "vgi_rpc.stream_state#b64";
     public const string CallState = "vgi_rpc.call_state#b64";
     public const string Cancel = "vgi_rpc.cancel";
