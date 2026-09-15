@@ -11,7 +11,17 @@ public sealed class RpcConnection<TContract> : IAsyncDisposable where TContract 
 {
     private readonly RpcClient _client;
 
-    public RpcConnection(IRpcTransport transport) => _client = new RpcClient(transport);
+    /// <param name="transport">The byte-stream transport to speak over.</param>
+    /// <param name="options">Client options. Set <see cref="RpcClientOptions.Protocol"/> when
+    /// <typeparamref name="TContract"/> is a client-side <em>view</em> of the server's interface
+    /// rather than the interface itself — a view is free to be named differently, and the
+    /// protocol on the wire is the server's name, not the view's.</param>
+    public RpcConnection(IRpcTransport transport, RpcClientOptions? options = null)
+    {
+        _client = new RpcClient(transport, options);
+        // The contract names the protocol; nothing else has to, unless the two differ.
+        _client.AdoptProtocol(WireNaming.ForProtocol(typeof(TContract)));
+    }
 
     public IRpcTransport Transport => _client.Transport;
 

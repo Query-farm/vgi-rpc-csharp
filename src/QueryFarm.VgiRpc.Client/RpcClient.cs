@@ -21,6 +21,7 @@ public sealed partial class RpcClient : IRpcClient
     private ShmSegment? _sharedMemory;
     private bool _transportOptionsChecked;
     private bool _disposed;
+    private string _protocol;
 
     internal bool IsReusable => !_disposed && _operationLock.CurrentCount == 1;
 
@@ -29,6 +30,25 @@ public sealed partial class RpcClient : IRpcClient
         _transport = transport ?? throw new ArgumentNullException(nameof(transport));
         _options = options ?? new RpcClientOptions();
         _ownsTransport = ownsTransport;
+        _protocol = _options.Protocol ?? "";
+    }
+
+    /// <summary>
+    /// Names the protocol this client addresses, if it has not been named already.
+    /// </summary>
+    /// <remarks>
+    /// The typed entry points know the contract and therefore know the protocol, so they call
+    /// this rather than making every caller repeat a name the type already carries. An explicit
+    /// <see cref="RpcClientOptions.Protocol"/> always wins, and the first contract to adopt wins
+    /// over a later one: a connection addresses one protocol, and silently re-pointing it at
+    /// another mid-life is not something a caller could have meant.
+    /// </remarks>
+    internal void AdoptProtocol(string protocol)
+    {
+        if (_protocol.Length == 0 && !string.IsNullOrEmpty(protocol))
+        {
+            _protocol = protocol;
+        }
     }
 
     public IRpcTransport Transport => _transport;
@@ -201,6 +221,15 @@ public sealed partial class RpcClient : IRpcClient
             ? new Dictionary<string, string>()
             : new Dictionary<string, string>(additional);
         result[MetadataKeys.Method] = method;
+        // Required on this transport family: `vgi_rpc.protocol` is the protocol's only carrier
+        // here, and the server refuses a request that does not name the protocol it addresses.
+        result[MetadataKeys.Protocol] = _protocol.Length > 0
+            ? _protocol
+            : throw new InvalidOperationException(
+                "This client has not been told which protocol it addresses. Set "
+                + "RpcClientOptions.Protocol, or call through a typed entry point "
+                + "(CreateProxy<TContract>() / RpcConnection<TContract>), which reads the name "
+                + "from the contract type.");
         result[MetadataKeys.RequestVersion] = MetadataKeys.CurrentRequestVersion;
         result.TryAdd(MetadataKeys.RequestId, Guid.NewGuid().ToString("n"));
         if (_options.ProtocolVersion is not null)
@@ -245,8 +274,11 @@ public sealed partial class RpcClient : IRpcClient
         _options.OnLog(new LogMessage(level, batch.GetMetadata(MetadataKeys.LogMessage) ?? "", extra));
     }
 
-    public TContract CreateProxy<TContract>() where TContract : class =>
-        RpcClientProxy<TContract>.Create(this);
+    public TContract CreateProxy<TContract>() where TContract : class
+    {
+        AdoptProtocol(WireNaming.ForProtocol(typeof(TContract)));
+        return RpcClientProxy<TContract>.Create(this);
+    }
 
     public async ValueTask DisposeAsync()
     {

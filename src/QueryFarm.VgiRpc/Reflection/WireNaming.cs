@@ -10,6 +10,25 @@ namespace QueryFarm.VgiRpc.Reflection;
 /// </summary>
 public static class WireNaming
 {
+    /// <summary>The protocol wire name a service interface is hosted under.</summary>
+    /// <param name="serviceInterface">The contract type.</param>
+    /// <remarks>
+    /// Strips C#'s conventional <c>I</c> prefix — and only when it really is the convention,
+    /// <c>I</c> followed by another capital, so a protocol legitimately named <c>Inventory</c>
+    /// keeps its name. The protocol name is a wire identity that every other port spells without
+    /// a language's naming convention on it, and it is in the protocol hash.
+    ///
+    /// <para>Shared by the server (which hosts under this name) and the clients (which address
+    /// it under this name), so the two agree by construction rather than by two copies of the
+    /// same three-line rule staying in step.</para>
+    /// </remarks>
+    public static string ForProtocol(Type serviceInterface)
+    {
+        ArgumentNullException.ThrowIfNull(serviceInterface);
+        var name = serviceInterface.Name;
+        return name.Length > 1 && name[0] == 'I' && char.IsUpper(name[1]) ? name[1..] : name;
+    }
+
     /// <summary>The longest protocol name any server may host, in UTF-8 bytes
     /// (WIRE_PROTOCOL.md §3.1). The grammar is ASCII-only, so bytes and chars coincide.</summary>
     public const int MaxProtocolNameLength = 255;

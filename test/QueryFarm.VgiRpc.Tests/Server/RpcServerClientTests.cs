@@ -1,8 +1,10 @@
 using QueryFarm.VgiRpc.Client;
 using QueryFarm.VgiRpc.Errors;
 using QueryFarm.VgiRpc.Logging;
+using QueryFarm.VgiRpc.Reflection;
 using QueryFarm.VgiRpc.Server;
 using QueryFarm.VgiRpc.Transport;
+using QueryFarm.VgiRpc.Wire;
 using Xunit;
 
 namespace QueryFarm.VgiRpc.Tests.Server;
@@ -174,13 +176,79 @@ public sealed class RpcServerClientTests
         var server = new RpcServer(typeof(IGreeter), new Greeter());
         var serveTask = server.ServeOneAsync(serverTransport);
 
-        // Deliberately connect a client typed for a *different* interface that shares no
-        // methods, to force an unknown-method error path end-to-end.
-        var connection = new RpcConnection<IOther>(clientTransport);
+        // A client typed for a *different* interface that shares no methods, forcing the
+        // unknown-method path end to end. It has to address the hosted protocol explicitly to
+        // get there: a request naming IOther's own protocol is refused one step earlier, as
+        // not-hosted, which is the whole point of the pair of tests below.
+        var connection = new RpcConnection<IOther>(
+            clientTransport,
+            new RpcClientOptions { Protocol = WireNaming.ForProtocol(typeof(IGreeter)) });
         var otherClient = connection.CreateProxy();
 
         var exception = await Assert.ThrowsAsync<MethodNotImplementedException>(() => otherClient.DoSomethingAsync());
         Assert.Equal(MethodNotImplementedException.ErrorKindConst, exception.ErrorKind);
+        await serveTask;
+    }
+
+    /// <summary>"I do not speak that protocol" is a different answer from "I speak it but not
+    /// that method", and a client probing for an optional protocol depends on the difference.</summary>
+    [Fact]
+    public async Task UnhostedProtocol_ReturnsProtocolNotSupported()
+    {
+        var (clientTransport, serverTransport) = PipeTransport.CreatePair();
+        var server = new RpcServer(typeof(IGreeter), new Greeter());
+        var serveTask = server.ServeOneAsync(serverTransport);
+
+        // No explicit Protocol, so the connection addresses IOther's own name -- which this
+        // server does not host.
+        var otherClient = new RpcConnection<IOther>(clientTransport).CreateProxy();
+
+        var exception = await Assert.ThrowsAsync<RpcException>(() => otherClient.DoSomethingAsync());
+        Assert.Equal("protocol_not_supported", exception.ErrorKind);
+        Assert.Contains("Other", exception.ErrorMessage, StringComparison.Ordinal);
+        await serveTask;
+    }
+
+    /// <summary>
+    /// On a byte-stream transport the routing key is the protocol's only carrier, so a request
+    /// without one is refused rather than landed on whichever protocol happens to be first.
+    /// </summary>
+    /// <remarks>
+    /// The deliberate asymmetry with HTTP, where the path segment has already resolved the
+    /// binding and an absent key is accepted. Written at the wire level because no client this
+    /// port ships can produce such a request any more — which is the point: the loud rejection is
+    /// for the intermediary that rebuilds a request and drops the field.
+    /// </remarks>
+    [Fact]
+    public async Task AbsentRoutingKey_IsRefused()
+    {
+        var (clientTransport, serverTransport) = PipeTransport.CreatePair();
+        var server = new RpcServer(typeof(IGreeter), new Greeter());
+        var serveTask = server.ServeOneAsync(serverTransport);
+
+        var info = ServiceRegistry.GetMethods(typeof(IGreeter))["echo_string"];
+        using var parameters = ValueCodec.BuildRow(info.ParamsSchema, ["hi"]);
+        await using (var writer = new WireWriter(clientTransport.Output, info.ParamsSchema))
+        {
+            await writer.WriteBatchAsync(new AnnotatedBatch(
+                parameters,
+                new Dictionary<string, string>
+                {
+                    [MetadataKeys.Method] = info.WireName,
+                    [MetadataKeys.RequestVersion] = MetadataKeys.CurrentRequestVersion,
+                }));
+        }
+
+        using var reader = new WireReader(clientTransport.Input);
+        await reader.ReadSchemaAsync();
+        var response = await reader.ReadNextAsync();
+        Assert.NotNull(response);
+        using (response!.Batch)
+        {
+            Assert.Equal("EXCEPTION", response.GetMetadata(MetadataKeys.LogLevel));
+            Assert.Equal("protocol_not_specified", response.GetMetadata(MetadataKeys.ErrorKind));
+        }
+
         await serveTask;
     }
 

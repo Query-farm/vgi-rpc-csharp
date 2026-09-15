@@ -178,13 +178,39 @@ public class IntrospectionIsLockedDownTests
         Assert.Equal(MetadataKeys.ErrorKinds.IntrospectionRefused, exc.ErrorKind);
     }
 
-    /// <summary>Same ordering claim, for the over-long case, which allocates before it rejects.</summary>
+    /// <summary>
+    /// An unauthorized caller presenting an <em>over-long</em> credential still learns only that
+    /// it is not an introspector.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Renamed from <c>AuthorizationPrecedesTheLengthCheck</c>, which is not what it pins. It
+    /// asserts the allowlist refusal, and the allowlist fires first whether the length cap exists
+    /// or not — so deleting the cap leaves this green. Measured: it survives that mutation.
+    /// </para>
+    /// <para>
+    /// A test whose name claims one property while asserting another is worse than a missing
+    /// test, because it reads as coverage in review — which is exactly how the cap came to have
+    /// no dispatch-level coverage at all. The cap itself is pinned by
+    /// <c>GuardsAreNotVacuousTests.TheLengthCapFiresRatherThanTheResolver</c>; what is real here
+    /// is the ordering, so the name now says ordering and the assertion is strengthened to check
+    /// the answer carries nothing else.
+    /// </para>
+    /// </remarks>
     [Fact]
-    public void AuthorizationPrecedesTheLengthCheck() =>
-        Assert.Throws<IntrospectionRefusedException>(
+    public void AnUnauthorizedCallerLearnsNothingFromAnOverLongCredential()
+    {
+        var exc = Assert.Throws<IntrospectionRefusedException>(
             () => Impl().IntrospectToken(
                 new string('x', IdentityGuards.MaxTokenBytes + 1),
                 IdentityTestDoubles.Ctx(IdentityTestDoubles.Auth("mallory"))));
+
+        // The same answer an unauthorized caller gets for a well-formed credential: nothing about
+        // the subject leaks, not even that it was too long to look at.
+        Assert.Equal(MetadataKeys.ErrorKinds.IntrospectionRefused, exc.ErrorKind);
+        Assert.Equal("caller is not an introspector", exc.ErrorMessage);
+        Assert.DoesNotContain("length", exc.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+    }
 
     /// <summary>The rate limit also precedes the shape checks, for the same reason.</summary>
     [Fact]

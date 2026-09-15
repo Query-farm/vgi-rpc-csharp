@@ -40,9 +40,13 @@ static async Task RunTcpClientAsync(CliArguments arguments)
 {
     var host = arguments.Required("host");
     var port = arguments.RequiredInt("port");
+    // The server maps IConformanceService, so that is the protocol on the wire —
+    // ITailnetEvidenceService is only this client's typed view of a subset of it, and a view is
+    // free to be named differently from the interface it views.
+    var options = new RpcClientOptions { Protocol = "ConformanceService" };
     await using var client = arguments.Optional("proxy") is { } proxy
-        ? await RpcClient.ConnectTcpAsync(host, port, proxy, arguments.Timeout)
-        : await RpcClient.ConnectTcpAsync(host, port);
+        ? await RpcClient.ConnectTcpAsync(host, port, proxy, arguments.Timeout, options)
+        : await RpcClient.ConnectTcpAsync(host, port, options);
     await ValidateTwiceAsync(client.CreateProxy<ITailnetEvidenceService>(), arguments);
 }
 

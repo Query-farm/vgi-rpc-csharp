@@ -113,7 +113,9 @@ public sealed class RpcServer
         // protocol `ConformanceService`. Carrying a language naming convention
         // onto the wire makes this port speak a differently-named protocol from
         // the one it is meant to implement.
-        ProtocolName = StripInterfacePrefix(serviceInterface.Name);
+        // The same derivation the clients use to address this server -- shared rather than
+        // duplicated, so the two cannot drift into hosting and addressing different names.
+        ProtocolName = WireNaming.ForProtocol(serviceInterface);
         ProtocolHash = ComputeProtocolHash(_methods);
 
         // Identity is registered AFTER reflection (which this port hosts unconditionally, and
@@ -376,6 +378,28 @@ public sealed class RpcServer
             _ = await ServeIdentityAsync(
                 transport.Output, methodName, request, new BufferedCallContext(),
                 emitAccessLog: true, cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+
+        // Routing, before the version gate and before dispatch. On a byte-stream transport
+        // `vgi_rpc.protocol` is the ONLY carrier there is -- no path segment, no header -- so an
+        // absent key is genuinely unroutable and dispatching anyway means landing on whichever
+        // protocol happens to be registered first. That is the exact confused-deputy shape the
+        // rule exists to prevent, and an intermediary that rebuilds a request and drops the field
+        // has to be told rather than silently accommodated.
+        //
+        // (HTTP is the deliberate asymmetry: there the path segment has already resolved the
+        // binding, so its dispatcher accepts an absent key and refuses only a disagreement. See
+        // RpcHttpEndpoints.CheckProtocolAgreementAsync, which names what that gives up.)
+        //
+        // Reserved framework built-ins are server-level, owned by no protocol, and resolved
+        // without routing -- `__transport_options__` below, and `__describe__` when it lands.
+        // Requiring one of them to name a protocol would break the diagnostic path a mismatched
+        // client uses to find out *what* mismatched.
+        if (!IsReservedMethodName(methodName)
+            && RoutingFailure(request) is { } routingFailure)
+        {
+            await WriteErrorStreamAsync(transport.Output, s_emptySchema, routingFailure, cancellationToken).ConfigureAwait(false);
             return true;
         }
 
@@ -1049,6 +1073,43 @@ public sealed class RpcServer
         return new FrameworkDispatch(info.ResultSchema, status, errorType, errorMessage);
     }
 
+    /// <summary>Whether <paramref name="methodName"/> is a framework built-in rather than a
+    /// protocol method -- a <c>__dunder__</c> name, owned by the server and routed without a
+    /// protocol.</summary>
+    private static bool IsReservedMethodName(string methodName) =>
+        methodName.Length > 4 && methodName.StartsWith("__", StringComparison.Ordinal)
+        && methodName.EndsWith("__", StringComparison.Ordinal);
+
+    /// <summary>
+    /// The refusal this request's <c>vgi_rpc.protocol</c> routing key earns, or
+    /// <see langword="null"/> when it addresses the protocol this server hosts.
+    /// </summary>
+    /// <remarks>
+    /// Reached only after the framework protocols have had their turn, so anything that still
+    /// names one of them is naming a protocol this deployment did not configure -- which is
+    /// "not hosted", not "no such method". The three answers stay distinct because a client
+    /// probing for an optional protocol depends on the difference.
+    /// </remarks>
+    private RpcException? RoutingFailure(AnnotatedBatch request)
+    {
+        var declared = request.GetMetadata(MetadataKeys.Protocol);
+        if (string.IsNullOrEmpty(declared))
+        {
+            return new ProtocolNotSpecifiedException(
+                $"Request carries no '{MetadataKeys.Protocol}' routing key. Every request must name the "
+                + $"protocol it addresses, including against a server hosting exactly one. This server "
+                + $"hosts: [{string.Join(", ", HostedProtocols)}].");
+        }
+
+        if (!string.Equals(declared, ProtocolName, StringComparison.Ordinal))
+        {
+            return new ProtocolNotSupportedException(
+                $"This server does not host protocol '{declared}'. Hosted: [{string.Join(", ", HostedProtocols)}].");
+        }
+
+        return null;
+    }
+
     /// <summary>The version a hosted protocol declares, or "" when it declares none.</summary>
     /// <remarks>
     /// Only the application protocol can carry one here: the framework protocols are versioned by
@@ -1074,14 +1135,6 @@ public sealed class RpcServer
         if (col is not StringArray sa || sa.Length == 0 || sa.IsNull(0)) return "";
         return sa.GetString(0) ?? "";
     }
-
-    /// <summary>Strip the conventional <c>I</c> prefix from an interface name.</summary>
-    /// <remarks>
-    /// Only when it is actually the convention -- <c>I</c> followed by another capital -- so a
-    /// protocol legitimately named <c>Inventory</c> keeps its name.
-    /// </remarks>
-    private static string StripInterfacePrefix(string name) =>
-        name.Length > 1 && name[0] == 'I' && char.IsUpper(name[1]) ? name[1..] : name;
 
     /// <summary>The application-level protocol-version guard — see the constructor's
     /// <c>expectedProtocolVersion</c> doc comment. Returns <see langword="null"/> when the

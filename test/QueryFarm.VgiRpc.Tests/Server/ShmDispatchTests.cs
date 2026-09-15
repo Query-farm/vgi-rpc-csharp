@@ -33,6 +33,9 @@ public sealed class ShmDispatchTests
         var metadata = new Dictionary<string, string>
         {
             [MetadataKeys.Method] = methodName,
+            // The protocol's only carrier on this transport; the server refuses a request that
+            // does not name the protocol it addresses.
+            [MetadataKeys.Protocol] = WireNaming.ForProtocol(typeof(IGreeter)),
             [MetadataKeys.RequestVersion] = MetadataKeys.CurrentRequestVersion,
         };
         if (extraMetadata is not null)

@@ -290,13 +290,20 @@ async Task ClearStreamAsync()
 static async Task<(RpcClient? Native, HttpRpcClient? Http)> ConnectAsync(JsonObject request, List<LogMessage> logs)
 {
     var transport = request["transport"]?.GetValue<string>() ?? "";
-    var options = new RpcClientOptions { OnLog = logs.Add };
+    // This driver is schema-first -- it builds every batch from the harness's JSON, so there is
+    // no contract type to read the protocol from. The harness may name one (to drive a co-hosted
+    // framework protocol); absent that, a conformance worker hosts exactly one application
+    // protocol and this is its name.
+    var protocol = request["protocol"]?.GetValue<string>() is { Length: > 0 } named
+        ? named
+        : "ConformanceService";
+    var options = new RpcClientOptions { OnLog = logs.Add, Protocol = protocol };
     switch (transport)
     {
         case "stdio":
             return (RpcClient.StartSubprocess(Arguments(request), options), null);
         case "shm":
-            options = new RpcClientOptions { OnLog = logs.Add, SharedMemorySize = request["shm_size"]?.GetValue<long>() ?? 4 * 1024 * 1024 };
+            options = new RpcClientOptions { OnLog = logs.Add, Protocol = protocol, SharedMemorySize = request["shm_size"]?.GetValue<long>() ?? 4 * 1024 * 1024 };
             return (RpcClient.StartSubprocess(Arguments(request), options), null);
         case "unix":
             return (await RpcClient.ConnectUnixAsync(request["target"]!.GetValue<string>(), options), null);
@@ -309,15 +316,9 @@ static async Task<(RpcClient? Native, HttpRpcClient? Http)> ConnectAsync(JsonObj
         case "http":
             var headers = request["headers"]?.Deserialize<Dictionary<string, string>>();
             var compressionLevel = request.ContainsKey("compression_level") ? request["compression_level"]?.GetValue<int?>() : 3;
-            // RPC paths are namespaced by protocol. The harness may name one (to drive a
-            // co-hosted framework protocol); absent that, this driver addresses the conformance
-            // service, which is the only application protocol a conformance worker hosts.
-            var httpProtocol = request["protocol"]?.GetValue<string>() is { Length: > 0 } named
-                ? named
-                : "ConformanceService";
             return (null, new HttpRpcClient(new Uri(request["target"]!.GetValue<string>()), new HttpRpcClientOptions
             {
-                Protocol = httpProtocol,
+                Protocol = protocol,
                 CompressionLevel = compressionLevel,
                 DefaultHeaders = headers,
                 OnLog = logs.Add,

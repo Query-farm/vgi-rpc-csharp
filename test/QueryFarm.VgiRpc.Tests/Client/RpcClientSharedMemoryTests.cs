@@ -22,7 +22,12 @@ public sealed class RpcClientSharedMemoryTests
         }, TestContext.Current.CancellationToken);
         await using var client = new RpcClient(
             clientTransport,
-            new RpcClientOptions { SharedMemorySize = 4 * 1024 * 1024 });
+            new RpcClientOptions
+            {
+                // Schema-first: there is no contract type to read the protocol from.
+                Protocol = WireNaming.ForProtocol(typeof(IGreeter)),
+                SharedMemorySize = 4 * 1024 * 1024,
+            });
         var method = new RpcMethodInfo(typeof(IGreeter).GetMethod(nameof(IGreeter.EchoLargeBytesAsync))!);
         using var value = new LargeBytesBuffer(Enumerable.Range(0, 512 * 1024).Select(index => (byte)index).ToArray());
         using var request = ValueCodec.BuildRow(method.ParamsSchema, [value]);

@@ -1,6 +1,7 @@
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using QueryFarm.VgiRpc.Client;
+using QueryFarm.VgiRpc.Reflection;
 using QueryFarm.VgiRpc.Server;
 using QueryFarm.VgiRpc.Streaming;
 using QueryFarm.VgiRpc.Transport;
@@ -12,6 +13,16 @@ namespace QueryFarm.VgiRpc.Tests.Client;
 public sealed class RpcClientStreamingTests
 {
     private static readonly Schema s_valuesSchema = new([new Field("value", Int64Type.Default, false)], null);
+
+    /// <summary>
+    /// Names the protocol explicitly, because <see cref="IStreamingClient"/> is a client-side
+    /// <em>view</em> of <see cref="IStreamingService"/> (session return types, cancellation
+    /// tokens) rather than the interface itself — so the name derived from the view is not the
+    /// name the server hosts. Schema-first calls need it for the same reason: there is no
+    /// contract in play at all.
+    /// </summary>
+    private static RpcClientOptions StreamingClientOptions =>
+        new() { Protocol = WireNaming.ForProtocol(typeof(IStreamingService)) };
 
     public interface IStreamingService
     {
@@ -96,7 +107,7 @@ public sealed class RpcClientStreamingTests
     {
         var (clientTransport, serverTransport) = PipeTransport.CreatePair();
         var server = new RpcServer(typeof(IStreamingService), new StreamingService());
-        await using var client = new RpcClient(clientTransport);
+        await using var client = new RpcClient(clientTransport, StreamingClientOptions);
         using var parameters = ValueRow("count", 2);
         var serveTask = server.ServeOneAsync(serverTransport);
 
@@ -117,7 +128,7 @@ public sealed class RpcClientStreamingTests
     {
         var (clientTransport, serverTransport) = PipeTransport.CreatePair();
         var server = new RpcServer(typeof(IStreamingService), new StreamingService());
-        await using var client = new RpcClient(clientTransport);
+        await using var client = new RpcClient(clientTransport, StreamingClientOptions);
         using var parameters = new RecordBatch(new Schema([], null), [], 1);
         var serveTask = server.ServeOneAsync(serverTransport);
 
@@ -137,7 +148,7 @@ public sealed class RpcClientStreamingTests
         var (clientTransport, serverTransport) = PipeTransport.CreatePair();
         var implementation = new StreamingService();
         var server = new RpcServer(typeof(IStreamingService), implementation);
-        await using var client = new RpcClient(clientTransport);
+        await using var client = new RpcClient(clientTransport, StreamingClientOptions);
         using var parameters = new RecordBatch(new Schema([], null), [], 1);
         var serveTask = server.ServeOneAsync(serverTransport);
 
@@ -156,7 +167,7 @@ public sealed class RpcClientStreamingTests
         var (clientTransport, serverTransport) = PipeTransport.CreatePair();
         var implementation = new StreamingService();
         var server = new RpcServer(typeof(IStreamingService), implementation);
-        await using var client = new RpcClient(clientTransport);
+        await using var client = new RpcClient(clientTransport, StreamingClientOptions);
         using var parameters = new RecordBatch(new Schema([], null), [], 1);
         var serveTask = server.ServeOneAsync(serverTransport);
 
@@ -174,7 +185,7 @@ public sealed class RpcClientStreamingTests
     {
         var (clientTransport, serverTransport) = PipeTransport.CreatePair();
         var server = new RpcServer(typeof(IStreamingService), new StreamingService());
-        await using var client = new RpcClient(clientTransport);
+        await using var client = new RpcClient(clientTransport, StreamingClientOptions);
         var proxy = client.CreateProxy<IStreamingClient>();
 
         var producerServeTask = server.ServeOneAsync(serverTransport);

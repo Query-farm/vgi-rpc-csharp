@@ -26,10 +26,17 @@ public sealed partial class HttpRpcClient : IRpcClient
     private readonly bool _ownsHttpClient;
     private readonly HttpRpcClientOptions _options;
     private readonly string _prefix;
-    // The protocol is folded into the prefix once, at construction, so every call site stays
-    // "{_rpcPrefix}/{method}" — the route shape lives in one place rather than at each of them.
-    private readonly string _rpcPrefix;
-    private readonly string _protocol;
+    private string _protocol;
+
+    /// <summary>
+    /// <c>{prefix}/{protocol}</c> — the route shape lives here rather than at each call site.
+    /// </summary>
+    /// <remarks>
+    /// Reading it is what requires the protocol to be known, which is why the server-level
+    /// endpoints (capability discovery, <c>__upload_url__</c>, the sticky-session route) can be
+    /// used on a client that never names one: they do not go through here.
+    /// </remarks>
+    private string RpcPrefix => $"{_prefix}/{Uri.EscapeDataString(RequireProtocol(_protocol))}";
     private readonly Stack<SessionSnapshot> _sessionScopes = new();
     private string? _sessionToken;
     private bool _acceptNewSession;
@@ -48,8 +55,7 @@ public sealed partial class HttpRpcClient : IRpcClient
         _http = new System.Net.Http.HttpClient(handler) { BaseAddress = baseAddress };
         _ownsHttpClient = true;
         _prefix = NormalizePrefix(_options.Prefix);
-        _protocol = RequireProtocol(_options.Protocol);
-        _rpcPrefix = $"{_prefix}/{Uri.EscapeDataString(_protocol)}";
+        _protocol = _options.Protocol ?? "";
         _acceptNewSession = _options.AcceptNewSession;
         ValidateAcceptedMaxResponseBytes(_options.AcceptedMaxResponseBytes);
         ValidateNoBudgetHeaderOverride(_options.DefaultHeaders);
@@ -81,8 +87,7 @@ public sealed partial class HttpRpcClient : IRpcClient
         _options = options ?? new HttpRpcClientOptions();
         _ownsHttpClient = ownsHttpClient;
         _prefix = NormalizePrefix(_options.Prefix);
-        _protocol = RequireProtocol(_options.Protocol);
-        _rpcPrefix = $"{_prefix}/{Uri.EscapeDataString(_protocol)}";
+        _protocol = _options.Protocol ?? "";
         _acceptNewSession = _options.AcceptNewSession;
         ValidateAcceptedMaxResponseBytes(_options.AcceptedMaxResponseBytes);
         ValidateNoBudgetHeaderOverride(_options.DefaultHeaders);
@@ -122,8 +127,11 @@ public sealed partial class HttpRpcClient : IRpcClient
     }
 
     /// <summary>Creates a reflection-based typed facade over this HTTP client.</summary>
-    public TContract CreateProxy<TContract>() where TContract : class =>
-        RpcClientProxy<TContract>.Create(this);
+    public TContract CreateProxy<TContract>() where TContract : class
+    {
+        AdoptProtocol(WireNaming.ForProtocol(typeof(TContract)));
+        return RpcClientProxy<TContract>.Create(this);
+    }
 
     /// <summary>Starts a disposable sticky-session scope, optionally from an existing token.</summary>
     public HttpSessionScope WithSession(string? token = null) => new(this, token);
@@ -221,7 +229,7 @@ public sealed partial class HttpRpcClient : IRpcClient
         CancellationToken cancellationToken = default)
     {
         var responseBody = await PostBatchAsync(
-            $"{_rpcPrefix}/{Uri.EscapeDataString(method)}",
+            $"{RpcPrefix}/{Uri.EscapeDataString(method)}",
             parameters,
             RequestMetadata(method, metadata),
             cancellationToken).ConfigureAwait(false);
@@ -236,7 +244,7 @@ public sealed partial class HttpRpcClient : IRpcClient
         CancellationToken cancellationToken = default)
     {
         var body = await PostBatchAsync(
-            $"{_rpcPrefix}/{Uri.EscapeDataString(method)}/init",
+            $"{RpcPrefix}/{Uri.EscapeDataString(method)}/init",
             parameters,
             RequestMetadata(method, metadata),
             cancellationToken).ConfigureAwait(false);
@@ -252,7 +260,7 @@ public sealed partial class HttpRpcClient : IRpcClient
         CancellationToken cancellationToken = default)
     {
         var body = await PostBatchAsync(
-            $"{_rpcPrefix}/{Uri.EscapeDataString(method)}/init",
+            $"{RpcPrefix}/{Uri.EscapeDataString(method)}/init",
             parameters,
             RequestMetadata(method, metadata),
             cancellationToken).ConfigureAwait(false);
@@ -372,7 +380,7 @@ public sealed partial class HttpRpcClient : IRpcClient
         RecordBatch batch,
         IReadOnlyDictionary<string, string> metadata,
         CancellationToken cancellationToken) =>
-        await PostBatchAsync($"{_rpcPrefix}/{Uri.EscapeDataString(method)}/exchange", batch, metadata, cancellationToken).ConfigureAwait(false);
+        await PostBatchAsync($"{RpcPrefix}/{Uri.EscapeDataString(method)}/exchange", batch, metadata, cancellationToken).ConfigureAwait(false);
 
     private async Task<byte[]> PostBatchAsync(
         string path,
@@ -701,7 +709,7 @@ public sealed partial class HttpRpcClient : IRpcClient
             // Sent alongside the path segment, and canonical relative to it: the path is a
             // projection an edge can read without an Arrow parser, and the server refuses a
             // request whose two carriers disagree.
-            result[MetadataKeys.Protocol] = _protocol;
+            result[MetadataKeys.Protocol] = RequireProtocol(_protocol);
         }
 
         result[MetadataKeys.RequestVersion] = MetadataKeys.CurrentRequestVersion;
@@ -711,10 +719,22 @@ public sealed partial class HttpRpcClient : IRpcClient
 
     private static string RequireProtocol(string protocol) =>
         string.IsNullOrWhiteSpace(protocol)
-            ? throw new ArgumentException(
-                "HttpRpcClientOptions.Protocol is required: RPC paths are {Prefix}/{Protocol}/{method} "
-                + "and every request names the protocol it addresses.", nameof(protocol))
+            ? throw new InvalidOperationException(
+                "This client has not been told which protocol it addresses. Set "
+                + "HttpRpcClientOptions.Protocol, or call through a typed entry point "
+                + "(CreateProxy<TContract>()), which reads the name from the contract type.")
             : protocol;
+
+    /// <summary>Names the protocol this client addresses, if it has not been named already.
+    /// Mirrors the native <c>RpcClient.AdoptProtocol</c> — see there for why the typed entry
+    /// points do not make a caller repeat a name the contract type already carries.</summary>
+    private void AdoptProtocol(string protocol)
+    {
+        if (_protocol.Length == 0 && !string.IsNullOrEmpty(protocol))
+        {
+            _protocol = protocol;
+        }
+    }
 
     private void AddCommonHeaders(HttpRequestMessage request)
     {
