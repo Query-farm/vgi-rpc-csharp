@@ -27,9 +27,22 @@ using var accessLog = options.AccessLogPath is { } accessLogPath ? new JsonlAcce
 // Matches the reference's ConformanceService.protocol_version. Declaring it
 // makes this worker enforce the version gate like every other port, and makes
 // the version it reports through reflection agree with theirs.
+//
+// --identity wires vgi_rpc.Identity.v1 with the fixed policy IDENTITY_CONFORMANCE_FIXTURE.md
+// pins (see ConformanceIdentity). Deliberately NOT unconditional: the shared group asserts
+// against the *plain* worker that a deployment configuring no hook hosts no identity protocol
+// at all, which is the property that keeps a dependency upgrade from growing a
+// credential-to-identity oracle on every existing worker. Hosting it here by default would make
+// that assertion unfalsifiable and this flag meaningless.
 var server = new RpcServer(
     typeof(IConformanceService), new ConformanceServiceImpl(), accessLog: accessLog,
-    expectedProtocolVersion: "2.0.0");
+    expectedProtocolVersion: "2.0.0",
+    identity: options.Identity switch
+    {
+        "both" => ConformanceIdentity.Build(mint: true),
+        "introspect-only" => ConformanceIdentity.Build(mint: false),
+        _ => null,
+    });
 
 using var cts = new CancellationTokenSource();
 RegisterShutdownHandlers(cts);
@@ -120,6 +133,16 @@ if (options.Http)
         // MtlsAuth.FromSubject() reads X-SSL-Client-Cert (URL-encoded PEM) and accepts any
         // certificate, using its Subject CN as principal — see docs/roadmap.md M9 mTLS.
         authenticate = MtlsAuth.FromSubject();
+    }
+    else if (options.Identity != "off")
+    {
+        // Two request headers, no identity provider -- see ConformanceIdentity.Authenticate.
+        // TRIVIALLY SPOOFABLE BY ANYONE WHO CAN REACH THE PORT; a test fixture, never a
+        // deployment. It is its own branch rather than an extension of --sticky-auth's below
+        // because only this one publishes *claims*, and auth_time is a claim: issue_grant's
+        // freshness guard reads nothing else, so a principal-only delegate would reduce the
+        // whole freshness section to a worker that refuses every mint.
+        authenticate = ConformanceIdentity.Authenticate;
     }
     else if (options.StickyAuth || options.Introspect)
     {
@@ -345,6 +368,7 @@ internal sealed class CliOptions
     public int ProofSkewSeconds { get; private init; } = 30;
     public bool ProofNoReplayCache { get; private init; }
     public bool Introspect { get; private init; }
+    public string Identity { get; private init; } = "off";
     public string? FakeStorageUrl { get; private init; }
     public long ExternalizeThresholdBytes { get; private init; } = 4096;
     public long? MaxRequestBytes { get; private init; }
@@ -378,6 +402,7 @@ internal sealed class CliOptions
         var proofSkewSeconds = 30;
         var proofNoReplayCache = false;
         var introspect = false;
+        var identity = "off";
         string? fakeStorageUrl = null;
         var externalizeThresholdBytes = 4096L;
         long? maxRequestBytes = null;
@@ -490,6 +515,20 @@ internal sealed class CliOptions
                     // X-Conformance-Principal convention --sticky-auth already uses.
                     introspect = true;
                     break;
+                case "--identity":
+                    // off|both|introspect-only -- the two fixture workers
+                    // IDENTITY_CONFORMANCE_FIXTURE.md §1 requires are the same binary with a
+                    // different value here: "both" configures the resolve and mint hooks,
+                    // "introspect-only" configures the resolver alone so issue_grant is not
+                    // hosted and the protocol_hash narrows with it.
+                    identity = RequireValue(args, ref i, "--identity");
+                    if (identity is not ("off" or "both" or "introspect-only"))
+                    {
+                        Console.Error.WriteLine($"--identity must be off|both|introspect-only, got '{identity}'");
+                        return null;
+                    }
+
+                    break;
                 case "--fake-storage":
                     // Base URL of a vgi_rpc.conformance.fake_storage-compatible HTTP service —
                     // enables external-location uploads (see docs/roadmap.md M13). An empty-string
@@ -567,6 +606,7 @@ internal sealed class CliOptions
             ProofSkewSeconds = proofSkewSeconds,
             ProofNoReplayCache = proofNoReplayCache,
             Introspect = introspect,
+            Identity = identity,
             FakeStorageUrl = fakeStorageUrl,
             ExternalizeThresholdBytes = externalizeThresholdBytes,
             MaxRequestBytes = maxRequestBytes,

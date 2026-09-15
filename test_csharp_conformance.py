@@ -283,6 +283,44 @@ def conformance_http_introspect_port(worker_binary: Path) -> Iterator[int]:
     yield from _spawn_http_worker_port(worker_binary, "--introspect")
 
 
+# The two fixtures the canonical vgi_rpc.Identity.v1 group is gated on. Same binary, different
+# --identity value; both HTTP, because Identity's guards all read an authenticated caller and HTTP
+# is the transport that carries one. See IDENTITY_CONFORMANCE_FIXTURE.md for the pinned policy --
+# every value is one six ports must configure identically, or no cross-port assertion exists.
+#
+# Deliberately NOT folded into conformance_http_port: the group asserts against *that* worker that
+# a deployment configuring no hook hosts no identity protocol at all. Adding identity there would
+# make TestIdentityAbsentByDefault unfalsifiable.
+# Session-scoped, unlike every other worker fixture here, and the policy is what licenses it.
+# The group is 77 cases and all but four of them resolve conformance_http_identity_port, so a
+# per-test worker means 77 .NET process spawns: on a loaded machine that stops being a cost and
+# becomes a correctness problem, because the 10s PORT:<port> discovery deadline starts expiring
+# and the failures land on whichever assertions happened to be running. Those read as identity
+# defects and are not.
+#
+# One worker is safe here because IDENTITY_CONFORMANCE_FIXTURE.md §3 requires both hooks to be
+# pure functions of their arguments -- no clock, no counter, no shared state -- so this worker
+# answers identically on the first call and the thousandth. The one piece of per-worker state
+# that could have leaked across cases is the introspection rate limiter, and the fixture pins it
+# at 100000 for exactly this reason (§3.1). Nothing in the group drains, restarts or otherwise
+# mutates the worker.
+@pytest.fixture(scope="session")
+def conformance_http_identity_port(worker_binary: Path) -> Iterator[int]:
+    """An HTTP worker with both identity hooks configured -- resolve and mint."""
+    yield from _spawn_http_worker_port(worker_binary, "--identity", "both")
+
+
+@pytest.fixture(scope="session")
+def conformance_http_identity_introspect_only_port(worker_binary: Path) -> Iterator[int]:
+    """The same binary with the mint hook left out.
+
+    The only way to observe method-level narrowing: that an unconfigured hook makes its method
+    *absent* rather than hosted-and-refusing, and that the protocol_hash shrinks with it. A
+    worker hosting both methods cannot show either.
+    """
+    yield from _spawn_http_worker_port(worker_binary, "--identity", "introspect-only")
+
+
 @pytest.fixture
 def conformance_http_small_request_cap_port(worker_binary: Path) -> Iterator[int]:
     """Worker used by the canonical encoded/decoded request-cap regression matrix."""
@@ -1187,4 +1225,31 @@ from vgi_rpc.conformance._external_pytest import (  # noqa: E402,F401
     TestExternalFetchSecurity,
     TestExternalInputRoutes,
     TestExternalStorageUrlPair,
+)
+
+
+# The canonical vgi_rpc.Identity.v1 group (vgi_rpc.conformance._identity_pytest, re-exported
+# through _pytest_suite), collected against conformance_http_identity_port /
+# conformance_http_identity_introspect_only_port above -- plus TestIdentityAbsentByDefault, which
+# takes conformance_http_port and so needs no identity fixture at all.
+#
+# All twelve classes, not a subset: the group's own design is that several of them are only
+# non-vacuous in each other's company. TestRejectionsAreUniform is what licenses the
+# resolvable-probe shape every guard case in TestTheJwsTrap and TestTheCredentialSizeCap depends
+# on, and TestIdentityNarrowing's hash-difference case is what stops two digests being pinned to
+# one wrong constant. Importing the interesting-looking half would leave the rest reading as
+# covered.
+from vgi_rpc.conformance._pytest_suite import (  # noqa: E402,F401
+    TestErrorKindsReachTheWire,
+    TestGrantFreshness,
+    TestGrantIssuance,
+    TestIdentityAbsentByDefault,
+    TestIdentityNarrowing,
+    TestIdentityWireShape,
+    TestIntrospectionAuthorization,
+    TestIntrospectionHappyPath,
+    TestRejectionsAreUniform,
+    TestTheCredentialSizeCap,
+    TestTheJwsTrap,
+    TestUnavailableIsTransient,
 )
