@@ -197,6 +197,49 @@ jobs:
       # checkout's own dev venv already had aiohttp installed, which is exactly the trap this
       # comment on M9's identical mTLS/cryptography miss warned about repeating).
       - run: pip install -e "./_conformance/vgi-rpc[conformance,http,external]" pytest cryptography
+      # --- cross-port drift ------------------------------------------------------------------
+      # The reference ships two tools that compare *ports to each other* rather than each port to
+      # a spec, and until now they only ever ran on a maintainer's laptop. Between them they found,
+      # in one day, four ports describing vgi_rpc.Reflection.v1 as having zero methods, six ports
+      # logging six different wrong protocol_hash values, and a client sending bare paths with no
+      # routing key. None of that is visible from inside a single port, which is the whole reason
+      # they belong in CI rather than in someone's shell history.
+      #
+      # They live here rather than in a job of their own because this job already has the three
+      # things they need -- Python, an unpinned reference checkout, and the extras -- and because
+      # the reference clone must be the *same* clone pip installed above. A second `actions/checkout`
+      # of vgi-rpc-python could resolve to a different commit than the installed one, and a drift
+      # report is unreadable when the two halves of the comparison disagree about which reference
+      # they mean.
+      #
+      # The tools resolve a port as <VGI_RPC_REPOS>/vgi-rpc-<name>, which this layout is not: this
+      # repo is the workspace root and the reference is nested inside it. Symlinks give them the
+      # sibling shape they expect without moving or re-cloning either checkout.
+      - name: Arrange the checkouts as the cross-port tools expect
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cross-port"
+          ln -sfn "$GITHUB_WORKSPACE" "$RUNNER_TEMP/cross-port/vgi-rpc-csharp"
+          ln -sfn "$GITHUB_WORKSPACE/_conformance/vgi-rpc" "$RUNNER_TEMP/cross-port/vgi-rpc-python"
+          echo "VGI_RPC_REPOS=$RUNNER_TEMP/cross-port" >> "$GITHUB_ENV"
+      # Ahead of the suite on purpose. A protocol-shape disagreement is exactly what makes the 186
+      # cases below fail in ways that read as a broken worker, so name it before they scroll past.
+      # describe_diff.py publishes the worker itself, into artifacts/conformance-worker -- the same
+      # path the pytest fixture below publishes to, so the suite's own build is then incremental.
+      # It exits non-zero on drift, on a listed-but-undescribable protocol, and on a port it could
+      # not reach at all; "not checked" is deliberately not the same as "checked and agrees".
+      - name: Cross-port protocol drift (describe_diff)
+        working-directory: _conformance/vgi-rpc
+        run: python tools/cross-port/describe_diff.py --only csharp
+      # A source-level grep, so it can only ever say "this port has not obviously diverged" -- the
+      # behaviour is established by test/QueryFarm.VgiRpc.Tests/Identity/*. --verbose so the log
+      # carries the file list the matrix was computed from: a run that found no identity sources
+      # would exit non-zero anyway ("NOT IMPLEMENTED"), but the file list is what distinguishes a
+      # real pass from a pass over a handful of files after someone moves Identity/ somewhere the
+      # tool's csharp globs (src/**, test/**) do not reach.
+      - name: Cross-port identity consistency
+        working-directory: _conformance/vgi-rpc
+        run: python tools/cross-port/identity_consistency.py --only csharp --verbose
       # test_csharp_conformance.py's worker_binary fixture builds the worker itself.
       - run: python -m pytest test_csharp_conformance.py -v
 
