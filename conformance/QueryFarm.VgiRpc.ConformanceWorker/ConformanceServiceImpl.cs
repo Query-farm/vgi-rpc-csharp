@@ -14,7 +14,7 @@ namespace QueryFarm.VgiRpc.ConformanceWorker;
 /// <summary>A C# port of <c>vgi_rpc.conformance._impl</c> for the methods <see cref="IConformanceService"/> declares.</summary>
 public sealed class ConformanceServiceImpl : IConformanceService
 {
-    public Task<string> EchoStringAsync(string payload) => Task.FromResult(payload);
+    public Task<string> EchoStringAsync(string value) => Task.FromResult(value);
 
     public Task<byte[]> EchoBytesAsync(byte[] data) => Task.FromResult(data);
 

@@ -21,7 +21,7 @@ public interface IConformanceService
 {
     // -- Scalar echo -----------------------------------------------------
 
-    Task<string> EchoStringAsync(string payload);
+    Task<string> EchoStringAsync(string value);
 
     Task<byte[]> EchoBytesAsync(byte[] data);
 
