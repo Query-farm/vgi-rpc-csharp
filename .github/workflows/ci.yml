@@ -245,6 +245,13 @@ jobs:
           VGI_CLIENT_DRIVER: ${{ github.workspace }}/conformance/QueryFarm.VgiRpc.ConformanceClientDriver/bin/Release/net10.0/QueryFarm.VgiRpc.ConformanceClientDriver
           VGI_PYTHON_BIN: python
           VGI_PY_TESTS_DIR: ${{ github.workspace }}/_conformance/vgi-rpc/tests
+          # This is the only job whose *server* is Python, so it is the only one that reaches the
+          # harness's Python HTTP-variant fixtures -- which spawn their interpreter from
+          # VGI_RPC_PYTHON, not from VGI_PYTHON_BIN, and whose fallback is a checkout-relative
+          # `.venv` that exists on a developer's machine and nowhere else. Unset, every one of
+          # those fixtures fails with a FileNotFoundError naming someone's home directory.
+          VGI_RPC_PYTHON: python
+          VGI_RPC_PYTHON_REPO: ${{ github.workspace }}/_conformance/vgi-rpc
           RUST_CONFORMANCE_WORKER: vgi-rpc-conformance
         run: python -m pytest test_rust_conformance.py -q
 
