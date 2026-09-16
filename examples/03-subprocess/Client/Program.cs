@@ -7,7 +7,6 @@
 //     dotnet build examples/03-subprocess/Worker
 //     dotnet run --project examples/03-subprocess/Client
 
-using System.Runtime.CompilerServices;
 using QueryFarm.VgiRpc.Client;
 using QueryFarm.VgiRpc.Errors;
 
@@ -35,10 +34,21 @@ catch (RpcException e)
 // `dotnet run --project examples/03-subprocess/Client` works with no
 // arguments regardless of Debug/Release configuration — as long as the
 // worker has been built at least once.
-static string FindWorkerDll([CallerFilePath] string here = "")
+//
+// Anchored on this program's own output directory rather than on
+// [CallerFilePath]: a deterministic build (which is what CI does) rewrites
+// embedded source paths, so the file path this method would be handed there
+// names a directory that exists on no machine.
+static string FindWorkerDll()
 {
-    var subprocessExampleDir = Path.GetDirectoryName(Path.GetDirectoryName(here))!; // .../03-subprocess
-    var workerBinDir = Path.Combine(subprocessExampleDir, "Worker", "bin");
+    var subprocessExampleDir = new DirectoryInfo(AppContext.BaseDirectory);
+    while (subprocessExampleDir is not null
+        && !Directory.Exists(Path.Combine(subprocessExampleDir.FullName, "Worker")))
+    {
+        subprocessExampleDir = subprocessExampleDir.Parent; // .../Client/bin/<config>/<tfm> -> .../03-subprocess
+    }
+
+    var workerBinDir = Path.Combine(subprocessExampleDir?.FullName ?? ".", "Worker", "bin");
     var candidates = Directory.Exists(workerBinDir)
         ? Directory.GetFiles(workerBinDir, "Worker.dll", SearchOption.AllDirectories)
         : [];

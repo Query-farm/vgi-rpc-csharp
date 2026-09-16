@@ -53,11 +53,46 @@ public sealed partial class RpcClient : IRpcClient
 
     public IRpcTransport Transport => _transport;
 
-    public async Task<AnnotatedBatch> CallUnaryAsync(
+    /// <summary>
+    /// One unary call addressed to <paramref name="protocol"/> instead of the one this client
+    /// was told it addresses.
+    /// </summary>
+    /// <param name="protocol">The routing key for this call alone.</param>
+    /// <param name="method">The method to call.</param>
+    /// <param name="parameters">The request batch.</param>
+    /// <param name="metadata">Extra request metadata.</param>
+    /// <param name="cancellationToken">Cancels the call.</param>
+    /// <remarks>
+    /// For the protocols a server co-hosts beside its application surface —
+    /// <c>vgi_rpc.Reflection.v1</c>, <c>vgi_rpc.Identity.v1</c> — which a client reaches over the
+    /// same connection without becoming a client of them. The connection's own protocol is
+    /// unchanged: this addresses one call, and a client still addresses one protocol.
+    /// </remarks>
+    public Task<AnnotatedBatch> CallUnaryOnAsync(
+        string protocol,
         string method,
         RecordBatch parameters,
         IReadOnlyDictionary<string, string>? metadata = null,
         CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(protocol);
+        return CallUnaryAsync(method, parameters, metadata, cancellationToken, protocol);
+    }
+
+    public async Task<AnnotatedBatch> CallUnaryAsync(
+        string method,
+        RecordBatch parameters,
+        IReadOnlyDictionary<string, string>? metadata = null,
+        CancellationToken cancellationToken = default) =>
+        await CallUnaryAsync(method, parameters, metadata, cancellationToken, protocol: null)
+            .ConfigureAwait(false);
+
+    private async Task<AnnotatedBatch> CallUnaryAsync(
+        string method,
+        RecordBatch parameters,
+        IReadOnlyDictionary<string, string>? metadata,
+        CancellationToken cancellationToken,
+        string? protocol)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentException.ThrowIfNullOrWhiteSpace(method);
@@ -68,7 +103,7 @@ public sealed partial class RpcClient : IRpcClient
         {
             await EnsureTransportOptionsAsync(cancellationToken).ConfigureAwait(false);
             _sharedMemory?.Reset();
-            var requestMetadata = RequestMetadata(method, metadata);
+            var requestMetadata = RequestMetadata(method, metadata, protocol);
             AddSharedMemoryMetadata(requestMetadata);
             var outgoing = await ShmPointerBatch.MaybeWriteAsync(
                 parameters,
@@ -213,9 +248,12 @@ public sealed partial class RpcClient : IRpcClient
         return new AnnotatedBatch(batch, metadata);
     }
 
+    // `protocol` addresses this one call elsewhere (see CallUnaryOnAsync); null means the
+    // client's own protocol.
     private Dictionary<string, string> RequestMetadata(
         string method,
-        IReadOnlyDictionary<string, string>? additional)
+        IReadOnlyDictionary<string, string>? additional,
+        string? protocol = null)
     {
         var result = additional is null
             ? new Dictionary<string, string>()
@@ -223,8 +261,9 @@ public sealed partial class RpcClient : IRpcClient
         result[MetadataKeys.Method] = method;
         // Required on this transport family: `vgi_rpc.protocol` is the protocol's only carrier
         // here, and the server refuses a request that does not name the protocol it addresses.
-        result[MetadataKeys.Protocol] = _protocol.Length > 0
-            ? _protocol
+        var routingKey = protocol is { Length: > 0 } ? protocol : _protocol;
+        result[MetadataKeys.Protocol] = routingKey.Length > 0
+            ? routingKey
             : throw new InvalidOperationException(
                 "This client has not been told which protocol it addresses. Set "
                 + "RpcClientOptions.Protocol, or call through a typed entry point "

@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Apache.Arrow;
+using Apache.Arrow.Types;
 using QueryFarm.VgiRpc.Client;
 using QueryFarm.VgiRpc.Client.Http;
 using QueryFarm.VgiRpc.Errors;
@@ -15,6 +16,15 @@ RpcExchangeSession? nativeExchange = null;
 HttpProducerSession? httpProducer = null;
 HttpExchangeSession? httpExchange = null;
 var logs = new List<LogMessage>();
+
+// Introspection format version, reported for readers who still look for it. Vestigial:
+// introspection is a protocol whose major version is part of its own name, so there is no
+// separate format number to negotiate and this will not move again.
+const string DescribeVersion = "5";
+
+// The prefix the framework reserves for its own co-hosted protocols.
+const string ReservedProtocolPrefix = "vgi_rpc.";
+
 
 while (await Console.In.ReadLineAsync() is { } line)
 {
@@ -40,8 +50,10 @@ while (await Console.In.ReadLineAsync() is { } line)
                 await ReplyAsync(Ok());
                 break;
             case "unary":
-            case "describe":
                 await HandleUnaryAsync(op, request);
+                break;
+            case "describe":
+                await DescribeAsync();
                 break;
             case "stream_open":
                 await OpenStreamAsync(request);
@@ -119,33 +131,13 @@ while (await Console.In.ReadLineAsync() is { } line)
 
 async Task HandleUnaryAsync(string op, JsonObject request)
 {
-    RecordBatch batch;
-    IReadOnlyDictionary<string, string>? metadata;
-    string method;
-    if (op == "describe")
-    {
-        // The one `__describe__` call left anywhere in this repo, and it is a *client* call: the
-        // driving harness (the Rust repo's rust_client_proxy.describe, reached through
-        // VGI_CLIENT_DRIVER) still asks for the retired batch shape and parses it with
-        // parse_describe_batch, which reflection's payload is not. Moving this to
-        // list_protocols/describe is a change to that harness's contract, not to this file
-        // alone, so it moves when the harness does. Every server in the fleet now refuses this,
-        // and the refusal says where introspection went -- which is the whole point of the
-        // refusal carrying text.
-        batch = ValueCodec.EmptyRow(new Schema([], null));
-        metadata = null;
-        method = "__describe__";
-    }
-    else
-    {
-        (batch, metadata) = await ReadOneAsync(request["request_b64"]!.GetValue<string>());
-        // A unary request always names its method. Defaulting to `__describe__` sent a retired
-        // method under a request that had simply lost its routing metadata, so the answer named
-        // the wrong problem entirely.
-        method = metadata?.GetValueOrDefault(MetadataKeys.Method)
-            ?? throw new InvalidOperationException(
-                $"unary op '{op}': the request batch carries no {MetadataKeys.Method} metadata.");
-    }
+    var (batch, metadata) = await ReadOneAsync(request["request_b64"]!.GetValue<string>());
+    // A unary request always names its method. Defaulting to `__describe__` sent a retired
+    // method under a request that had simply lost its routing metadata, so the answer named
+    // the wrong problem entirely.
+    var method = metadata?.GetValueOrDefault(MetadataKeys.Method)
+        ?? throw new InvalidOperationException(
+            $"unary op '{op}': the request batch carries no {MetadataKeys.Method} metadata.");
 
     using (batch)
     {
@@ -161,6 +153,149 @@ async Task HandleUnaryAsync(string op, JsonObject request)
                 ["logs"] = DrainLogs(logs),
                 ["error"] = null,
             });
+        }
+    }
+}
+
+/// <summary>
+/// The `describe` op: `vgi_rpc.Reflection.v1`, decoded, relayed as JSON.
+/// </summary>
+/// <remarks>
+/// <para>
+/// This used to be `__describe__` — one hardcoded method answering one flat batch, which is the
+/// shape the driving harness (`rust_client_proxy.describe`, reached through VGI_CLIENT_DRIVER)
+/// used to parse. Both ends have moved: every server in the fleet refuses `__describe__` now, and
+/// the harness asks the driver for an already-decoded description because reflection's reply is
+/// two nested payloads rather than one batch, and relaying raw Arrow would make the Python shim
+/// re-implement the reflection schema.
+/// </para>
+/// <para>
+/// Two round trips, the documented way: `list_protocols` for what the server hosts and its
+/// identity, then `describe` on the first protocol that is not framework-owned. The two
+/// server-identity fields live on the listing and not on the description, because two processes
+/// serving the same protocol must describe it identically or the description is not a property of
+/// the protocol.
+/// </para>
+/// <para>
+/// The per-method schemas are relayed as the server's own bytes rather than decoded and
+/// re-encoded here: `params_schema_ipc` is already an IPC stream, which is exactly what the
+/// harness opens. Re-encoding would only add a place for this shim to disagree with the server
+/// about a schema neither of them authored.
+/// </para>
+/// </remarks>
+async Task DescribeAsync()
+{
+    using var listing = await ReflectionCallAsync(
+        ReflectionProtocol.ListProtocolsMethod,
+        new RecordBatch(new Schema([], null), [], 1));
+
+    var (summaries, summaryStart, summaryEnd) = StructList(listing, "protocols");
+    var names = StructColumn<StringArray>(summaries, "protocol");
+    string? primary = null;
+    var hosted = new List<string>();
+    for (var i = summaryStart; i < summaryEnd; i++)
+    {
+        var name = names.GetString(i);
+        hosted.Add(name);
+        // The framework's own protocols are co-hosted beside the application surface; the one a
+        // client means by "describe this server" is the one that is not framework-owned.
+        if (primary is null && !name.StartsWith(ReservedProtocolPrefix, StringComparison.Ordinal))
+        {
+            primary = name;
+        }
+    }
+
+    if (primary is null)
+    {
+        throw new RpcException(
+            "ProtocolError",
+            $"Server '{Row0<StringArray>(listing, "server_id").GetString(0)}' hosts no application "
+                + $"protocol; it lists only [{string.Join(", ", hosted)}].");
+    }
+
+    using var described = await ReflectionCallAsync(
+        ReflectionProtocol.DescribeMethod,
+        new RecordBatch(
+            new Schema([new Field("protocol", StringType.Default, nullable: false)], null),
+            [new StringArray.Builder().Append(primary).Build()],
+            1));
+
+    var (methodRows, methodStart, methodEnd) = StructList(described, "methods");
+    var methodName = StructColumn<StringArray>(methodRows, "name");
+    var methodType = StructColumn<StringArray>(methodRows, "method_type");
+    var hasReturn = StructColumn<BooleanArray>(methodRows, "has_return");
+    var hasHeader = StructColumn<BooleanArray>(methodRows, "has_header");
+    var streamKind = StructColumn<StringArray>(methodRows, "stream_kind");
+    var paramsIpc = StructColumn<BinaryArray>(methodRows, "params_schema_ipc");
+    var resultIpc = StructColumn<BinaryArray>(methodRows, "result_schema_ipc");
+    var headerIpc = StructColumn<BinaryArray>(methodRows, "header_schema_ipc");
+
+    var methods = new JsonArray();
+    for (var i = methodStart; i < methodEnd; i++)
+    {
+        var header = hasHeader.GetValue(i) == true;
+        methods.Add(new JsonObject
+        {
+            ["name"] = methodName.GetString(i),
+            ["method_type"] = methodType.GetString(i),
+            ["has_return"] = hasReturn.GetValue(i) == true,
+            ["has_header"] = header,
+            ["is_exchange"] = IsExchange(streamKind.GetString(i)),
+            ["params_schema_b64"] = SchemaBase64(paramsIpc, i),
+            ["result_schema_b64"] = SchemaBase64(resultIpc, i),
+            ["header_schema_b64"] = header ? SchemaBase64(headerIpc, i) : null,
+        });
+    }
+
+    await ReplyAsync(new JsonObject
+    {
+        ["ok"] = true,
+        ["describe"] = new JsonObject
+        {
+            ["protocol_name"] = Row0<StringArray>(described, "protocol").GetString(0),
+            // From the listing hop: server identity is a property of the server, so the
+            // description deliberately does not carry it.
+            ["request_version"] = Row0<StringArray>(listing, "request_version").GetString(0),
+            ["server_id"] = Row0<StringArray>(listing, "server_id").GetString(0),
+            ["describe_version"] = DescribeVersion,
+            ["protocol_hash"] = Row0<StringArray>(described, "protocol_hash").GetString(0),
+            ["protocol_version"] = Row0<StringArray>(described, "protocol_version").GetString(0),
+            ["methods"] = methods,
+        },
+        ["logs"] = DrainLogs(logs),
+        ["error"] = null,
+    });
+}
+
+/// <summary>One unary call on <c>vgi_rpc.Reflection.v1</c>, unwrapped to its nested payload.</summary>
+/// <remarks>
+/// Reflection is an ordinary co-hosted protocol, so its reply obeys the ordinary unary convention
+/// for a structured return: the payload serialized into a single non-null <c>result</c> binary
+/// column. The connection stays a client of the application protocol — only this call is
+/// addressed elsewhere.
+/// </remarks>
+async Task<RecordBatch> ReflectionCallAsync(string method, RecordBatch parameters)
+{
+    using (parameters)
+    {
+        var reply = native is not null
+            ? await native.CallUnaryOnAsync(ReflectionProtocol.ProtocolName, method, parameters)
+            : await RequireHttp().CallUnaryOnAsync(ReflectionProtocol.ProtocolName, method, parameters);
+        using (reply.Batch)
+        {
+            if (reply.Batch.Column("result") is not BinaryArray result || result.Length == 0 || result.IsNull(0))
+            {
+                throw new RpcException(
+                    "ProtocolError", $"reflection '{method}' reply carries no 'result' payload.");
+            }
+
+            using var stream = new MemoryStream(result.GetBytes(0).ToArray());
+            using var reader = new WireReader(stream);
+            await reader.ReadSchemaAsync();
+            var item = await reader.ReadNextAsync()
+                ?? throw new RpcException(
+                    "ProtocolError", $"reflection '{method}' payload carried no batch.");
+            return item.Batch;
         }
     }
 }
@@ -361,6 +496,65 @@ static async Task<string> WriteOneAsync(AnnotatedBatch item)
     await using (var writer = new WireWriter(buffer, item.Batch.Schema)) await writer.WriteBatchAsync(item);
     return Convert.ToBase64String(buffer.ToArray());
 }
+
+/// <summary>A single-row payload's top-level column.</summary>
+static T Row0<T>(RecordBatch payload, string field) where T : IArrowArray =>
+    payload.Column(field) is T column
+        ? column
+        : throw new RpcException("ProtocolError", $"reflection payload missing '{field}'.");
+
+/// <summary>The struct elements of a single-row payload's list column, as [start, end).</summary>
+static (StructArray Values, int Start, int End) StructList(RecordBatch payload, string field)
+{
+    var list = Row0<ListArray>(payload, field);
+    if (list.Length == 0 || list.IsNull(0))
+    {
+        throw new RpcException("ProtocolError", $"reflection payload missing '{field}'.");
+    }
+
+    return ((StructArray)list.Values, list.ValueOffsets[0], list.ValueOffsets[1]);
+}
+
+/// <summary>One named child of a struct array, by declared field order.</summary>
+static T StructColumn<T>(StructArray rows, string field) where T : IArrowArray
+{
+    var index = ((StructType)rows.Data.DataType).Fields.ToList().FindIndex(f => f.Name == field);
+    return index >= 0 && rows.Fields[index] is T column
+        ? column
+        : throw new RpcException("ProtocolError", $"reflection method table missing '{field}'.");
+}
+
+/// <summary>
+/// A method's schema as the server serialized it, or null for an absent one.
+/// </summary>
+/// <remarks>
+/// Absent is spelled as empty bytes rather than null on the wire, so that a port need not
+/// null-check a value it will only ever treat as absent.
+/// </remarks>
+static JsonNode? SchemaBase64(BinaryArray column, int row)
+{
+    if (column.IsNull(row))
+    {
+        return null;
+    }
+
+    var bytes = column.GetBytes(row);
+    return bytes.Length == 0 ? null : JsonValue.Create(Convert.ToBase64String(bytes.ToArray()));
+}
+
+/// <summary>
+/// A stream kind as the tri-state "does this stream accept input" the client-side view uses.
+/// </summary>
+/// <remarks>
+/// Unary (<c>""</c>) and <c>"unknown"</c> both become null: a server describing its own surface
+/// often genuinely cannot say, and "unknown" is the honest answer rather than a missing one.
+/// </remarks>
+static JsonNode? IsExchange(string streamKind) => streamKind switch
+{
+    "exchange" => JsonValue.Create(true),
+    "producer" => JsonValue.Create(false),
+    _ => null,
+};
 
 static JsonObject Ok() => new() { ["ok"] = true };
 static JsonObject Error(RpcException exception) => new() { ["error_type"] = exception.ErrorType, ["error_message"] = exception.ErrorMessage, ["traceback"] = exception.RemoteTraceback };

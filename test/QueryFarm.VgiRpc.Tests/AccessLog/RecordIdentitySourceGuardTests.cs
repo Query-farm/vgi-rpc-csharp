@@ -188,7 +188,40 @@ public class RecordIdentitySourceGuardTests
         throw new InvalidOperationException("unbalanced parentheses in an AccessLogRecord construction");
     }
 
-    /// <summary>This file's own location is the only repo anchor a test binary has.</summary>
-    private static string RepoRoot([CallerFilePath] string thisFile = "") =>
-        Path.GetFullPath(Path.Combine(Path.GetDirectoryName(thisFile)!, "..", "..", ".."));
+    /// <summary>
+    /// The repository root, found by walking up from the test binary to the solution file.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Not <see cref="CallerFilePathAttribute"/>, which is the obvious answer and is wrong under
+    /// CI. <c>Directory.Build.props</c> sets <c>ContinuousIntegrationBuild</c> when
+    /// <c>GITHUB_ACTIONS</c> is set, which turns on deterministic source paths, which rewrites
+    /// every embedded source path to <c>/_/...</c> — so the anchor this guard reads resolves to a
+    /// directory that exists on no machine, and a guard that cannot find its sources fails
+    /// (deliberately: it must never pass vacuously) on exactly the runs that matter most. Found
+    /// in CI, green locally, which is the signature of reading a build-rewritten path.
+    /// </para>
+    /// <para>
+    /// The binary's own location survives that rewrite, so walk up from it to the marker file the
+    /// repository root is defined by — the same anchor <c>WorkerPoolTests</c> already uses to find
+    /// a built example.
+    /// </para>
+    /// </remarks>
+    private static string RepoRoot()
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null && !File.Exists(Path.Combine(directory.FullName, RepositoryMarker)))
+        {
+            directory = directory.Parent;
+        }
+
+        Assert.True(
+            directory is not null,
+            $"no '{RepositoryMarker}' above '{AppContext.BaseDirectory}'; this guard reads the "
+                + "repository's sources and cannot be skipped");
+        return directory!.FullName;
+    }
+
+    /// <summary>The file that marks the repository root.</summary>
+    private const string RepositoryMarker = "vgi-rpc-csharp.slnx";
 }

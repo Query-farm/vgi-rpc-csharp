@@ -236,6 +236,32 @@ public sealed partial class HttpRpcClient : IRpcClient
         return await ReadUnaryAsync(responseBody, method, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// One unary call addressed to <paramref name="protocol"/> instead of the one this client
+    /// was told it addresses. Mirrors <c>RpcClient.CallUnaryOnAsync</c> — see there for why.
+    /// </summary>
+    /// <remarks>
+    /// Both carriers move together: the path segment and the <c>vgi_rpc.protocol</c> metadata
+    /// name the same protocol, because the server refuses a request whose two carriers disagree.
+    /// The client's own protocol is untouched, so this is safe to call concurrently with
+    /// ordinary traffic on the same client.
+    /// </remarks>
+    public async Task<AnnotatedBatch> CallUnaryOnAsync(
+        string protocol,
+        string method,
+        RecordBatch parameters,
+        IReadOnlyDictionary<string, string>? metadata = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(protocol);
+        var responseBody = await PostBatchAsync(
+            $"{_prefix}/{Uri.EscapeDataString(protocol)}/{Uri.EscapeDataString(method)}",
+            parameters,
+            RequestMetadata(method, metadata, protocol: protocol),
+            cancellationToken).ConfigureAwait(false);
+        return await ReadUnaryAsync(responseBody, method, cancellationToken).ConfigureAwait(false);
+    }
+
     public async Task<HttpProducerSession> OpenProducerAsync(
         string method,
         RecordBatch parameters,
@@ -700,7 +726,13 @@ public sealed partial class HttpRpcClient : IRpcClient
     /// (<c>__upload_url__</c>), which belong to no protocol: stamping a routing key on one would
     /// claim it is addressed to a protocol that does not host it.
     /// </remarks>
-    private Dictionary<string, string> RequestMetadata(string method, IReadOnlyDictionary<string, string>? metadata, bool protocolScoped = true)
+    // `protocol` addresses this one call elsewhere (see CallUnaryOnAsync); null means the
+    // client's own protocol.
+    private Dictionary<string, string> RequestMetadata(
+        string method,
+        IReadOnlyDictionary<string, string>? metadata,
+        bool protocolScoped = true,
+        string? protocol = null)
     {
         var result = metadata is null ? new Dictionary<string, string>() : new Dictionary<string, string>(metadata);
         result[MetadataKeys.Method] = method;
@@ -709,7 +741,7 @@ public sealed partial class HttpRpcClient : IRpcClient
             // Sent alongside the path segment, and canonical relative to it: the path is a
             // projection an edge can read without an Arrow parser, and the server refuses a
             // request whose two carriers disagree.
-            result[MetadataKeys.Protocol] = RequireProtocol(_protocol);
+            result[MetadataKeys.Protocol] = RequireProtocol(protocol ?? _protocol);
         }
 
         result[MetadataKeys.RequestVersion] = MetadataKeys.CurrentRequestVersion;

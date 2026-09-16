@@ -2,10 +2,10 @@ using System.Globalization;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using QueryFarm.VgiRpc.Conformance;
-using QueryFarm.VgiRpc.Reflection;
 using QueryFarm.VgiRpc.Conformance.Errors;
 using QueryFarm.VgiRpc.Conformance.Types;
 using QueryFarm.VgiRpc.Logging;
+using QueryFarm.VgiRpc.Reflection;
 using QueryFarm.VgiRpc.Server;
 using QueryFarm.VgiRpc.Streaming;
 

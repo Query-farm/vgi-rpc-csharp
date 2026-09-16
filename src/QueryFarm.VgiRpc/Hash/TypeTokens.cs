@@ -2,8 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
-using Apache.Arrow.Types;
 using Apache.Arrow;
+using Apache.Arrow.Types;
 
 namespace QueryFarm.VgiRpc.Hash;
 

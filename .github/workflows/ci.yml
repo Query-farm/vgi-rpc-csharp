@@ -30,6 +30,16 @@ jobs:
       - run: dotnet restore
       - run: dotnet build -c Release --no-restore
       - run: dotnet test -c Release --no-build --logger trx --results-directory test-results
+      # The examples are built by `dotnet build` and referenced by no test, so a runtime throw in
+      # one passes both steps above. They are the first thing a new user runs; run them here.
+      # 04-http is left out on purpose: it is two processes around a fixed port, which is a
+      # different kind of step than "does this program still work".
+      - name: Run the examples
+        shell: bash
+        run: |
+          for example in 01-hello-world 02-structured-types 03-subprocess/Client; do
+            dotnet run -c Release --no-build --project "examples/$example"
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:

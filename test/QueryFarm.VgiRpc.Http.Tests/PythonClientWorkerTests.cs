@@ -274,7 +274,7 @@ public sealed class PythonClientWorkerTests
         var payload = Enumerable.Range(0, 512 * 1024).Select(index => (byte)(index % 251)).ToArray();
         await using (var client = RpcClient.StartSubprocess(
             [python, "-m", "vgi_rpc.conformance.client_worker", "--stdio"],
-            new RpcClientOptions { SharedMemorySize = 2 * 1024 * 1024 },
+            new RpcClientOptions { Protocol = WorkerProtocol, SharedMemorySize = 2 * 1024 * 1024 },
             SubprocessStderrMode.Discard))
         {
             await AssertBinaryEchoAsync(client, payload);
@@ -288,7 +288,8 @@ public sealed class PythonClientWorkerTests
             await using var unixWorker = await PythonWorker.StartSocketAsync("--unix", socketPath);
             await using var unix = await RpcClient.ConnectUnixAsync(
                 socketPath,
-                cancellationToken: TestContext.Current.CancellationToken);
+                new RpcClientOptions { Protocol = WorkerProtocol },
+                TestContext.Current.CancellationToken);
             await AssertBinaryEchoAsync(unix, "unix"u8.ToArray());
         }
 
@@ -298,7 +299,8 @@ public sealed class PythonClientWorkerTests
         await using var tcp = await RpcClient.ConnectTcpAsync(
             address[..separator],
             int.Parse(address[(separator + 1)..], System.Globalization.CultureInfo.InvariantCulture),
-            cancellationToken: TestContext.Current.CancellationToken);
+            new RpcClientOptions { Protocol = WorkerProtocol },
+            TestContext.Current.CancellationToken);
         await AssertBinaryEchoAsync(tcp, "tcp"u8.ToArray());
     }
 

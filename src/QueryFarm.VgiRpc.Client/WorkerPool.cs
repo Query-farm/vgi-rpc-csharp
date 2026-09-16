@@ -154,6 +154,10 @@ public sealed class WorkerPool : IAsyncDisposable
             : new RpcClientOptions
             {
                 OnLog = clientOptions.OnLog,
+                // Carried, not dropped: the routing key is required on this transport family, and
+                // a pooled client that silently lost the caller's is one that can only be used
+                // through a typed entry point whose contract name happens to equal the protocol.
+                Protocol = clientOptions.Protocol,
                 ProtocolVersion = clientOptions.ProtocolVersion,
                 SharedMemorySize = clientOptions.SharedMemorySize ?? _options.SharedMemorySize,
             };
