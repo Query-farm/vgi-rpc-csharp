@@ -232,11 +232,13 @@ jobs:
         working-directory: _conformance/vgi-rpc
         run: python tools/cross-port/describe_diff.py --only csharp
       # A source-level grep, so it can only ever say "this port has not obviously diverged" -- the
-      # behaviour is established by test/QueryFarm.VgiRpc.Tests/Identity/*. --verbose so the log
-      # carries the file list the matrix was computed from: a run that found no identity sources
-      # would exit non-zero anyway ("NOT IMPLEMENTED"), but the file list is what distinguishes a
-      # real pass from a pass over a handful of files after someone moves Identity/ somewhere the
-      # tool's csharp globs (src/**, test/**) do not reach.
+      # behaviour is established by test/QueryFarm.VgiRpc.Tests/Identity/*. The two ways this could
+      # pass having audited nothing -- the symlink above pointing somewhere with no repo, and a repo
+      # with no discoverable identity source -- both exit non-zero in the tool itself (ABSENT and
+      # NOT IMPLEMENTED respectively), so no guard is needed here. --verbose is still worth the
+      # lines: the file list is what distinguishes a real pass from a pass over a thin remnant after
+      # someone moves Identity/ somewhere the tool's csharp globs (src/**, test/**) do not reach.
+      # Expect "=== csharp: 20 identity file(s)" or thereabouts, never a handful.
       - name: Cross-port identity consistency
         working-directory: _conformance/vgi-rpc
         run: python tools/cross-port/identity_consistency.py --only csharp --verbose
