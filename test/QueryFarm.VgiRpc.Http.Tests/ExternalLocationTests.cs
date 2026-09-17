@@ -191,6 +191,7 @@ public class ExternalLocationTests
         var serverConfig = new ServerExternalConfig { Storage = storage, ExternalizeThresholdBytes = 8 };
         var (pointerBatch, pointerMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(original, null, serverConfig);
         Assert.Equal(0, pointerBatch.Length);
+        Assert.NotNull(pointerMetadata);
 
         var clientConfig = new ClientExternalConfig { UrlValidator = null };
         var (resolvedBatch, resolvedMetadata) = await ExternalLocation.ResolveAsync(pointerBatch, pointerMetadata, clientConfig);

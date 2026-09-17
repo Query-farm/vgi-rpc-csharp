@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Apache.Arrow;
 using QueryFarm.VgiRpc.Errors;
 using QueryFarm.VgiRpc.External;
@@ -8,6 +9,40 @@ using QueryFarm.VgiRpc.Transport;
 using QueryFarm.VgiRpc.Wire;
 
 namespace QueryFarm.VgiRpc.Client;
+
+/// <summary>What one batch arriving on a byte-stream response is, as every reader must decide it.</summary>
+/// <remarks>
+/// <para>
+/// This type exists so the decision has exactly one implementation
+/// (<see cref="RpcClient.Classify"/>) rather than one per reader. The ordering it encodes is
+/// normative: WIRE_PROTOCOL.md §1.5 and §12 require testing for an external-storage pointer
+/// <i>before</i> classifying a zero-row batch as a log or control batch. A pointer is zero-row by
+/// construction, so a reader that classifies first discards it and then reports the payload
+/// absent -- the header does not fail to parse, it fails to exist. Four of seven ports shipped
+/// exactly that, and this port shipped the adjacent version of it: two readers, one branch, with
+/// <c>ReadStreamDataAsync</c> resolving and its header-reading sibling not.
+/// </para>
+/// <para>
+/// <see cref="Pointer"/> is a separate member from <see cref="Data"/> rather than folded into it,
+/// even though both take the same branch in every reader today, so that "is this a pointer" is
+/// never re-derived from "does it carry metadata" or "does it have zero rows" at a call site. The
+/// two defects this guards against were both that inference.
+/// </para>
+/// </remarks>
+internal enum IncomingBatchKind
+{
+    /// <summary>An ordinary data batch.</summary>
+    Data,
+
+    /// <summary>A zero-row <c>vgi_rpc.location</c> pointer whose payload lives in external storage.</summary>
+    Pointer,
+
+    /// <summary>A client-directed log record.</summary>
+    Log,
+
+    /// <summary>A serialized server-side exception, terminating the response.</summary>
+    Exception,
+}
 
 /// <summary>
 /// Async schema-first client over one persistent byte-stream transport. A connection permits one
@@ -144,22 +179,24 @@ public sealed partial class RpcClient : IRpcClient
         {
             while (await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false) is { } batch)
             {
-                var level = batch.GetMetadata(MetadataKeys.LogLevel);
-                if (level is null || IsExternalPointer(batch))
+                switch (Classify(batch))
                 {
-                    terminal?.Batch.Dispose();
-                    terminal = await ResolveIncomingAsync(batch, cancellationToken).ConfigureAwait(false);
-                }
-                else if (level == "EXCEPTION")
-                {
-                    var exception = RpcErrorDecoder.Decode(batch);
-                    batch.Batch.Dispose();
-                    throw exception;
-                }
-                else
-                {
-                    DispatchLog(batch);
-                    batch.Batch.Dispose();
+                    case IncomingBatchKind.Exception:
+                        var exception = RpcErrorDecoder.Decode(batch);
+                        batch.Batch.Dispose();
+                        throw exception;
+                    case IncomingBatchKind.Log:
+                        DispatchLog(batch);
+                        batch.Batch.Dispose();
+                        break;
+                    case IncomingBatchKind.Pointer:
+                    case IncomingBatchKind.Data:
+                        terminal?.Batch.Dispose();
+                        terminal = await ResolveIncomingAsync(batch, cancellationToken).ConfigureAwait(false);
+                        break;
+                    default:
+                        batch.Batch.Dispose();
+                        throw new UnreachableException($"unhandled {nameof(IncomingBatchKind)}: {Classify(batch)}");
                 }
             }
 
@@ -233,20 +270,29 @@ public sealed partial class RpcClient : IRpcClient
     }
 
     /// <summary>
-    /// Whether <paramref name="batch"/> is an external-storage pointer this client would resolve.
+    /// Decides what one incoming batch is. The single definition of that ordering — see
+    /// <see cref="IncomingBatchKind"/> for why the pointer test comes first and why it is a kind
+    /// of its own.
     /// </summary>
-    /// <remarks>
-    /// Every reader below asks this <i>before</i> classifying a batch as a log or control batch,
-    /// as WIRE_PROTOCOL.md §1.5 and §12 require. A pointer is zero-row by construction, so a
-    /// reader that classifies first drops it and then reports the payload absent rather than
-    /// malformed -- the failure mode that cost four ports their stream header. This port keys its
-    /// log classification on <c>vgi_rpc.log_level</c> rather than on row count, which a pointer
-    /// never carries, so the order is belt and braces here; it is written explicitly anyway so a
-    /// later edit toward row-count classification cannot reintroduce the bug silently.
-    /// </remarks>
-    private bool IsExternalPointer(AnnotatedBatch batch) =>
-        _options.ExternalLocation is not null
-        && ExternalLocation.IsExternalLocationBatch(batch.Batch, batch.Metadata);
+    private IncomingBatchKind Classify(AnnotatedBatch batch)
+    {
+        // Pointer FIRST. Everything below it keys on vgi_rpc.log_level, which a pointer never
+        // carries, so this port would survive the other order -- but the order is the contract,
+        // and writing it down is what stops a later edit toward row-count classification from
+        // reintroducing the defect silently.
+        if (_options.ExternalLocation is not null
+            && ExternalLocation.IsExternalLocationBatch(batch.Batch, batch.Metadata))
+        {
+            return IncomingBatchKind.Pointer;
+        }
+
+        return batch.GetMetadata(MetadataKeys.LogLevel) switch
+        {
+            null => IncomingBatchKind.Data,
+            "EXCEPTION" => IncomingBatchKind.Exception,
+            _ => IncomingBatchKind.Log,
+        };
+    }
 
     /// <summary>
     /// Resolves whichever kind of pointer batch <paramref name="incoming"/> is — a shared-memory

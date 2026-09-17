@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Apache.Arrow;
 using QueryFarm.VgiRpc.Errors;
 using QueryFarm.VgiRpc.Reflection;
@@ -205,30 +206,30 @@ public sealed partial class RpcClient
         {
             while (await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false) is { } batch)
             {
-                // Pointer first. The header batch is externalizable like any other
-                // (WIRE_PROTOCOL.md §1.5), and the pointer that replaces it is zero-row -- so a
-                // header reader that classified before testing would skip it and then report the
-                // header absent rather than malformed.
-                var level = IsExternalPointer(batch) ? null : batch.GetMetadata(MetadataKeys.LogLevel);
-                if (level == "EXCEPTION")
+                // The header batch is externalizable like any other (WIRE_PROTOCOL.md §1.5), and
+                // the pointer that replaces it is zero-row. Classify() puts the pointer test ahead
+                // of the log test for that reason, and resolving here rather than leaving it to
+                // the caller is what closes this port's own gap: the header stream is a second
+                // externalization call site, and only its sibling below used to resolve.
+                switch (Classify(batch))
                 {
-                    var exception = RpcErrorDecoder.Decode(batch);
-                    batch.Batch.Dispose();
-                    throw exception;
+                    case IncomingBatchKind.Exception:
+                        var exception = RpcErrorDecoder.Decode(batch);
+                        batch.Batch.Dispose();
+                        throw exception;
+                    case IncomingBatchKind.Log:
+                        DispatchLog(batch);
+                        batch.Batch.Dispose();
+                        continue;
+                    case IncomingBatchKind.Pointer:
+                    case IncomingBatchKind.Data:
+                        result?.Batch.Dispose();
+                        result = await ResolveIncomingAsync(batch, cancellationToken).ConfigureAwait(false);
+                        break;
+                    default:
+                        batch.Batch.Dispose();
+                        throw new UnreachableException($"unhandled {nameof(IncomingBatchKind)}: {Classify(batch)}");
                 }
-
-                if (level is not null)
-                {
-                    DispatchLog(batch);
-                    batch.Batch.Dispose();
-                    continue;
-                }
-
-                result?.Batch.Dispose();
-                // Resolved here, not by the caller: the header stream is a second externalization
-                // call site with its own chance to go wrong, and its sibling reader below already
-                // resolves. Two readers, one branch, was this port's defect.
-                result = await ResolveIncomingAsync(batch, cancellationToken).ConfigureAwait(false);
             }
 
             var transfer = result;
@@ -247,22 +248,23 @@ public sealed partial class RpcClient
     {
         while (await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false) is { } batch)
         {
-            var level = IsExternalPointer(batch) ? null : batch.GetMetadata(MetadataKeys.LogLevel);
-            if (level == "EXCEPTION")
+            switch (Classify(batch))
             {
-                var exception = RpcErrorDecoder.Decode(batch);
-                batch.Batch.Dispose();
-                throw exception;
+                case IncomingBatchKind.Exception:
+                    var exception = RpcErrorDecoder.Decode(batch);
+                    batch.Batch.Dispose();
+                    throw exception;
+                case IncomingBatchKind.Log:
+                    DispatchLog(batch);
+                    batch.Batch.Dispose();
+                    continue;
+                case IncomingBatchKind.Pointer:
+                case IncomingBatchKind.Data:
+                    return await ResolveIncomingAsync(batch, cancellationToken).ConfigureAwait(false);
+                default:
+                    batch.Batch.Dispose();
+                    throw new UnreachableException($"unhandled {nameof(IncomingBatchKind)}: {Classify(batch)}");
             }
-
-            if (level is not null)
-            {
-                DispatchLog(batch);
-                batch.Batch.Dispose();
-                continue;
-            }
-
-            return await ResolveIncomingAsync(batch, cancellationToken).ConfigureAwait(false);
         }
 
         return null;
