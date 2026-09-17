@@ -1320,17 +1320,41 @@ public static class RpcHttpEndpoints
         await WriteBytesAsync(context, StatusCodes.Status200OK, WrittenMemory(responseBuffer), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>Drops the framework's own stream-framing keys from a request's custom_metadata
+    /// before it is handed to user code as a turn's input metadata. Mirrors Python's
+    /// <c>strip_keys(..., STATE_KEY, CALL_STATE_KEY, CANCEL_KEY)</c>.</summary>
+    private static IReadOnlyDictionary<string, string>? StripTransportKeys(IReadOnlyDictionary<string, string>? metadata)
+    {
+        static bool IsTransportKey(string key) =>
+            key is MetadataKeys.StreamState or MetadataKeys.CallState or MetadataKeys.Cancel;
+
+        if (metadata is null || !metadata.Keys.Any(IsTransportKey))
+        {
+            return metadata;
+        }
+
+        var stripped = new Dictionary<string, string>(metadata.Count, StringComparer.Ordinal);
+        foreach (var (key, value) in metadata)
+        {
+            if (!IsTransportKey(key))
+            {
+                stripped.Add(key, value);
+            }
+        }
+
+        return stripped;
+    }
+
     /// <summary>
     /// <c>POST {prefix}/{protocol}/{method}/init</c> — dispatches a stream method and registers it under a
     /// fresh call id (see <see cref="StreamCallRegistry"/>), returning (optional header stream +)
     /// a zero-row sentinel batch carrying the sealed call-id token on both
     /// <see cref="MetadataKeys.StreamState"/> and <see cref="MetadataKeys.CallState"/> — the real
     /// Python client reads both from exactly this shape (see
-    /// <c>vgi_rpc.http._client._init_http_stream_session</c>). Unlike the canonical Python
-    /// server, this never folds a producer's first turn into the init response (see
-    /// <see cref="StreamCallRegistry"/>'s doc comment on why): every turn, producer or exchange,
-    /// happens via <see cref="HandleStreamExchangeAsync"/> — which the client's generic init-response
-    /// reader handles correctly regardless (it just sees zero data batches this turn).
+    /// <c>vgi_rpc.http._client._init_http_stream_session</c>). A PRODUCER's first turn runs here,
+    /// inside the init request, matching the canonical Python server (see the <c>isProducer</c>
+    /// block below for why that changed); every later turn, and every exchange turn including the
+    /// first, happens via <see cref="HandleStreamExchangeAsync"/>.
     /// </summary>
     private static async Task HandleStreamInitAsync(RpcServer server, string protocol, string method, int prefixSegments, HttpContext context, int? compressionLevel, byte[] tokenKey, StreamCallRegistry registry, long? maxResponseBytes, AuthenticateDelegate? authenticate, string? proxyHint, StickySessionRegistry? sticky, ExternalizationOptions? externalization, long? maxRequestBytes, long? preferredResponseBytes)
     {
@@ -1582,7 +1606,20 @@ public static class RpcHttpEndpoints
             try
             {
                 using var tickBatch = ValueCodec.EmptyRow(s_emptySchema);
-                await stream.State.ProcessAsync(new AnnotatedBatch(tickBatch, null), tickCollector!, tickContext, cancellationToken).ConfigureAwait(false);
+                // The /init request's own Arrow metadata IS this first tick's metadata: on the
+                // pipe transport the client's first tick batch carries it, and folding the tick
+                // into /init is the only reason it would otherwise be lost. VGI's result-cache
+                // conditional revalidation rides exactly here (`vgi.cache.if_none_match`), so a
+                // null metadata made every HTTP revalidation miss its validators and answer a
+                // full re-stream instead of `not_modified`. Mirrors the canonical Python
+                // implementation's `tick_request_metadata` in `_run_init_producer`.
+                //
+                // The transport's own bookkeeping keys are stripped for the same reason Python
+                // strips them: a cursor/cancel key is framing, not user metadata. An honest
+                // client never puts one on an /init body — it has not been issued a cursor yet —
+                // so this is defence against a crafted one, not a behaviour change.
+                var tickMetadata = StripTransportKeys(requestBatch.Metadata);
+                await stream.State.ProcessAsync(new AnnotatedBatch(tickBatch, tickMetadata), tickCollector!, tickContext, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception exc)
             {
@@ -1595,9 +1632,14 @@ public static class RpcHttpEndpoints
         }
 
         var tickFinished = tickCollector?.Finished ?? false;
+        // The turn's own application-level custom_metadata, read BEFORE detaching the batch.
+        // RpcServer.ServeStreamAsync (the pipe transport) has always carried this through; HTTP
+        // silently dropped it, so every per-batch key a worker emits — VGI's `vgi.cache.*`
+        // result-cache directives, `vgi_partition_values#b64`, `vgi_batch_index`,
+        // `vgi_rpc.parent_row#b64` — vanished on this transport alone.
         var tickEmitted = tickCollector?.DetachEmittedBatch();
         using var tickEmittedOwner = tickEmitted is null ? null : new RecordBatchOwner(tickEmitted);
-        IReadOnlyDictionary<string, string>? tickEmittedMetadata = null;
+        var tickEmittedMetadata = tickCollector?.EmittedMetadata;
         if (externalization?.External is { } externalConfig && tickEmitted is not null)
         {
             var predicted = ExternalLocation.PredictExternalizeBytes(tickEmitted, externalConfig);
@@ -1610,7 +1652,7 @@ public static class RpcHttpEndpoints
                 return;
             }
 
-            (tickEmitted, tickEmittedMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(tickEmitted, null, externalConfig, cancellationToken).ConfigureAwait(false);
+            (tickEmitted, tickEmittedMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(tickEmitted, tickEmittedMetadata, externalConfig, cancellationToken).ConfigureAwait(false);
             tickEmittedOwner!.Replace(tickEmitted);
         }
 
@@ -1930,6 +1972,11 @@ public static class RpcHttpEndpoints
         Exception? turnException = null;
         try
         {
+            // Same strip as the /init tick: the continuation cursor and cancel keys are this
+            // transport's framing, not the caller's metadata, and user code that sees a turn's
+            // metadata must see the same keys on every transport. (On the pipe the cursor does
+            // not exist at all, so leaving it in here was a pure HTTP-only leak.)
+            turnBatch = turnBatch with { Metadata = StripTransportKeys(turnBatch.Metadata) };
             await stream.State.ProcessAsync(turnBatch, collector, turnContext, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception exc)
@@ -1981,7 +2028,8 @@ public static class RpcHttpEndpoints
         // is never attempted.
         var emittedBatch = collector.DetachEmittedBatch();
         using var emittedBatchOwner = emittedBatch is null ? null : new RecordBatchOwner(emittedBatch);
-        IReadOnlyDictionary<string, string>? emittedBatchMetadata = null;
+        // Same carry-through as HandleStreamInitAsync's tick — see the comment there.
+        var emittedBatchMetadata = collector.EmittedMetadata;
         if (externalization?.External is { } externalConfig && emittedBatch is not null)
         {
             var predicted = ExternalLocation.PredictExternalizeBytes(emittedBatch, externalConfig);
@@ -1998,7 +2046,7 @@ public static class RpcHttpEndpoints
                 return;
             }
 
-            (emittedBatch, emittedBatchMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(emittedBatch, null, externalConfig, cancellationToken).ConfigureAwait(false);
+            (emittedBatch, emittedBatchMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(emittedBatch, emittedBatchMetadata, externalConfig, cancellationToken).ConfigureAwait(false);
             emittedBatchOwner!.Replace(emittedBatch);
         }
 
@@ -2037,18 +2085,20 @@ public static class RpcHttpEndpoints
                 // server-side (the client ends the exchange by simply stopping calling exchange()),
                 // so freshTokenB64 is always set here in practice.
                 Dictionary<string, string>? dataMetadata = null;
-                if (freshTokenB64 is not null)
-                {
-                    dataMetadata = new Dictionary<string, string> { [MetadataKeys.StreamState] = freshTokenB64 };
-                }
-
                 if (emittedBatchMetadata is not null)
                 {
+                    dataMetadata = new Dictionary<string, string>(emittedBatchMetadata, StringComparer.Ordinal);
+                }
+
+                // The token goes on LAST so the framing key always wins. The application's keys
+                // and the transport's share one dictionary here, and a worker that happened to
+                // emit `vgi_rpc.stream_state#b64` would otherwise silently overwrite its own
+                // continuation cursor and wedge the stream. (The input side of the same seam is
+                // handled by StripTransportKeys.)
+                if (freshTokenB64 is not null)
+                {
                     dataMetadata ??= [];
-                    foreach (var (key, value) in emittedBatchMetadata)
-                    {
-                        dataMetadata[key] = value;
-                    }
+                    dataMetadata[MetadataKeys.StreamState] = freshTokenB64;
                 }
 
                 if (emittedBatch is null)
