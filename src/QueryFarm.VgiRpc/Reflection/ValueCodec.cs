@@ -234,12 +234,72 @@ public static class ValueCodec
             // length=1, which Arrow .NET permits but every foreign Arrow reader correctly rejects.
             ListType listType => nullRow ? BuildListArray(listType, null) : BuildZeroRowListArray(listType),
             StructType structType => nullRow ? BuildStructArray(structType, value: null, isEmpty: false) : BuildStructArray(structType, value: null, isEmpty: true),
-            DictionaryType dictType => nullRow
-                ? new DictionaryArray(dictType, new Int16Array.Builder().AppendNull().Build(), new StringArray.Builder().Build())
-                : new DictionaryArray(dictType, new Int16Array.Builder().Build(), new StringArray.Builder().Build()),
+            // Both halves must be built from the DECLARED types, not assumed to be Int16/String:
+            // a DuckDB ENUM arrives as a dictionary whose index width tracks its cardinality
+            // (Int8/UInt8 for a small enum, Int16/Int32 above that), and the hard-coded Int16
+            // indices made `new DictionaryArray(...)`'s own type check throw ArgumentException
+            // ("Specified array type <Int16> does not match expected type(s) <Int8>") for every
+            // one of them. Reached wherever an empty row of a schema carrying a dictionary column
+            // is built — HTTP's continuation-token sentinel batch, void results, log/error batches.
+            DictionaryType dictType => new DictionaryArray(
+                dictType,
+                BuildEmptyArrayOrNull(dictType.IndexType, nullRow),
+                BuildEmptyArray(dictType.ValueType)),
             MapType mapType => nullRow ? BuildMapArray(mapType, null) : BuildZeroRowMapArray(mapType),
+            NullType => new NullArray(nullRow ? 1 : 0),
+            // DuckDB's ARRAY(n). One validity buffer and one child; the child of a zero-row
+            // fixed-size list is itself zero-row (length * ListSize == 0).
+            FixedSizeListType fixedSizeList when !nullRow => new FixedSizeListArray(new ArrayData(
+                fixedSizeList, length: 0, nullCount: 0, offset: 0,
+                [ArrowBuffer.Empty],
+                [BuildEmptyArray(fixedSizeList.ValueDataType).Data])),
+            // A union carries no top-level validity bitmap, so "one null row" is not a property of
+            // the union itself — it is the SELECTED CHILD's null, which needs a type-id (and, when
+            // dense, an offset) chosen for it. Nothing needs that shape today, and inventing a
+            // child selection is worse than saying so, so only the zero-row form is built here.
+            UnionType union when !nullRow => BuildZeroRowUnionArray(union),
+            // EVERY remaining fixed-width type, by layout rather than by name — this must stay
+            // last, since DictionaryType and the named primitives above are FixedWidthType too and
+            // need their own handling. Enumerating fixed-width types one at a time is what made
+            // this method a repeat source of 500s: FixedSizeBinary (a UUID column), then Interval,
+            // each discovered only when some worker's output schema happened to contain one. A
+            // fixed-width type's zero-row and one-null-row layouts are fully determined by its
+            // BitWidth, so there is nothing per-type left to get wrong.
+            FixedWidthType fixedWidth => BuildFixedWidthArray(fixedWidth, nullRow),
             var other => throw NotSupportedYet(other),
         };
+
+    /// <summary>Zero rows, or one null row, of any fixed-width column. The layout is always
+    /// [validity, values]; a null row still occupies its full width in the values buffer.</summary>
+    private static IArrowArray BuildFixedWidthArray(FixedWidthType type, bool nullRow)
+    {
+        if (!nullRow)
+        {
+            return ArrowArrayFactory.BuildArray(new ArrayData(type, length: 0, nullCount: 0, offset: 0,
+                [ArrowBuffer.Empty, ArrowBuffer.Empty]));
+        }
+
+        var validity = new ArrowBuffer.BitmapBuilder();
+        validity.Append(false);
+        var byteWidth = Math.Max((type.BitWidth + 7) / 8, 1);
+        var values = new ArrowBuffer.Builder<byte>(byteWidth);
+        values.Append(new byte[byteWidth]);
+        return ArrowArrayFactory.BuildArray(new ArrayData(type, length: 1, nullCount: 1, offset: 0,
+            [validity.Build(), values.Build()]));
+    }
+
+    /// <summary>Zero rows of a union column. Sparse carries one buffer (the type ids); dense
+    /// carries two (type ids, then per-row offsets into the selected child). Every child is itself
+    /// a zero-row array of its own declared type.</summary>
+    private static IArrowArray BuildZeroRowUnionArray(UnionType type)
+    {
+        var children = type.Fields.Select(f => BuildEmptyArray(f.DataType).Data).ToArray();
+        ArrowBuffer[] buffers = type.Mode == UnionMode.Dense
+            ? [ArrowBuffer.Empty, ArrowBuffer.Empty]
+            : [ArrowBuffer.Empty];
+        var data = new ArrayData(type, length: 0, nullCount: 0, offset: 0, buffers, children);
+        return UnionArray.Create(data);
+    }
 
     private static IArrowArray BuildEmptyArray(IArrowType type) => BuildEmptyArrayOrNull(type, nullRow: false);
 
