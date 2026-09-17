@@ -48,3 +48,16 @@ Service interfaces are declared with idiomatic PascalCase C# members. The wire n
 deterministic PascalCase→snake_case conversion (with a trailing `Async` suffix stripped first), or
 can be overridden explicitly with `[RpcName("wire_name")]`. See
 `src/QueryFarm.VgiRpc/Attributes/RpcNameAttribute.cs`.
+
+The *protocol* name follows the same declare-or-derive shape one level up: it defaults to the
+contract type's name with C#'s `I` prefix stripped (`IGreeter` → `Greeter`), and
+`[ProtocolName("vgi.v2")]` declares it instead. Both the server (which hosts under the name) and
+the clients (which address it) go through `WireNaming.ForProtocol`, so the two cannot drift. A
+declared name is checked against the §3.1 grammar and refused if it claims the reserved `vgi_rpc.`
+prefix; the check runs where the name is resolved, i.e. at construction. See
+`src/QueryFarm.VgiRpc/Attributes/ProtocolNameAttribute.cs`.
+
+Declaring matters because a derived name is an accident of the local type system, which differs per
+language: six implementations of the VGI protocol derived four different names (`VgiProtocol`,
+`VgiService`, `Service`, `vgi`), which stayed invisible until `vgi_rpc.protocol` became a required
+routing key. A dot-qualified name like `vgi.v2` is additionally unspellable as a C# identifier.

@@ -113,7 +113,10 @@ Filled in as each piece lands. Key decisions so far:
   are transport-implementation-internal, not part of the cross-language wire contract (confirmed:
   Rust uses HMAC-signed tokens, Java uses CBOR+HMAC — every port already picked its own envelope).
 - **Naming**: PascalCase C# API + `[RpcName]` attribute for wire-name overrides, default
-  PascalCase→snake_case conversion. See `docs/wire-protocol.md`.
+  PascalCase→snake_case conversion. The protocol's own wire name is `[ProtocolName("...")]`
+  when the contract declares one (read from its *own* attributes, never inherited; validated
+  and refused under the reserved `vgi_rpc.` prefix, at construction), else the type name minus
+  C#'s `I` prefix. See `docs/wire-protocol.md`.
 - **Width overrides**: no general `Annotated[T, ArrowType(...)]`-equivalent exists. Every scalar
   width already has a distinct CLR type to key off (`sbyte`→int8, `short`→int16, ... — see
   `SchemaDerivation`'s own type-mapping doc comment), so the only gap was `pa.large_string()`/

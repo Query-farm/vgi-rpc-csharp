@@ -20,9 +20,10 @@ public sealed class RpcClientOptions
     /// </para>
     /// <para>
     /// Leave it unset when using a typed entry point — <see cref="RpcClient.CreateProxy{T}"/> or
-    /// <see cref="RpcConnection{T}"/> — and the client derives the name from the contract type
+    /// <see cref="RpcConnection{T}"/> — and the client resolves the name from the contract type
     /// with the same <see cref="Reflection.WireNaming.ForProtocol"/> rule the server hosts it
-    /// under, so the two agree by construction. It is only required for a schema-first
+    /// under (a <see cref="Attributes.ProtocolNameAttribute"/> the contract declares, else the
+    /// derived name), so the two agree by construction. It is only required for a schema-first
     /// <see cref="RpcClient.CallUnaryAsync(string, Apache.Arrow.RecordBatch, System.Collections.Generic.IReadOnlyDictionary{string, string}, System.Threading.CancellationToken)"/> against a dynamic protocol, where there is no
     /// contract to read it from. Setting it always wins over the derivation.
     /// </para>

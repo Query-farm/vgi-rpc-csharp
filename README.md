@@ -112,6 +112,25 @@ Methods must return `Task` or `Task<T>`. By default, method names are converted 
 on the wire and a trailing `Async` suffix is removed, so `GreetAsync` becomes `greet`. Use
 `[RpcName("...")]` to override a method, parameter, or property name.
 
+The protocol's own wire name — the `vgi_rpc.protocol` routing key, and the protocol path segment
+over HTTP — defaults to the contract type's name with C#'s conventional `I` prefix stripped, so
+`IGreeter` is hosted and addressed as `Greeter`. Declare it explicitly with `[ProtocolName("...")]`
+when the wire name is a cross-port contract rather than a local type name:
+
+```csharp
+[ProtocolName("vgi.v2")]
+public interface IVgiService { ... }
+```
+
+A wire name may contain dots — `vgi.v2`, `vgi_rpc.Reflection.v1` — which no C# identifier can, so
+for a dot-qualified protocol this attribute is the only way to spell the name. Conventionally the
+major version goes in the name (gRPC's AIP-185, Kubernetes API groups, D-Bus): an incompatible
+major is then a *different* protocol and a 404, and `foo.v1` and `foo.v2` can be served side by
+side while clients migrate. The declaration is read from the type's own attributes, never an
+inherited one, and is validated where it is resolved — at server or client construction — so an
+unroutable name fails once, at startup, rather than on every request. The `vgi_rpc.` prefix is
+reserved for the framework's own protocols and is refused.
+
 See the complete
 [`01-hello-world`](https://github.com/Query-farm/vgi-rpc-csharp/tree/main/examples/01-hello-world)
 example for a runnable project.

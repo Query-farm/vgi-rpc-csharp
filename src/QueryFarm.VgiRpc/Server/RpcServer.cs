@@ -132,13 +132,15 @@ public sealed class RpcServer
         _accessLog = accessLog;
         _expectedProtocolVersion = expectedProtocolVersion;
         _dispatchHook = dispatchHooks is { Count: > 0 } ? new CompositeDispatchHook(dispatchHooks) : null;
-        // Strip C#'s interface `I` prefix: the protocol name is the wire
-        // identity, it is in the protocol hash, and every other port names this
-        // protocol `ConformanceService`. Carrying a language naming convention
-        // onto the wire makes this port speak a differently-named protocol from
-        // the one it is meant to implement.
-        // The same derivation the clients use to address this server -- shared rather than
+        // A [ProtocolName] declaration when the contract carries one, else the type name with
+        // C#'s interface `I` prefix stripped: the protocol name is the wire identity, it is in
+        // the protocol hash, and carrying a language naming convention onto the wire makes this
+        // port speak a differently-named protocol from the one it is meant to implement. A name
+        // no C# identifier can spell -- `vgi.v2` -- is why declaring it has to be possible at all.
+        // The same resolution the clients use to address this server -- shared rather than
         // duplicated, so the two cannot drift into hosting and addressing different names.
+        // Resolved here, in the constructor: an unroutable declaration fails when the server is
+        // built rather than on every request.
         ProtocolName = WireNaming.ForProtocol(serviceInterface);
 
         // Identity is registered AFTER reflection (which this port hosts unconditionally, and
