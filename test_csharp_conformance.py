@@ -18,14 +18,21 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from vgi_rpc.conformance._external_bytestream_pytest import ByteStreamExternalTarget
+    from vgi_rpc.log import Message
 
 REPO_ROOT = Path(__file__).parent
 WORKER_PROJECT = REPO_ROOT / "conformance" / "QueryFarm.VgiRpc.ConformanceWorker"
 WORKER_OUTPUT = REPO_ROOT / "artifacts" / "conformance-worker"
+CLIENT_DRIVER_PROJECT = REPO_ROOT / "conformance" / "QueryFarm.VgiRpc.ConformanceClientDriver"
+CLIENT_DRIVER_OUTPUT = REPO_ROOT / "artifacts" / "conformance-client-driver"
 
 # Test categories/methods implemented so far (unary only — see docs/roadmap.md M2). Grows as
 # later milestones land: M3 adds producer_stream/exchange_stream/*_header/cancel/dynamic_schema,
@@ -473,6 +480,95 @@ def conformance_http_externalized_cap_port(worker_binary: Path, conformance_fake
     )
 
 
+# The byte-stream externalization group (vgi_rpc.conformance._external_bytestream_pytest,
+# imported at the bottom of this file). Unlike every other external group here, the *server* is
+# the canonical Python reference, not this port's worker — that is the whole point of the leg. A
+# port's own server externalizes only in the data path and never externalizes a stream header, so
+# a port talking to itself cannot produce the pointer batches its own reader is supposed to
+# resolve; the reference is the one peer that externalizes headers. See
+# docs/cross-language-conformance.md, "Byte-stream externalization contract".
+#
+# The client under test is therefore this port's RpcClient, reached through the same JSONL driver
+# the cross-language client-role legs use (VGI_CLIENT_DRIVER), so no value marshaling happens
+# Python-side and a driver defect cannot be papered over by the reference's own client.
+@pytest.fixture(scope="session")
+def client_driver_binary() -> Path:
+    """Publishes the JSONL client driver once per test session."""
+    if CLIENT_DRIVER_OUTPUT.exists():
+        shutil.rmtree(CLIENT_DRIVER_OUTPUT)
+
+    subprocess.run(  # noqa: S603
+        [
+            "dotnet",
+            "publish",
+            str(CLIENT_DRIVER_PROJECT),
+            "-c",
+            "Release",
+            "-o",
+            str(CLIENT_DRIVER_OUTPUT),
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+
+    exe = CLIENT_DRIVER_OUTPUT / "QueryFarm.VgiRpc.ConformanceClientDriver"
+    if not exe.exists():
+        exe = CLIENT_DRIVER_OUTPUT / "QueryFarm.VgiRpc.ConformanceClientDriver.exe"
+    assert exe.exists(), f"Client driver binary not found under {CLIENT_DRIVER_OUTPUT}"
+    return exe
+
+
+@pytest.fixture(scope="session")
+def conformance_bytestream_external_target(
+    conformance_fake_storage: str,
+    client_driver_binary: Path,
+) -> Iterator["ByteStreamExternalTarget"]:
+    """This port's byte-stream client, against an externalizing reference peer.
+
+    The peer's argv names its transport with an explicit ``--pipe`` rather than spelling "byte
+    stream" as the absence of every other flag. That is not decoration: a harness that infers the
+    transport from which flags are present reroutes to an HTTP server the moment the fixture adds
+    ``--fake-storage``, the driver then talks stdio to a process listening on a TCP port nobody
+    dialled, and every test in the group times out in a read with no error text at all.
+
+    ``--externalize-threshold 1`` puts every data-bearing batch through storage, which is what
+    makes the group's upload assertions able to fail rather than pass vacuously.
+    """
+    import httpx2
+
+    from vgi_rpc.conformance._external_bytestream_pytest import ByteStreamExternalTarget
+    from vgi_rpc.conformance.client_driver import ClientDriver
+    from vgi_rpc.external import ExternalLocationConfig
+
+    driver = ClientDriver.from_env(default=[str(client_driver_binary)])
+    peer = [
+        sys.executable,
+        "-c",
+        "from vgi_rpc.conformance._cli import main; main()",
+        "--pipe",
+        "--fake-storage",
+        conformance_fake_storage,
+        "--externalize-threshold",
+        "1",
+    ]
+
+    def connect(on_log: "Callable[[Message], None] | None" = None) -> object:
+        # Only the *presence* of a config crosses the driver's control boundary — resolving
+        # Python-side would mask the client under test, which is the thing being measured.
+        return driver.connect("stdio", peer, on_log, external_config=ExternalLocationConfig())
+
+    def uploaded_objects() -> int:
+        response = httpx2.get(f"{conformance_fake_storage}/_stats", timeout=5.0)
+        response.raise_for_status()
+        return int(response.json()["object_count"])
+
+    yield ByteStreamExternalTarget(
+        name="csharp-client-vs-python-pipe",
+        connect=connect,
+        uploaded_objects=uploaded_objects,
+    )
+
+
 def _make_test_cert(cn: str = "test-client", *, days_valid: int = 365, not_before_offset=None) -> str:
     """Generates a self-signed certificate and returns it URL-encoded PEM, ready to drop straight
     into an X-SSL-Client-Cert header — mirrors the canonical Python repo's
@@ -707,7 +803,7 @@ _ACCESS_LOG_FILTER = "scalar_echo.*,dataclass.echo_point,producer_stream.*,excha
 # reference pins the same value in tests/golden/protocol_hash_vector.json). Pinned literally
 # rather than recomputed from the worker, because recomputing it here would just re-derive
 # whatever this port happens to do and assert that it equals itself.
-_CONFORMANCE_PROTOCOL_HASH = "5cc768771c2e8a54e19ebb7546c97c119823eb13e20a5ff62ca5ce7ed2a1334e"
+_CONFORMANCE_PROTOCOL_HASH = "7713e810a0523bddfed4caa692dd218f4cbb09a773d0d94401a90d70ac3b6e54"
 
 
 @pytest.mark.parametrize("debug", [False, True], ids=["info", "debug"])
@@ -1226,6 +1322,12 @@ from vgi_rpc.conformance._external_pytest import (  # noqa: E402,F401
     TestExternalInputRoutes,
     TestExternalStorageUrlPair,
 )
+
+# The byte-stream half of §12: pointer batches are not an HTTP feature, and this port's one
+# pointer resolver is also called by its pipe/subprocess/unix/tcp client. Supplying
+# conformance_fake_storage (above) without this group's target fixture is what the shared suite
+# deliberately *fails* rather than skips — a resolver exercised only over HTTP is half-tested.
+from vgi_rpc.conformance._external_bytestream_pytest import TestExternalByteStream  # noqa: E402,F401
 
 
 # The canonical vgi_rpc.Identity.v1 group (vgi_rpc.conformance._identity_pytest, re-exported

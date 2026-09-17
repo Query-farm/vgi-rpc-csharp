@@ -43,7 +43,9 @@ nested one per `src/`, `test/`, `conformance/`, `benchmark/`, `examples/` folder
 
 - `src/` — published packages (`QueryFarm.VgiRpc` core + optional add-ons: `.Http`,
   `.Http.OAuth`, `.OpenTelemetry`, `.Sentry`, `.S3`, `.Gcs`). `.S3`/`.Gcs` (M20) are real
-  `IExternalStorage`/`IUploadUrlProvider` implementations (that seam itself lives in `.Http`) —
+  `IExternalStorage`/`IUploadUrlProvider` implementations (that seam lives in the core package,
+  under `QueryFarm.VgiRpc.External` — externalization is not an HTTP feature, WIRE_PROTOCOL.md §12,
+  and the byte-stream client resolves pointer batches through exactly the same code) —
   `S3Storage`/`GcsStorage`, both presign PUT+GET URL pairs in addition to the plain upload path.
   Conformance still exercises the seam only via a fake in-repo backend (`FakeStorageBackend` in
   `conformance/QueryFarm.VgiRpc.ConformanceWorker/`) — that's deliberate (see M20's roadmap entry:

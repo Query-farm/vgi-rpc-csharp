@@ -1,6 +1,6 @@
 using QueryFarm.VgiRpc.Errors;
 
-namespace QueryFarm.VgiRpc.Http;
+namespace QueryFarm.VgiRpc.External;
 
 /// <summary>
 /// URL fetching for ExternalLocation pointer resolution — a simplified port of the canonical

@@ -277,6 +277,19 @@ public interface IConformanceService
     [StreamKind(StreamKind.Producer)]
     Task<RpcStream<StreamState>> ProduceLargeBatchesAsync(long rowsPerBatch, long batchCount);
 
+    /// <summary>Produces <c>count</c> batches, each carrying distinct per-emit custom metadata
+    /// (<c>conformance.batch_index</c>, <c>conformance.batch_total</c>, and a deliberately
+    /// non-ASCII <c>conformance.emit_label</c>).
+    ///
+    /// <para>Pins the one place per-batch metadata and externalization meet. Two sibling ports
+    /// shipped opposite defects there — one refused to externalize any batch carrying metadata
+    /// (treating "has metadata" as a proxy for "is a control batch"), the other externalized and
+    /// then <i>replaced</i> the result's metadata, erasing <c>vgi_rpc.location</c> and leaving a
+    /// zero-row batch no resolver recognises. Classify data explicitly; never infer it from
+    /// whether metadata is present.</para></summary>
+    [StreamKind(StreamKind.Producer)]
+    Task<RpcStream<StreamState>> ProduceAnnotatedBatchesAsync(long count, long rowsPerBatch);
+
     // -- Stream headers -------------------------------------------------------
 
     [StreamHeader(typeof(ConformanceHeader))]

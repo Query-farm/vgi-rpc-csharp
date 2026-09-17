@@ -1,6 +1,7 @@
 using System.Net.Http.Json;
 using System.Text.Json.Serialization;
 using Apache.Arrow;
+using QueryFarm.VgiRpc.External;
 using QueryFarm.VgiRpc.Http;
 
 namespace QueryFarm.VgiRpc.ConformanceWorker;

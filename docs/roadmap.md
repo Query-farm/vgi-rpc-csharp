@@ -1275,5 +1275,42 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       Arrow round trips; no network), providing a reproducible post-refactor baseline rather than
       conflating client API overhead with network latency.
 
+- [x] **M23 — External pointers on the byte-stream transports, and reader-stamped provenance.**
+      M22 delivered external response resolution on the *HTTP* client and nowhere else.
+      `RpcClient.ResolveIncomingAsync` resolved shared-memory pointers only and never tested for
+      `vgi_rpc.location`, so on pipe/subprocess/unix/tcp an external pointer batch reached the
+      caller as the zero-row batch it is on the wire: every row of an externalized response gone,
+      no error raised anywhere. That is a missing feature, not a missing branch — the
+      externalization seam lived in `QueryFarm.VgiRpc.Http`, which the byte-stream client does not
+      (and should not, it carries an ASP.NET Core framework reference) depend on.
+
+      `ExternalLocation`/`ExternalFetch` therefore move into the core package as
+      `QueryFarm.VgiRpc.External`, which is where WIRE_PROTOCOL.md §12 already says they belong:
+      externalization is not an HTTP feature, and every transport that carries record batches
+      carries pointer batches. `ExternalizationOptions` — genuinely HTTP-server wiring — stays in
+      `.Http`. `RpcClientOptions.ExternalLocation` opts a byte-stream client in.
+
+      Two readers, one branch, was the shape of the second defect: `ReadStreamDataAsync` resolved
+      and its sibling `ReadSingleDataStreamAsync` — the *header* reader — did not. §1.5 now states
+      that a stream header is externalizable and arrives as a zero-row pointer, so a reader that
+      classifies a zero-row batch as log or control before testing for a pointer discards the
+      header and then reports it absent. Four of seven ports had exactly this. Both readers now
+      test for a pointer first.
+
+      Provenance: §12 as rewritten makes `vgi_rpc.location.source` and `vgi_rpc.location.fetch_ms`
+      **reader-stamped, at resolve time**, and forbids a wire pointer from carrying either. This
+      port had declared both key constants and referenced neither — a reasonable reading of the
+      old text, which listed them in the pointer-batch table as "diagnostics". `ResolveAsync` now
+      stamps both onto the *inner* batch's metadata.
+
+      Wired to the shared `TestExternalByteStream` group via a session-scoped
+      `conformance_bytestream_external_target` fixture. The server half is the canonical reference
+      peer (`--pipe --fake-storage URL --externalize-threshold 1`), not this port's own worker:
+      this port's server externalizes only in the data path and never externalizes a header, so a
+      port talking to itself cannot produce the pointer batches its own reader must resolve. The
+      client half is this port's `RpcClient`, reached through the JSONL conformance driver. The
+      fixture names its transport explicitly rather than inferring it from the absence of flags,
+      which is the documented way that harness deadlocks once `--fake-storage` is added.
+
 Full rationale for each milestone's sequencing lives in the plan this repo was bootstrapped from;
 see `CLAUDE.md` for where cross-language wire-alignment decisions are recorded as they're made.

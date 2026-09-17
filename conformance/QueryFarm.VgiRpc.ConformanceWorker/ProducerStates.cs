@@ -9,6 +9,58 @@ using QueryFarm.VgiRpc.Wire;
 
 namespace QueryFarm.VgiRpc.ConformanceWorker;
 
+/// <summary>Output schema for <see cref="AnnotatedProducerState"/> — mirrors Python's
+/// <c>_ANNOTATED_SCHEMA</c>: one <i>nullable</i> int64 column named <c>value</c>.</summary>
+public static class AnnotatedProducerSchemas
+{
+    public static readonly Schema Output = new(
+        [new Field("value", Int64Type.Default, nullable: true)],
+        metadata: null);
+
+    /// <summary>A constant, deliberately non-ASCII: a port round-tripping metadata through a
+    /// latin-1 or C-string path fails here rather than in someone's production data.</summary>
+    public const string EmitLabel = "\u00fcn\u00efcode-\u03bb";
+}
+
+/// <summary>Emits <c>count</c> batches of <c>rowsPerBatch</c> rows, each carrying distinct
+/// per-emit custom metadata. Mirrors Python's <c>AnnotatedProducerState</c>.
+///
+/// <para><c>conformance.batch_index</c> varies per batch and the shared suite checks <i>which</i>
+/// batch carried <i>which</i> value: a constant label alone would pass against a port that caches
+/// the first turn's metadata and reuses it, which is a real failure mode once metadata is threaded
+/// through a per-stream struct rather than a per-emit one.</para></summary>
+public sealed class AnnotatedProducerState(long count, long rowsPerBatch) : ProducerState
+{
+    private long _current;
+
+    public override Task ProduceAsync(OutputCollector output, ICallContext? ctx, CancellationToken cancellationToken)
+    {
+        if (_current >= count)
+        {
+            output.Finish();
+            return Task.CompletedTask;
+        }
+
+        var baseValue = _current * 1_000_000;
+        var values = new Int64Array.Builder();
+        for (long row = 0; row < rowsPerBatch; row++)
+        {
+            values.Append(baseValue + row);
+        }
+
+        output.Emit(
+            new RecordBatch(AnnotatedProducerSchemas.Output, [values.Build()], checked((int)rowsPerBatch)),
+            new Dictionary<string, string>
+            {
+                ["conformance.batch_index"] = _current.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["conformance.batch_total"] = count.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["conformance.emit_label"] = AnnotatedProducerSchemas.EmitLabel,
+            });
+        _current++;
+        return Task.CompletedTask;
+    }
+}
+
 /// <summary>Output schema shared by every producer state below — mirrors Python's <c>_COUNTER_SCHEMA</c>.</summary>
 public static class ConformanceStreamSchemas
 {

@@ -11,6 +11,7 @@ using Microsoft.Extensions.DependencyInjection;
 using QueryFarm.VgiRpc.Client;
 using QueryFarm.VgiRpc.Client.Http;
 using QueryFarm.VgiRpc.Errors;
+using QueryFarm.VgiRpc.External;
 using QueryFarm.VgiRpc.Server;
 using QueryFarm.VgiRpc.Streaming;
 using QueryFarm.VgiRpc.Wire;
@@ -596,8 +597,8 @@ public sealed class HttpRpcClientTests
     {
         private readonly string _suffix = new('x', 700);
 
-        public Task<UploadUrl> GenerateUploadUrlAsync(
-            Schema schema, CancellationToken cancellationToken) => Task.FromResult(new UploadUrl(
+        public Task<QueryFarm.VgiRpc.External.UploadUrl> GenerateUploadUrlAsync(
+            Schema schema, CancellationToken cancellationToken) => Task.FromResult(new QueryFarm.VgiRpc.External.UploadUrl(
                 "https://upload.invalid/" + _suffix,
                 "https://download.invalid/" + _suffix,
                 DateTimeOffset.UtcNow.AddHours(1)));

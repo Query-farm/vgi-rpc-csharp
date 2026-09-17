@@ -203,6 +203,10 @@ public sealed class ConformanceServiceImpl : IConformanceService
         Task.FromResult(new RpcStream<StreamState>(
             ConformanceStreamSchemas.Counter, new LargeProducerState(rowsPerBatch, batchCount)));
 
+    public Task<RpcStream<StreamState>> ProduceAnnotatedBatchesAsync(long count, long rowsPerBatch) =>
+        Task.FromResult(new RpcStream<StreamState>(
+            AnnotatedProducerSchemas.Output, new AnnotatedProducerState(count, rowsPerBatch)));
+
     public Task<RpcStream<StreamState>> ProduceNAsync(long count) =>
         Task.FromResult(new RpcStream<StreamState>(ConformanceStreamSchemas.Counter, new CounterState(count)));
 

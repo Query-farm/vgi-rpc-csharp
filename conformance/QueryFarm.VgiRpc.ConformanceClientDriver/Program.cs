@@ -445,13 +445,26 @@ static async Task<(RpcClient? Native, HttpRpcClient? Http)> ConnectAsync(JsonObj
     var protocol = request["protocol"]?.GetValue<string>() is { Length: > 0 } named
         ? named
         : "ConformanceService";
-    var options = new RpcClientOptions { OnLog = logs.Add, Protocol = protocol };
+    // `external` is not an HTTP flag: WIRE_PROTOCOL.md §12 governs pointer batches on every
+    // transport, and the harness sets it on the byte-stream connections too. The validator is
+    // left open because a conformance run's storage is a plain-HTTP loopback fake, which the
+    // shipped HTTPS-only default correctly refuses; nothing outside this driver inherits it.
+    var external = request["external"]?.GetValue<bool>() == true
+        ? new QueryFarm.VgiRpc.External.ClientExternalConfig { UrlValidator = null }
+        : null;
+    var options = new RpcClientOptions { OnLog = logs.Add, Protocol = protocol, ExternalLocation = external };
     switch (transport)
     {
         case "stdio":
             return (RpcClient.StartSubprocess(Arguments(request), options), null);
         case "shm":
-            options = new RpcClientOptions { OnLog = logs.Add, Protocol = protocol, SharedMemorySize = request["shm_size"]?.GetValue<long>() ?? 4 * 1024 * 1024 };
+            options = new RpcClientOptions
+            {
+                OnLog = logs.Add,
+                Protocol = protocol,
+                ExternalLocation = external,
+                SharedMemorySize = request["shm_size"]?.GetValue<long>() ?? 4 * 1024 * 1024,
+            };
             return (RpcClient.StartSubprocess(Arguments(request), options), null);
         case "unix":
             return (await RpcClient.ConnectUnixAsync(request["target"]!.GetValue<string>(), options), null);
@@ -470,9 +483,7 @@ static async Task<(RpcClient? Native, HttpRpcClient? Http)> ConnectAsync(JsonObj
                 CompressionLevel = compressionLevel,
                 DefaultHeaders = headers,
                 OnLog = logs.Add,
-                ExternalLocation = request["external"]?.GetValue<bool>() == true
-                    ? new QueryFarm.VgiRpc.Http.ClientExternalConfig { UrlValidator = null }
-                    : null,
+                ExternalLocation = external,
             }));
         default:
             throw new InvalidOperationException($"unknown transport: {transport}");

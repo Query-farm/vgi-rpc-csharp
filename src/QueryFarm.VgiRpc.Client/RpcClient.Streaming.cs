@@ -205,7 +205,11 @@ public sealed partial class RpcClient
         {
             while (await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false) is { } batch)
             {
-                var level = batch.GetMetadata(MetadataKeys.LogLevel);
+                // Pointer first. The header batch is externalizable like any other
+                // (WIRE_PROTOCOL.md §1.5), and the pointer that replaces it is zero-row -- so a
+                // header reader that classified before testing would skip it and then report the
+                // header absent rather than malformed.
+                var level = IsExternalPointer(batch) ? null : batch.GetMetadata(MetadataKeys.LogLevel);
                 if (level == "EXCEPTION")
                 {
                     var exception = RpcErrorDecoder.Decode(batch);
@@ -221,7 +225,10 @@ public sealed partial class RpcClient
                 }
 
                 result?.Batch.Dispose();
-                result = batch;
+                // Resolved here, not by the caller: the header stream is a second externalization
+                // call site with its own chance to go wrong, and its sibling reader below already
+                // resolves. Two readers, one branch, was this port's defect.
+                result = await ResolveIncomingAsync(batch, cancellationToken).ConfigureAwait(false);
             }
 
             var transfer = result;
@@ -240,7 +247,7 @@ public sealed partial class RpcClient
     {
         while (await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false) is { } batch)
         {
-            var level = batch.GetMetadata(MetadataKeys.LogLevel);
+            var level = IsExternalPointer(batch) ? null : batch.GetMetadata(MetadataKeys.LogLevel);
             if (level == "EXCEPTION")
             {
                 var exception = RpcErrorDecoder.Decode(batch);

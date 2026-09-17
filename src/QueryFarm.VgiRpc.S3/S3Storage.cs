@@ -2,6 +2,7 @@ using Amazon.Runtime;
 using Amazon.S3;
 using Amazon.S3.Model;
 using Apache.Arrow;
+using QueryFarm.VgiRpc.External;
 using QueryFarm.VgiRpc.Http;
 
 namespace QueryFarm.VgiRpc.S3;

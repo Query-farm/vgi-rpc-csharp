@@ -8,6 +8,7 @@ using Apache.Arrow;
 using Apache.Arrow.Types;
 using QueryFarm.VgiRpc.Client;
 using QueryFarm.VgiRpc.Errors;
+using QueryFarm.VgiRpc.External;
 using QueryFarm.VgiRpc.Http;
 using QueryFarm.VgiRpc.Logging;
 using QueryFarm.VgiRpc.Reflection;

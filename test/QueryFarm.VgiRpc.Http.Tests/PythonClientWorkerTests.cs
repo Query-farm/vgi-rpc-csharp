@@ -6,6 +6,7 @@ using Apache.Arrow.Types;
 using QueryFarm.VgiRpc.Client;
 using QueryFarm.VgiRpc.Client.Http;
 using QueryFarm.VgiRpc.Errors;
+using QueryFarm.VgiRpc.External;
 using QueryFarm.VgiRpc.Http;
 using QueryFarm.VgiRpc.Reflection;
 using Xunit;

@@ -3,6 +3,7 @@ using Apache.Arrow;
 using Apache.Arrow.Types;
 using Microsoft.AspNetCore.Http;
 using QueryFarm.VgiRpc.Errors;
+using QueryFarm.VgiRpc.External;
 using QueryFarm.VgiRpc.Http;
 using QueryFarm.VgiRpc.Wire;
 using Xunit;
@@ -198,7 +199,20 @@ public class ExternalLocationTests
         var resolvedColumn = (Int64Array)resolvedBatch.Column(0);
         var originalColumn = (Int64Array)original.Column(0);
         Assert.Equal(originalColumn.Values.ToArray(), resolvedColumn.Values.ToArray());
-        Assert.Null(resolvedMetadata); // the uploaded stream carried no extra metadata of its own
+        // The uploaded stream carried no metadata of its own, so what comes back is exactly the
+        // two provenance keys the *reader* stamps at resolve time (WIRE_PROTOCOL.md §12,
+        // "Resolved batch metadata (added by the reader)") -- and neither of the pointer's own.
+        Assert.NotNull(resolvedMetadata);
+        Assert.Equal(
+            [MetadataKeys.LocationFetchMs, MetadataKeys.LocationSource],
+            resolvedMetadata.Keys.Order(StringComparer.Ordinal));
+        Assert.Equal(pointerMetadata[MetadataKeys.Location], resolvedMetadata[MetadataKeys.LocationSource]);
+        Assert.True(double.TryParse(
+            resolvedMetadata[MetadataKeys.LocationFetchMs],
+            System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out var fetchMs));
+        Assert.True(fetchMs >= 0);
     }
 
     [Fact]

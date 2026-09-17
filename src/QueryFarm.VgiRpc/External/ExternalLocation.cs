@@ -3,7 +3,7 @@ using Apache.Arrow;
 using QueryFarm.VgiRpc.Reflection;
 using QueryFarm.VgiRpc.Wire;
 
-namespace QueryFarm.VgiRpc.Http;
+namespace QueryFarm.VgiRpc.External;
 
 /// <summary>
 /// ExternalLocation batch support for large data batches — a port of the canonical Python repo's
@@ -12,6 +12,12 @@ namespace QueryFarm.VgiRpc.Http;
 /// zero-row pointer batch carrying a <c>vgi_rpc.location</c> metadata key. Readers resolve the
 /// pointer transparently; writers externalize batches above the threshold. See
 /// <c>docs/roadmap.md</c> M13 for what this port implements and what it deliberately doesn't yet.
+///
+/// <para><b>Not an HTTP feature.</b> WIRE_PROTOCOL.md §12 governs pointer batches on every
+/// transport, which is why this lives in the core package rather than in
+/// <c>QueryFarm.VgiRpc.Http</c>: <c>QueryFarm.VgiRpc.Client.RpcClient</c> resolves them over pipe,
+/// subprocess, Unix socket and TCP through exactly this code (see M23). Only
+/// <c>ExternalizationOptions</c>, which is HTTP-server wiring, stayed behind.</para>
 ///
 /// <para><b>Object lifecycle</b>: vgi-rpc does not delete uploaded objects. Every
 /// <see cref="IExternalStorage.UploadAsync"/>/<see cref="IUploadUrlProvider.GenerateUploadUrlAsync"/>
@@ -165,7 +171,9 @@ public static class ExternalLocation
         var url = metadata![MetadataKeys.Location];
         var expectedSha256 = metadata.GetValueOrDefault(MetadataKeys.LocationSha256);
 
+        var fetchStarted = System.Diagnostics.Stopwatch.GetTimestamp();
         var data = await ExternalFetch.FetchUrlAsync(url, config.FetchConfig, config.UrlValidator, cancellationToken).ConfigureAwait(false);
+        var fetchMs = System.Diagnostics.Stopwatch.GetElapsedTime(fetchStarted).TotalMilliseconds;
 
         if (expectedSha256 is not null)
         {
@@ -227,7 +235,7 @@ public static class ExternalLocation
             }
 
             dataBatches.Clear(); // ownership transfers to the caller
-            return (resolved.Batch, resolved.Metadata);
+            return (resolved.Batch, WithProvenance(resolved.Metadata, url, fetchMs));
         }
         finally
         {
@@ -236,6 +244,42 @@ public static class ExternalLocation
                 unclaimed.Batch.Dispose();
             }
         }
+    }
+
+    /// <summary>
+    /// Stamps the two reader-owned provenance keys onto a resolved batch's metadata:
+    /// <see cref="MetadataKeys.LocationSource"/> (the URL that was actually fetched) and
+    /// <see cref="MetadataKeys.LocationFetchMs"/> (how long the fetch took).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WIRE_PROTOCOL.md §12, <i>Resolution (reading)</i>: neither key is wire content. Both are
+    /// added by the resolving reader, and a pointer batch on the wire MUST NOT carry either — a
+    /// writer that stamps <c>location.source</c> onto the pointer propagates its own guess rather
+    /// than a URL anyone fetched, and agrees only with a reader that wrongly passes the pointer's
+    /// metadata through. See <see cref="MakePointerBatch"/>, which writes neither.
+    /// </para>
+    /// <para>
+    /// The source URL is recorded in full, not through <see cref="ExternalFetch.RedactUrl"/>:
+    /// redaction governs <i>rendering</i> a URL for a human (diagnostics, logs, exception text),
+    /// not this metadata key.
+    /// </para>
+    /// <para>
+    /// The base is the <i>inner</i> data batch's metadata, never the pointer's — everything the
+    /// writer attached to the data batch, including any continuation cursor, lives inside the
+    /// fetched object.
+    /// </para>
+    /// </remarks>
+    private static IReadOnlyDictionary<string, string> WithProvenance(
+        IReadOnlyDictionary<string, string>? resolvedMetadata, string url, double fetchMs)
+    {
+        var merged = resolvedMetadata is null
+            ? []
+            : new Dictionary<string, string>(resolvedMetadata);
+        merged[MetadataKeys.LocationSource] = url;
+        merged[MetadataKeys.LocationFetchMs] =
+            fetchMs.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+        return merged;
     }
 }
 
@@ -267,42 +311,6 @@ public interface IUploadUrlProvider
     /// for content-type or metadata hints.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     Task<UploadUrl> GenerateUploadUrlAsync(Schema schema, CancellationToken cancellationToken);
-}
-
-/// <summary>
-/// Bundles every M13 externalization knob <see cref="RpcHttpEndpoints.MapVgiRpc"/> accepts, so
-/// that call site takes one parameter instead of five. All fields are independently optional —
-/// an operator wanting only request-side pointer resolution (no response externalization, no
-/// upload-URL vending) sets just <see cref="External"/>, for example.
-/// </summary>
-public sealed class ExternalizationOptions
-{
-    /// <summary>Drives both directions of server-side externalization: uploading oversized unary
-    /// results (<see cref="ServerExternalConfig.Storage"/>) and resolving client-vended pointer
-    /// batches on incoming requests/exchange turns (<see cref="ServerExternalConfig.FetchConfig"/>/
-    /// <see cref="ServerExternalConfig.UrlValidator"/>). <see langword="null"/> disables both.</summary>
-    public ServerExternalConfig? External { get; init; }
-
-    /// <summary>Enables <c>POST {prefix}/__upload_url__/init</c> when non-null — lets a client
-    /// externalize an oversized <i>request</i> by vending it a pre-signed upload/download URL
-    /// pair to PUT to directly.</summary>
-    public IUploadUrlProvider? UploadUrlProvider { get; init; }
-
-    /// <summary>Hard cap on inbound request body size (pre-decompression, on-wire bytes) — see
-    /// <see cref="RequestCap"/>. Advertised via <c>VGI-Max-Request-Bytes</c>.</summary>
-    public long? MaxRequestBytes { get; init; }
-
-    /// <summary>Advertised via <c>VGI-Max-Upload-Bytes</c> — informational only in this port (the
-    /// upload-URL provider itself is responsible for enforcing it against what actually lands in
-    /// storage; this server never sees the uploaded bytes, since the client PUTs directly to the
-    /// vended pre-signed URL).</summary>
-    public long? MaxUploadBytes { get; init; }
-
-    /// <summary>Hard cap on the raw (pre-compression) byte count of any single externalized
-    /// upload — unlike <c>max_response_bytes</c>, this has no soft/continuation escape valve
-    /// (see <see cref="ExternalLocation.PredictExternalizeBytes"/>'s doc comment). Advertised via
-    /// <c>VGI-Max-Externalized-Response-Bytes</c>.</summary>
-    public long? MaxExternalizedResponseBytes { get; init; }
 }
 
 /// <summary>Compression settings for externalized data.</summary>
@@ -352,7 +360,7 @@ public sealed class ClientExternalConfig
 }
 
 /// <summary>zstd/gzip compression for externalized upload bytes. This is a separate code path
-/// from response wire-compression negotiation (<see cref="ContentEncoding"/>/M6-M7):
+/// from response wire-compression negotiation (<c>QueryFarm.VgiRpc.Http.ContentEncoding</c>/M6-M7):
 /// externalized objects are fetched via plain HTTP GET by whatever storage
 /// client resolves them, never through this port's own response-negotiation path.</summary>
 internal static class ExternalCompression

@@ -1,5 +1,6 @@
 using Apache.Arrow;
 using QueryFarm.VgiRpc.Errors;
+using QueryFarm.VgiRpc.External;
 using QueryFarm.VgiRpc.Logging;
 using QueryFarm.VgiRpc.Reflection;
 using QueryFarm.VgiRpc.Shm;
@@ -144,7 +145,7 @@ public sealed partial class RpcClient : IRpcClient
             while (await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false) is { } batch)
             {
                 var level = batch.GetMetadata(MetadataKeys.LogLevel);
-                if (level is null)
+                if (level is null || IsExternalPointer(batch))
                 {
                     terminal?.Batch.Dispose();
                     terminal = await ResolveIncomingAsync(batch, cancellationToken).ConfigureAwait(false);
@@ -231,6 +232,33 @@ public sealed partial class RpcClient : IRpcClient
         metadata[MetadataKeys.ShmSegmentSize] = _sharedMemory.Size.ToString(System.Globalization.CultureInfo.InvariantCulture);
     }
 
+    /// <summary>
+    /// Whether <paramref name="batch"/> is an external-storage pointer this client would resolve.
+    /// </summary>
+    /// <remarks>
+    /// Every reader below asks this <i>before</i> classifying a batch as a log or control batch,
+    /// as WIRE_PROTOCOL.md §1.5 and §12 require. A pointer is zero-row by construction, so a
+    /// reader that classifies first drops it and then reports the payload absent rather than
+    /// malformed -- the failure mode that cost four ports their stream header. This port keys its
+    /// log classification on <c>vgi_rpc.log_level</c> rather than on row count, which a pointer
+    /// never carries, so the order is belt and braces here; it is written explicitly anyway so a
+    /// later edit toward row-count classification cannot reintroduce the bug silently.
+    /// </remarks>
+    private bool IsExternalPointer(AnnotatedBatch batch) =>
+        _options.ExternalLocation is not null
+        && ExternalLocation.IsExternalLocationBatch(batch.Batch, batch.Metadata);
+
+    /// <summary>
+    /// Resolves whichever kind of pointer batch <paramref name="incoming"/> is — a shared-memory
+    /// pointer, or a <c>vgi_rpc.location</c> external-storage pointer — and returns the batch the
+    /// caller should see. Any other batch is returned untouched.
+    /// </summary>
+    /// <remarks>
+    /// Both kinds are checked here, on one path, because every reader on this transport family
+    /// funnels through it. Resolving only shm is not a narrower feature but a silent one: an
+    /// external pointer is zero-row by construction, so it reaches the caller as an empty batch
+    /// and every row of that response is simply gone, with nothing raised anywhere.
+    /// </remarks>
     private async Task<AnnotatedBatch> ResolveIncomingAsync(AnnotatedBatch incoming, CancellationToken cancellationToken)
     {
         var (batch, metadata, release) = await ShmPointerBatch.ResolveAsync(
@@ -238,14 +266,35 @@ public sealed partial class RpcClient : IRpcClient
             incoming.Metadata,
             _sharedMemory,
             cancellationToken).ConfigureAwait(false);
-        if (ReferenceEquals(batch, incoming.Batch))
+        if (!ReferenceEquals(batch, incoming.Batch))
+        {
+            incoming.Batch.Dispose();
+            release?.Invoke();
+            incoming = new AnnotatedBatch(batch, metadata);
+        }
+
+        if (_options.ExternalLocation is not { } external
+            || !ExternalLocation.IsExternalLocationBatch(incoming.Batch, incoming.Metadata))
         {
             return incoming;
         }
 
-        incoming.Batch.Dispose();
-        release?.Invoke();
-        return new AnnotatedBatch(batch, metadata);
+        try
+        {
+            var (resolved, resolvedMetadata) = await ExternalLocation.ResolveAsync(
+                incoming.Batch,
+                incoming.Metadata,
+                external,
+                cancellationToken,
+                DispatchLog).ConfigureAwait(false);
+            return new AnnotatedBatch(resolved, resolvedMetadata);
+        }
+        finally
+        {
+            // The pointer is never the batch handed back (it was one by the guard above), so it
+            // is this method's to release on every exit -- a fetch that throws included.
+            incoming.Batch.Dispose();
+        }
     }
 
     // `protocol` addresses this one call elsewhere (see CallUnaryOnAsync); null means the

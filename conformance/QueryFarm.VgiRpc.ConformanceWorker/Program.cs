@@ -13,6 +13,7 @@ using Microsoft.Extensions.Logging;
 using QueryFarm.VgiRpc.AccessLog;
 using QueryFarm.VgiRpc.Conformance;
 using QueryFarm.VgiRpc.ConformanceWorker;
+using QueryFarm.VgiRpc.External;
 using QueryFarm.VgiRpc.Http;
 using QueryFarm.VgiRpc.Server;
 using QueryFarm.VgiRpc.Transport;

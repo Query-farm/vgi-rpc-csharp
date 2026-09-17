@@ -1,3 +1,4 @@
+using QueryFarm.VgiRpc.External;
 using QueryFarm.VgiRpc.Logging;
 
 namespace QueryFarm.VgiRpc.Client;
@@ -32,4 +33,24 @@ public sealed class RpcClientOptions
 
     /// <summary>Creates and negotiates a per-connection shared-memory segment of this size.</summary>
     public long? SharedMemorySize { get; init; }
+
+    /// <summary>
+    /// Resolves <c>vgi_rpc.location</c> external-storage pointer batches in responses. Leave
+    /// <see langword="null"/> and a pointer is handed to the caller unresolved.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Externalization is not an HTTP feature (WIRE_PROTOCOL.md §12): any transport that carries
+    /// record batches carries pointer batches, and this client reads them on pipe, subprocess,
+    /// Unix socket and TCP alike. A pointer is zero-row by construction, so an unresolved one
+    /// reaches the caller as an empty batch — every row of an externalized response silently
+    /// missing, with no error anywhere. That is why this is worth setting whenever the peer is
+    /// configured to externalize.
+    /// </para>
+    /// <para>
+    /// It governs the *response* direction only. This client never externalizes what it sends;
+    /// a request that outgrows the peer's limits is refused, not uploaded.
+    /// </para>
+    /// </remarks>
+    public ClientExternalConfig? ExternalLocation { get; init; }
 }

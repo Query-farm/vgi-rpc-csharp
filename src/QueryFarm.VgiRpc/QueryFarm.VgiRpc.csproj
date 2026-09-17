@@ -13,6 +13,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Externalized objects may be stored zstd/gzip-compressed (WIRE_PROTOCOL.md §12). That is
+         a storage-object encoding, not an HTTP transport concern, so the codec belongs wherever
+         External/ does, and External/ is here because every transport carries pointer batches,
+         not just HTTP. -->
+    <PackageReference Include="ZstdSharp.Port" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
     <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
   </ItemGroup>

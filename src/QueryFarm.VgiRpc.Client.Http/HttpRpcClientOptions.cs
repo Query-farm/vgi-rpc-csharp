@@ -1,4 +1,5 @@
 using System.Security.Cryptography.X509Certificates;
+using QueryFarm.VgiRpc.External;
 using QueryFarm.VgiRpc.Http;
 using QueryFarm.VgiRpc.Logging;
 

@@ -1,6 +1,7 @@
 using Apache.Arrow;
 using Google.Apis.Auth.OAuth2;
 using Google.Cloud.Storage.V1;
+using QueryFarm.VgiRpc.External;
 using QueryFarm.VgiRpc.Http;
 using GcsObject = Google.Apis.Storage.v1.Data.Object;
 
