@@ -97,6 +97,37 @@ public sealed class FailOnExchangeNState(long failOn) : ExchangeState
     }
 }
 
+/// <summary>Output schema for <c>exchange_input_metadata</c>: <c>{seen: utf8, keys: utf8}</c>,
+/// both nullable, as Python's <c>_INPUT_METADATA_OUTPUT_SCHEMA</c>.</summary>
+public static class InputMetadataSchemas
+{
+    public static readonly Schema Output = new(
+        [new Field("seen", StringType.Default, nullable: true), new Field("keys", StringType.Default, nullable: true)],
+        metadata: null);
+}
+
+/// <summary>
+/// Reports, per input, the custom metadata <see cref="ExchangeAsync"/> was handed: <c>seen</c> is
+/// the value of <c>vgi.conformance.input</c> (empty when absent) and <c>keys</c> every key present,
+/// sorted and comma-joined (empty when there is no metadata). The pair lets the suite check both
+/// halves of the rule -- the input's own metadata arrives, the HTTP cursor and call token do not.
+/// Mirrors Python's <c>InputMetadataExchangeState</c>.
+/// </summary>
+public sealed class InputMetadataExchangeState : ExchangeState
+{
+    private const string InputMetadataKey = "vgi.conformance.input";
+
+    public override Task ExchangeAsync(AnnotatedBatch input, OutputCollector output, ICallContext? ctx, CancellationToken cancellationToken)
+    {
+        var seen = input.GetMetadata(InputMetadataKey) ?? "";
+        var keys = input.Metadata is null
+            ? ""
+            : string.Join(",", input.Metadata.Keys.Order(StringComparer.Ordinal));
+        output.Emit(ValueCodec.BuildRow(InputMetadataSchemas.Output, [seen, keys]));
+        return Task.CompletedTask;
+    }
+}
+
 /// <summary>Echoes a zero-column batch back unchanged. Mirrors <c>ZeroColumnExchangeState</c>.</summary>
 /// <remarks>
 /// Both schemas have no fields, which is a legal Arrow schema and a shape the framing has to

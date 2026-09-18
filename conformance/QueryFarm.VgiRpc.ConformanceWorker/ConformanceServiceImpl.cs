@@ -199,6 +199,10 @@ public sealed class ConformanceServiceImpl : IConformanceService
             new RpcStream<StreamState>(empty, new ZeroColumnExchangeState(), InputSchema: empty));
     }
 
+    public Task<RpcStream<StreamState>> ExchangeInputMetadataAsync() =>
+        Task.FromResult(new RpcStream<StreamState>(
+            InputMetadataSchemas.Output, new InputMetadataExchangeState(), InputSchema: ExchangeSchemas.Scale));
+
     public Task<RpcStream<StreamState>> ProduceLargeBatchesAsync(long rowsPerBatch, long batchCount) =>
         Task.FromResult(new RpcStream<StreamState>(
             ConformanceStreamSchemas.Counter, new LargeProducerState(rowsPerBatch, batchCount)));

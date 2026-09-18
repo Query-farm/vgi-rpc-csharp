@@ -273,6 +273,10 @@ public interface IConformanceService
     [StreamKind(StreamKind.Exchange)]
     Task<RpcStream<StreamState>> ExchangeZeroColumnsAsync();
 
+    /// <summary>Report the custom metadata each exchange input batch was handed with.</summary>
+    [StreamKind(StreamKind.Exchange)]
+    Task<RpcStream<StreamState>> ExchangeInputMetadataAsync();
+
     /// <summary>Produces <c>batchCount</c> batches of <c>rowsPerBatch</c> rows each.</summary>
     [StreamKind(StreamKind.Producer)]
     Task<RpcStream<StreamState>> ProduceLargeBatchesAsync(long rowsPerBatch, long batchCount);

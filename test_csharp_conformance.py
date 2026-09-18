@@ -67,6 +67,7 @@ IMPLEMENTED_FILTER = ",".join(
         "exchange_stream.error_first",
         "exchange_stream.error_nth",
         "exchange_stream.empty_session",
+        "exchange_stream.input_metadata",
         "error_recovery.*",
         "cancel.*",
         "producer_header.*",
@@ -794,7 +795,7 @@ _ACCESS_LOG_FILTER = "scalar_echo.*,dataclass.echo_point,producer_stream.*,excha
 # reference pins the same value in tests/golden/protocol_hash_vector.json). Pinned literally
 # rather than recomputed from the worker, because recomputing it here would just re-derive
 # whatever this port happens to do and assert that it equals itself.
-_CONFORMANCE_PROTOCOL_HASH = "7713e810a0523bddfed4caa692dd218f4cbb09a773d0d94401a90d70ac3b6e54"
+_CONFORMANCE_PROTOCOL_HASH = "4b0269208a5a8fdeb7d8fe0f62a352713a3bfc071d7de99e5e12408c5f0b9402"
 
 
 @pytest.mark.parametrize("debug", [False, True], ids=["info", "debug"])
