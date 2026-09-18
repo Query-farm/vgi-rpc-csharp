@@ -27,10 +27,12 @@ namespace QueryFarm.VgiRpc.Http;
 ///
 /// <para>
 /// <b>RPC paths are namespaced by protocol; reserved framework endpoints are not.</b>
-/// <c>{prefix}/health</c>, <c>{prefix}/__session__</c>, <c>{prefix}/__introspect_token__</c> and
-/// <c>{prefix}/__upload_url__/init</c> belong to the server rather than to any one protocol, so
-/// they stay flat. Introspection is not a special path either way — it is
-/// <c>{prefix}/vgi_rpc.Reflection.v1/list_protocols</c>, reached the same way as anything else.
+/// <c>{prefix}/health</c>, <c>{prefix}/__session__</c> and <c>{prefix}/__upload_url__/init</c>
+/// belong to the server rather than to any one protocol, so they stay flat. Neither reflection
+/// nor token introspection is a special path — they are
+/// <c>{prefix}/vgi_rpc.Reflection.v1/list_protocols</c> and
+/// <c>{prefix}/vgi_rpc.Identity.v1/introspect_token</c>, reached the same way as anything else.
+/// The pre-0.46 <c>{prefix}/__introspect_token__</c> JSON route is retired and not served.
 /// </para>
 ///
 /// <para>
@@ -127,18 +129,6 @@ public static class RpcHttpEndpoints
     /// operator-declared rather than derived: <paramref name="authenticate"/> is an opaque
     /// callback (possibly composed via <see cref="ProxyProof.RequireAll"/>), so `MapVgiRpc` has
     /// no way to introspect whether it enforces proxy proof or in which mode.</param>
-    /// <param name="introspectResolver">Enables <c>POST {prefix}/__introspect_token__</c> when
-    /// non-null (see <see cref="TokenIntrospection"/>) — resolves an opaque bearer credential to
-    /// a principal for a fronting proxy. The route is always mounted regardless (the porting
-    /// guide requires a definitive answer from every worker, enabled or not); a
-    /// <see langword="null"/> resolver just makes it always answer <c>404 not_enabled</c>.</param>
-    /// <param name="introspectPrincipals">Principals permitted to introspect — required whenever
-    /// <paramref name="introspectResolver"/> is set, with no permissive default (see
-    /// <see cref="TokenIntrospection.NormalizePrincipals"/>). The caller must also pass through
-    /// <paramref name="authenticate"/> and resolve an <see cref="AuthIdentity"/> to be considered
-    /// at all — introspection layers an allowlist on top of, never instead of, normal auth.</param>
-    /// <param name="introspectRateLimitPerSecond">Introspection requests allowed per caller per
-    /// second — matches Python's default of 20.</param>
     /// <param name="externalization">Enables external-storage pointer batches (see
     /// <see cref="ExternalLocation"/> and <c>docs/roadmap.md</c> M13) when non-null:
     /// server-response externalization above <see cref="ServerExternalConfig.ExternalizeThresholdBytes"/>,
@@ -150,7 +140,7 @@ public static class RpcHttpEndpoints
     /// <param name="hostingMaxRequestBytes">Provider-neutral hosting request ceiling; null means unset.</param>
     /// <param name="hostingMaxResponseBytes">Provider-neutral hosting response ceiling; null means unset.</param>
     /// <param name="preferredResponseBytes">Advisory batching target, clamped to the effective hard limit.</param>
-    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null, long? maxResponseBytes = null, AuthenticateDelegate? authenticate = null, string? proxyHint = null, string? corsPolicyName = null, StickySessionRegistry? sticky = null, bool proxyProofRequired = false, TokenIntrospection.TokenResolver? introspectResolver = null, IReadOnlySet<string>? introspectPrincipals = null, int introspectRateLimitPerSecond = 20, ExternalizationOptions? externalization = null, long? hostingMaxRequestBytes = null, long? hostingMaxResponseBytes = null, long? preferredResponseBytes = null)
+    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null, long? maxResponseBytes = null, AuthenticateDelegate? authenticate = null, string? proxyHint = null, string? corsPolicyName = null, StickySessionRegistry? sticky = null, bool proxyProofRequired = false, ExternalizationOptions? externalization = null, long? hostingMaxRequestBytes = null, long? hostingMaxResponseBytes = null, long? preferredResponseBytes = null)
     {
         ValidateResponseBudget(maxResponseBytes, nameof(maxResponseBytes));
         ValidateResponseBudget(hostingMaxResponseBytes, nameof(hostingMaxResponseBytes));
@@ -159,17 +149,20 @@ public static class RpcHttpEndpoints
         var effectiveMaxRequestBytes = MinLimit(externalization?.MaxRequestBytes, hostingMaxRequestBytes);
         tokenKey ??= RandomNumberGenerator.GetBytes(32);
         var registry = new StreamCallRegistry();
-        var introspectEnabled = introspectResolver is not null;
         void Stamp(HttpContext context) => ApplyResponseBudgetCapabilities(
             context.Response, effectiveMaxRequestBytes, effectiveMaxResponseBytes);
         var health = endpoints.MapMethods($"{prefix}/health", ["GET", "HEAD"], (HttpContext context) => { Stamp(context); return HandleHealthAsync(server, context, proxyProofRequired); });
-        var capabilities = endpoints.MapMethods($"{prefix}/health", ["OPTIONS"], (HttpContext context) => { Stamp(context); return HandleCapabilitiesAsync(server, context, effectiveMaxResponseBytes, sticky, proxyProofRequired, introspectEnabled, externalization, effectiveMaxRequestBytes, authenticate, proxyHint); });
+        var capabilities = endpoints.MapMethods($"{prefix}/health", ["OPTIONS"], (HttpContext context) => { Stamp(context); return HandleCapabilitiesAsync(server, context, effectiveMaxResponseBytes, sticky, proxyProofRequired, externalization, effectiveMaxRequestBytes, authenticate, proxyHint); });
         // RPC paths are namespaced by protocol: {prefix}/{protocol}/{method}[/init|/exchange].
         // The reserved framework endpoints above and below are deliberately NOT namespaced —
         // they belong to the server rather than to any one protocol (WIRE_PROTOCOL.md §10).
         // ASP.NET matches literal segments ahead of parameterised ones, so `/health`,
-        // `/__session__`, `/__introspect_token__` and `/__upload_url__/init` keep winning over
-        // these routes rather than being swallowed as a {protocol} named "__upload_url__".
+        // `/__session__` and `/__upload_url__/init` keep winning over these routes rather than
+        // being swallowed as a {protocol} named "__upload_url__".
+        //
+        // There is deliberately no `/__introspect_token__`: that pre-0.46 JSON route is retired
+        // (IDENTITY_V1_SPEC §8). Introspection is the vgi_rpc.Identity.v1 protocol, hosted by the
+        // RpcServer like any other and reached through the routes below.
         var prefixSegments = PathSegmentCount(prefix);
         var unary = endpoints.MapPost($"{prefix}/{{protocol}}/{{method}}", (string protocol, string method, HttpContext context) => { Stamp(context); return HandleUnaryAsync(server, protocol, method, prefixSegments, context, compressionLevel, effectiveMaxResponseBytes, authenticate, proxyHint, sticky, tokenKey, externalization, effectiveMaxRequestBytes, preferredResponseBytes); });
         var init = endpoints.MapPost($"{prefix}/{{protocol}}/{{method}}/init", (string protocol, string method, HttpContext context) => { Stamp(context); return HandleStreamInitAsync(server, protocol, method, prefixSegments, context, compressionLevel, tokenKey, registry, effectiveMaxResponseBytes, authenticate, proxyHint, sticky, externalization, effectiveMaxRequestBytes, preferredResponseBytes); });
@@ -190,16 +183,6 @@ public static class RpcHttpEndpoints
             {
                 session.RequireCors(corsPolicyName);
             }
-        }
-
-        // Always mounted — see introspectResolver's doc comment. Only constructed once, outside
-        // the per-request handler, since NormalizePrincipals/the rate limiter are per-worker state.
-        var normalizedPrincipals = introspectEnabled ? TokenIntrospection.NormalizePrincipals(introspectPrincipals) : null;
-        var rateLimiter = introspectEnabled ? new IntrospectionRateLimiter(introspectRateLimitPerSecond) : null;
-        var introspect = endpoints.MapPost($"{prefix}{TokenIntrospection.IntrospectEndpoint}", (HttpContext context) => { Stamp(context); return HandleIntrospectAsync(context, authenticate, proxyHint, introspectResolver, normalizedPrincipals, rateLimiter); });
-        if (corsPolicyName is not null)
-        {
-            introspect.RequireCors(corsPolicyName);
         }
 
         if (externalization?.UploadUrlProvider is not null)
@@ -365,27 +348,6 @@ public static class RpcHttpEndpoints
         context.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
         context.Response.ContentType = "text/plain";
         await context.Response.WriteAsync(exc.Message, cancellationToken).ConfigureAwait(false);
-    }
-
-    /// <summary><c>POST {prefix}/__introspect_token__</c> — runs the worker's own
-    /// <paramref name="authenticate"/> gate first (introspection is layered on top of normal
-    /// auth, never a bypass of it), then delegates to <see cref="TokenIntrospection.HandleAsync"/>
-    /// when a resolver is configured, or <see cref="TokenIntrospection.HandleDisabledAsync"/>
-    /// otherwise.</summary>
-    private static async Task HandleIntrospectAsync(HttpContext context, AuthenticateDelegate? authenticate, string? proxyHint, TokenIntrospection.TokenResolver? resolver, IReadOnlySet<string>? principals, IntrospectionRateLimiter? limiter)
-    {
-        if (resolver is null)
-        {
-            await TokenIntrospection.HandleDisabledAsync(context).ConfigureAwait(false);
-            return;
-        }
-
-        if (await TryRejectUnauthenticatedAsync(context, authenticate, proxyHint).ConfigureAwait(false))
-        {
-            return;
-        }
-
-        await TokenIntrospection.HandleAsync(context, resolver, principals!, limiter!).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -747,7 +709,7 @@ public static class RpcHttpEndpoints
     /// </summary>
     private static async Task HandleCapabilitiesAsync(RpcServer server, HttpContext context,
         long? maxResponseBytes, StickySessionRegistry? sticky, bool proxyProofRequired,
-        bool introspectEnabled, ExternalizationOptions? externalization, long? maxRequestBytes,
+        ExternalizationOptions? externalization, long? maxRequestBytes,
         AuthenticateDelegate? authenticate, string? proxyHint)
     {
         if (await TryRejectUnauthenticatedAsync(context, authenticate, proxyHint).ConfigureAwait(false))
@@ -805,13 +767,6 @@ public static class RpcHttpEndpoints
             // docs/proxy-proof-spec.md §2.2 — require mode only, never emitted as "false" in
             // off/allow (writers MUST emit it only in require mode).
             headers[ProxyProof.ProofRequiredHeader] = "true";
-        }
-
-        if (introspectEnabled)
-        {
-            // Porting guide "HTTP token introspection" §7 — absent (never "false") when disabled,
-            // so a proxy preflights at boot rather than discovering at first login.
-            headers[TokenIntrospection.IntrospectEnabledHeader] = "true";
         }
 
         context.Response.StatusCode = StatusCodes.Status200OK;

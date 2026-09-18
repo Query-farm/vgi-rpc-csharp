@@ -280,16 +280,6 @@ def proof_worker_factory(worker_binary: Path):
     yield spawn
 
 
-# M12 (see docs/roadmap.md): token introspection. Same import-the-canonical-suite pattern as
-# M10/M11. TestTokenIntrospection needs one worker with the fixed constants
-# vgi_rpc.conformance._pytest_suite requires; TestTokenIntrospectionOffMode reuses
-# conformance_http_port (the M10 sticky fixture, no introspect resolver configured).
-@pytest.fixture
-def conformance_http_introspect_port(worker_binary: Path) -> Iterator[int]:
-    """A worker with token introspection enabled — for TestTokenIntrospection."""
-    yield from _spawn_http_worker_port(worker_binary, "--introspect")
-
-
 # The two fixtures the canonical vgi_rpc.Identity.v1 group is gated on. Same binary, different
 # --identity value; both HTTP, because Identity's guards all read an authenticated caller and HTTP
 # is the transport that carries one. See IDENTITY_CONFORMANCE_FIXTURE.md for the pinned policy --
@@ -1266,34 +1256,6 @@ from vgi_rpc.conformance._pytest_suite import TestSticky  # noqa: E402,F401
 # (the M10 sticky fixture) — a sticky-enabled worker with no proxy-proof gate configured still
 # satisfies "unconfigured worker accepts without a proof", which is exactly the property under test.
 from vgi_rpc.conformance._pytest_suite import TestProxyProof, TestProxyProofOffMode  # noqa: E402,F401
-
-# M12: the canonical TestTokenIntrospection (+ TestTokenIntrospectionOffMode) groups, collected
-# against conformance_http_introspect_port (above) and conformance_http_port (M10's sticky
-# fixture) respectively.
-#
-# Conditional because the reference deleted this group: introspection moved off the
-# POST {prefix}/__introspect_token__ HTTP JSON route and became the vgi_rpc.Identity.v1
-# protocol, reachable on every transport instead of one. This port still implements the HTTP
-# route, so the groups exist upstream only for as long as it has not migrated -- and the day it
-# does, these imports are what has to go, not something to restore.
-#
-# Guarded rather than deleted, and surfaced as a skip rather than swallowed: an import that
-# quietly stops collecting two groups looks exactly like two groups that pass. The skip reason
-# is the migration's name, so a run says what is missing and why.
-try:
-    from vgi_rpc.conformance._pytest_suite import (  # noqa: E402,F401
-        TestTokenIntrospection,
-        TestTokenIntrospectionOffMode,
-    )
-except ImportError:
-
-    @pytest.mark.skip(
-        reason="reference retired TestTokenIntrospection: introspection is now the "
-        "vgi_rpc.Identity.v1 protocol, not an HTTP JSON route. This port still serves "
-        "POST /__introspect_token__ and has not migrated."
-    )
-    def test_token_introspection_conformance_group_is_gone_upstream() -> None:
-        """Placeholder so the retired group shows up as a named skip, not as silence."""
 
 # The canonical TestRequestId group, collected against conformance_http_port (M10's fixture)
 # and conformance_http_access_log (above). Imported late, because until the access-log fixture

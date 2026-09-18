@@ -11,9 +11,10 @@ namespace QueryFarm.VgiRpc.Identity;
 /// Identity lives at the RPC layer rather than in any application protocol: a bearer token is
 /// not an application concept, the auth primitives it builds on (<see cref="AuthContext"/>, the
 /// peer-identity chain) are already here, and implementing it once is the whole point. It was
-/// previously an HTTP JSON route, <c>POST {prefix}/__introspect_token__</c> (still present in
-/// this port as <c>QueryFarm.VgiRpc.Http.TokenIntrospection</c>), which meant it existed only on
-/// one transport and had to be hand-written in every port.
+/// previously an HTTP JSON route, <c>POST {prefix}/__introspect_token__</c>, which meant it
+/// existed only on one transport and had to be hand-written in every port. That route is retired
+/// (IDENTITY_V1_SPEC §8) and this port no longer serves it: this protocol is the only
+/// introspection surface, and a client learns whether a worker introspects from reflection.
 /// </para>
 /// <para>
 /// Two methods share one module's guards, and they are guarded <em>differently</em> on purpose.

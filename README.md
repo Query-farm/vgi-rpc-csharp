@@ -259,7 +259,10 @@ subject for the existing peer-authentication policies. See
 requirements.
 
 The HTTP package also includes CORS handling, request and response size limits, zstd content
-encoding, sticky sessions, token introspection, and proxy-proof validation.
+encoding, sticky sessions, and proxy-proof validation. Token introspection is not an HTTP route:
+it is the `vgi_rpc.Identity.v1` protocol (`QueryFarm.VgiRpc.Identity.IdentityImpl`, passed to
+`RpcServer` as `identity:`), reachable over every transport and gated by an introspector
+allowlist rather than a rate limit.
 
 The separate `QueryFarm.VgiRpc.Client.OAuth` package performs OIDC discovery, Authorization Code
 with PKCE (including constant-time state validation), Device Authorization polling, token refresh,

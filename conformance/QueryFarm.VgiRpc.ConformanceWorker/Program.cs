@@ -145,14 +145,12 @@ if (options.Http)
         // whole freshness section to a worker that refuses every mint.
         authenticate = ConformanceIdentity.Authenticate;
     }
-    else if (options.StickyAuth || options.Introspect)
+    else if (options.StickyAuth)
     {
         // Maps X-Conformance-Principal to an AuthIdentity — absent header stays anonymous (never
         // rejected, so unauthenticated probes like GET /health keep working), matching the
         // canonical Python repo's tests/serve_conformance_http.py::_principal_from_header
-        // exactly. Backs TestSticky::test_cross_principal_replay_rejected (spec §9.1) and (shared
-        // with --introspect, since token introspection's caller identity is resolved the exact
-        // same way) TestTokenIntrospection's caller-authorization checks (docs/roadmap.md M12).
+        // exactly. Backs TestSticky::test_cross_principal_replay_rejected (spec §9.1).
         authenticate = context =>
         {
             var principal = context.Request.Headers["X-Conformance-Principal"].ToString();
@@ -208,26 +206,6 @@ if (options.Http)
             echoHeaders: echoHeaders);
     }
 
-    // Fixed constants docs/porting-guide.md's "HTTP token introspection" section and the
-    // canonical TestTokenIntrospection conformance group require exactly (see
-    // vgi_rpc.conformance._pytest_suite's _INTROSPECTOR/_SUBJECT_TOKEN/_SUBJECT_PRINCIPAL/
-    // _UNAVAILABLE_TOKEN — the JWS trap token needs no entry here at all: the shape guard in
-    // TokenIntrospection.HandleAsync rejects it before ever reaching this resolver, and the
-    // conformance suite's own trap token is deliberately *not* pre-registered — resolving it
-    // would be the bug the test exists to catch).
-    TokenIntrospection.TokenResolver? introspectResolver = null;
-    IReadOnlySet<string>? introspectPrincipals = null;
-    if (options.Introspect)
-    {
-        introspectResolver = token => Task.FromResult(token switch
-        {
-            "conformance-opaque-subject-token" => new TokenIdentity("subject@conformance.example"),
-            "conformance-unavailable-token" => throw new AuthUnavailableException(),
-            _ => (TokenIdentity?)null,
-        });
-        introspectPrincipals = new HashSet<string> { "conformance-introspector" };
-    }
-
     // External storage (M13) — a --fake-storage URL wires both directions: server-response
     // externalization (ServerExternalConfig.Storage) and client-vended upload URLs
     // (ExternalizationOptions.UploadUrlProvider), so the OPTIONS capabilities response advertises
@@ -269,7 +247,7 @@ if (options.Http)
         externalization = new ExternalizationOptions { MaxRequestBytes = maxRequestBytesOnly };
     }
 
-    app.MapVgiRpc(server, maxResponseBytes: options.MaxResponseBytes ?? 65536, authenticate: authenticate, proxyHint: options.ConformanceProxyHint, corsPolicyName: corsEnabled ? CorsPolicyName : null, tokenKey: tokenKey, sticky: sticky, proxyProofRequired: proxyProofRequired, introspectResolver: introspectResolver, introspectPrincipals: introspectPrincipals, externalization: externalization);
+    app.MapVgiRpc(server, maxResponseBytes: options.MaxResponseBytes ?? 65536, authenticate: authenticate, proxyHint: options.ConformanceProxyHint, corsPolicyName: corsEnabled ? CorsPolicyName : null, tokenKey: tokenKey, sticky: sticky, proxyProofRequired: proxyProofRequired, externalization: externalization);
 
     // Test-only admin endpoint — NOT part of MapVgiRpc's real surface. Lets
     // TestSticky::test_drain_rejects_new_opens flip the drain flag over the wire instead of
@@ -368,7 +346,6 @@ internal sealed class CliOptions
     public string? ProofSecrets { get; private init; }
     public int ProofSkewSeconds { get; private init; } = 30;
     public bool ProofNoReplayCache { get; private init; }
-    public bool Introspect { get; private init; }
     public string Identity { get; private init; } = "off";
     public string? FakeStorageUrl { get; private init; }
     public long ExternalizeThresholdBytes { get; private init; } = 4096;
@@ -402,7 +379,6 @@ internal sealed class CliOptions
         string? proofSecrets = null;
         var proofSkewSeconds = 30;
         var proofNoReplayCache = false;
-        var introspect = false;
         var identity = "off";
         string? fakeStorageUrl = null;
         var externalizeThresholdBytes = 4096L;
@@ -508,14 +484,6 @@ internal sealed class CliOptions
                 case "--proof-no-replay-cache":
                     proofNoReplayCache = true;
                     break;
-                case "--introspect":
-                    // Enables POST {prefix}/__introspect_token__ with the fixed constants
-                    // docs/porting-guide.md's "HTTP token introspection" section and
-                    // vgi_rpc.conformance._pytest_suite's TestTokenIntrospection group require —
-                    // see docs/roadmap.md M12. Caller identity comes from the same
-                    // X-Conformance-Principal convention --sticky-auth already uses.
-                    introspect = true;
-                    break;
                 case "--identity":
                     // off|both|introspect-only -- the two fixture workers
                     // IDENTITY_CONFORMANCE_FIXTURE.md §1 requires are the same binary with a
@@ -606,7 +574,6 @@ internal sealed class CliOptions
             ProofSecrets = proofSecrets,
             ProofSkewSeconds = proofSkewSeconds,
             ProofNoReplayCache = proofNoReplayCache,
-            Introspect = introspect,
             Identity = identity,
             FakeStorageUrl = fakeStorageUrl,
             ExternalizeThresholdBytes = externalizeThresholdBytes,

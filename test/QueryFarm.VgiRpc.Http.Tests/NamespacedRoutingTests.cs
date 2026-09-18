@@ -164,10 +164,7 @@ public sealed class NamespacedRoutingTests
             IdentityProtocol.IntrospectTokenMethod, StringRow("token", "good"),
             cancellationToken: TestContext.Current.CancellationToken);
         using var batch = response.Batch;
-        // Fully qualified: the enclosing QueryFarm.VgiRpc.Http namespace has a same-named type of
-        // its own (the legacy JSON introspection route's), which wins the simple-name lookup.
-        var identity = (QueryFarm.VgiRpc.Identity.TokenIdentity)ValueCodec.ExtractRow(
-            batch, [typeof(QueryFarm.VgiRpc.Identity.TokenIdentity)])[0]!;
+        var identity = (TokenIdentity)ValueCodec.ExtractRow(batch, [typeof(TokenIdentity)])[0]!;
 
         Assert.Equal("bob", identity.Principal);
     }
@@ -372,10 +369,56 @@ public sealed class NamespacedRoutingTests
         Assert.Equal(HttpStatusCode.OK, options.StatusCode);
     }
 
+    /// <summary>
+    /// The pre-0.46 <c>POST {prefix}/__introspect_token__</c> JSON route is retired
+    /// (IDENTITY_V1_SPEC §8), even on a worker that does introspect.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Two introspection surfaces means two sets of guards to keep identical, and the second had
+    /// already drifted: it kept a rate limiter after the protocol dropped one. So the route is not
+    /// merely disabled — the old "always mounted, answers <c>404 not_enabled</c>" shape is gone
+    /// too. The request below is answered exactly as a path that was never routed is, which is
+    /// what goes red if any of it is restored; and the capability header that advertised the
+    /// route is not emitted (a client learns whether a worker introspects from reflection).
+    /// </para>
+    /// <para>
+    /// The caller is an allowlisted introspector presenting a credential the worker resolves, so
+    /// a route that still worked would have answered with the principal.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task TheRetiredIntrospectionRouteIsNotServed()
+    {
+        await using var host = await StartHostAsync(
+            identity: FullIdentity(),
+            authenticate: RecentlyAuthenticated("proxy", DateTimeOffset.UtcNow.ToUnixTimeSeconds()));
+        using var http = new System.Net.Http.HttpClient { BaseAddress = host.Address };
+
+        async Task<(HttpStatusCode Status, string Body)> PostJsonAsync(string path)
+        {
+            using var content = new StringContent("{\"token\":\"good\"}", System.Text.Encoding.UTF8, "application/json");
+            using var response = await http.PostAsync(path, content, TestContext.Current.CancellationToken);
+            return (response.StatusCode, await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken));
+        }
+
+        var retired = await PostJsonAsync("/__introspect_token__");
+        var neverRouted = await PostJsonAsync("/__no_such_route__");
+
+        Assert.Equal(HttpStatusCode.NotFound, retired.Status);
+        Assert.Equal(neverRouted, retired);
+        Assert.DoesNotContain("bob", retired.Body, StringComparison.Ordinal);
+
+        using var options = await http.SendAsync(
+            new HttpRequestMessage(HttpMethod.Options, "/health"), TestContext.Current.CancellationToken);
+        Assert.Equal(HttpStatusCode.OK, options.StatusCode);
+        Assert.False(options.Headers.Contains("VGI-Token-Introspection"));
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private static IdentityImpl FullIdentity() => new(
-        resolveToken: token => token == "good" ? new QueryFarm.VgiRpc.Identity.TokenIdentity("bob", "ci-key") : null,
+        resolveToken: token => token == "good" ? new TokenIdentity("bob", "ci-key") : null,
         mintGrant: (principal, purpose, scopes, ttl) => new IssuedGrant(
             $"grant-for-{principal}", DateTimeOffset.UtcNow.ToUnixTimeSeconds() + ttl, "g1"),
         introspectPrincipals: ["proxy"]);

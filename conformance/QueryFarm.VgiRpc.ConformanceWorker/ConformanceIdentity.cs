@@ -3,12 +3,6 @@ using QueryFarm.VgiRpc.Http;
 using QueryFarm.VgiRpc.Identity;
 using QueryFarm.VgiRpc.Server;
 
-// This worker still serves the retired POST /__introspect_token__ JSON route (--introspect), whose
-// own payload type is also called TokenIdentity. Alias rather than drop a using: the protocol's
-// type is the one this file means everywhere, and leaving the name ambiguous would let a future
-// edit silently resolve to the route's.
-using TokenIdentity = QueryFarm.VgiRpc.Identity.TokenIdentity;
-
 namespace QueryFarm.VgiRpc.ConformanceWorker;
 
 /// <summary>

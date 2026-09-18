@@ -9,8 +9,8 @@ namespace QueryFarm.VgiRpc.Identity;
 /// <remarks>
 /// <para>
 /// Each one carries a stable <see cref="RpcException.ErrorKind"/>, and that is load bearing
-/// rather than decorative. These used to be a bespoke HTTP JSON route (this port still has it:
-/// <c>QueryFarm.VgiRpc.Http.TokenIntrospection</c>) whose callers classified
+/// rather than decorative. These used to be a bespoke HTTP JSON route (the retired
+/// <c>POST {prefix}/__introspect_token__</c>) whose callers classified
 /// definitive-vs-transient on the HTTP status -- 404 meant "that credential is unknown", 503
 /// meant "I could not find out". As protocol methods every handler exception surfaces the same
 /// way, so <c>error_kind</c> is now the <em>only</em> signal a caller has. A caller that

@@ -529,7 +529,14 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       configured user authenticator" composition is implemented and documented
       (`ProxyProof.RequireAll`) but not exercised by a dedicated conformance fixture today (the
       imported `TestProxyProof` suite doesn't currently test that combination against any port).
-- [x] **M12 — Token introspection.** Full port of `vgi_rpc.http.server._introspect` —
+- [x] **M12 — Token introspection.** *(Retired 2026-09-18: the `__introspect_token__` route, its
+      handler, `TokenIntrospection`/`TokenIdentity`/`AuthUnavailableException`/
+      `IntrospectionRateLimiter`, the `VGI-Token-Introspection` capability header, the
+      `MapVgiRpc` `introspect*` options and the conformance worker's `--introspect` flag are all
+      deleted, per IDENTITY_V1_SPEC §8. Introspection is the `vgi_rpc.Identity.v1` protocol only
+      — `IdentityImpl` — and is no longer rate limited (spec §4): the per-caller limit was one
+      budget for every user behind the asker. The entry below is kept as history.)*
+      Full port of `vgi_rpc.http.server._introspect` —
       `QueryFarm.VgiRpc.Http.TokenIntrospection`/`TokenIdentity`/`AuthUnavailableException`/
       `IntrospectionRateLimiter`. `POST {prefix}/__introspect_token__` resolves an opaque bearer
       credential to a principal, for a reverse proxy that terminates the only public listener and

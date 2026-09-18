@@ -35,7 +35,7 @@ public static class Cors
     /// to read cross-origin. Matches Python's conditional-append pattern in <c>_factory.py</c>
     /// exactly (a header is exposed if and only if the corresponding feature is actually
     /// configured), narrowed to what this port currently implements — extend this list as later
-    /// milestones (sticky sessions, proxy proof, token introspection) add their own headers.
+    /// milestones (sticky sessions, proxy proof) add their own headers.
     /// </summary>
     public static string[] ExposedHeaders(long? maxResponseBytes = null, string? proxyHint = null)
     {
