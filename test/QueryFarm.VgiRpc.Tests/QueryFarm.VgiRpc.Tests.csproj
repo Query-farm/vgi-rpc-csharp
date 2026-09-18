@@ -6,6 +6,11 @@
          responsiveness nicety, not a correctness issue; revisit once tests exercise real
          long-running I/O where prompt cancellation actually matters. -->
     <NoWarn>$(NoWarn);xUnit1051</NoWarn>
+    <!-- JIT every method optimized on first call instead of tiering up from unoptimized code.
+         Some bugs exist only in optimized code — an object the optimizer stops reporting live
+         while memory it owns is still in use (Wire/ArrowStreamWriterKeepAliveTests.cs) — and
+         under the default tiering a test for one passes until the method happens to be promoted. -->
+    <TieredCompilationQuickJit>false</TieredCompilationQuickJit>
   </PropertyGroup>
 
   <ItemGroup>

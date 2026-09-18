@@ -858,6 +858,14 @@ namespace Apache.Arrow.Ipc
             long bufferLength = WriteBufferData(recordBatchBuilder.Buffers);
 
             FinishedWritingRecordBatch(bufferLength, metadataLength);
+
+            // [vgi-rpc-csharp patch] recordBatchBuilder.Buffers holds ReadOnlyMemory<byte> views
+            // whose object is the buffer's memory manager, not the SharedMemoryHandle that owns
+            // it — so they do not keep the owner alive. The batch's last use above is before
+            // WriteBufferData copies the bodies; without this, a batch the caller no longer
+            // references (one built only to be written) can have its handles finalized, and its
+            // native memory freed, mid-copy. See README.md, "Seventh patch".
+            GC.KeepAlive(recordBatch);
         }
 
         private protected Task WriteRecordBatchInternalAsync(RecordBatch recordBatch,
@@ -916,6 +924,11 @@ namespace Apache.Arrow.Ipc
             long bufferLength = await WriteBufferDataAsync(recordBatchBuilder.Buffers, cancellationToken).ConfigureAwait(false);
 
             FinishedWritingRecordBatch(bufferLength, metadataLength);
+
+            // [vgi-rpc-csharp patch] Same as the synchronous path above. The async state machine
+            // happens to hold the parameter today; this states the requirement rather than
+            // depending on how the compiler lowers the method.
+            GC.KeepAlive(recordBatch);
         }
 
         private long WriteBufferData(IReadOnlyList<ArrowRecordBatchFlatBufferBuilder.Buffer> buffers)
@@ -1067,6 +1080,10 @@ namespace Apache.Arrow.Ipc
             long bufferLength = WriteBufferData(recordBatchBuilder.Buffers);
 
             FinishedWritingDictionary(bufferLength, metadataLength);
+
+            // [vgi-rpc-csharp patch] Same window as WriteRecordBatchInternal: keep the dictionary
+            // reachable until its bodies are copied, rather than relying on the dictionary memo.
+            GC.KeepAlive(dictionary);
         }
 
         private protected async Task WriteDictionariesAsync(DictionaryMemo dictionaryMemo, CancellationToken cancellationToken)
@@ -1093,6 +1110,9 @@ namespace Apache.Arrow.Ipc
             long bufferLength = await WriteBufferDataAsync(recordBatchBuilder.Buffers, cancellationToken).ConfigureAwait(false);
 
             FinishedWritingDictionary(bufferLength, metadataLength);
+
+            // [vgi-rpc-csharp patch] See WriteDictionary.
+            GC.KeepAlive(dictionary);
         }
 
         private Tuple<ArrowRecordBatchFlatBufferBuilder, Offset<Flatbuf.DictionaryBatch>> CreateDictionaryBatchOffset(long id, IArrowType valueType, IArrowArray dictionary)

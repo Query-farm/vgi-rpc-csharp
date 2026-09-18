@@ -1,8 +1,8 @@
 # Vendored: Apache Arrow .NET (patched for per-batch `custom_metadata`)
 
 This directory vendors `Apache.Arrow` and `Apache.Arrow.Scalars` from
-[apache/arrow-dotnet](https://github.com/apache/arrow-dotnet), **with six small patches applied
-on top of the `v23.0.0` release tag** (one cherry-picked from an upstream PR, five authored directly
+[apache/arrow-dotnet](https://github.com/apache/arrow-dotnet), **with seven small patches applied
+on top of the `v23.0.0` release tag** (one cherry-picked from an upstream PR, six authored directly
 in this vendoring — see below for each).
 
 ## Why this exists
@@ -165,6 +165,43 @@ deterministic.
 If/when this vendoring is removed, either upstream needs equivalent owned-slice semantics or
 `LargeBytesBuffer` must fall back to copying incoming values before the batch is released.
 
+## Seventh patch: the writer keeps a batch reachable until its bodies are copied (vgi-rpc-csharp-specific, found via vgi-csharp)
+
+Not cherry-picked from an upstream PR, and still present on upstream `main` (checked at
+`75718c9`, 2026-09-14) — worth reporting upstream independently of this port.
+
+A builder-made `ArrowBuffer` (anything built through `new ArrowBuffer(IMemoryOwner<byte>)`) is
+owned by a `SharedMemoryHandle`, whose finalizer releases its `SharedMemoryOwner`, which disposes
+the `NativeMemoryManager` inside — zeroing its pointer and freeing (in this fork, pooling) the
+native memory. But `ArrowBuffer.Memory`, and so every `ReadOnlyMemory<byte>` the writer records in
+`ArrowRecordBatchFlatBufferBuilder.Buffers`, has the *manager* as its object, not the handle:
+holding it keeps the manager from being collected, not the handle from being finalized.
+`WriteRecordBatchInternal`'s last use of `recordBatch` is `recordBatch.Length`, before
+`WriteMessage` and `WriteBufferData`, so in optimized code a batch its caller does not reference
+afterwards — `writer.WriteRecordBatch(BuildRow(...))`, or a local never used again — is
+unreachable while its bodies are copied. A collection in that window finalizes the handles; the
+next `BaseStream.Write(dataBuffer)` then reads through the zeroed pointer (a
+`NullReferenceException` in `SpanHelpers.Memmove` under `WriteBufferData`), or, when the finalizer
+lands just after the pointer was read, copies memory the pool has already handed to another
+buffer — silently wrong bytes. Found as an intermittent `NullReferenceException` from vgi-csharp's
+catalog listings, whose `EmbeddedIpc.Encode` writes a one-row batch built only to be written;
+this repo's own `ValueCodec.BuildEmbeddedRecordArray` has the same shape.
+
+Fixed with `GC.KeepAlive(recordBatch)` at the end of `WriteRecordBatchInternal` and its async
+twin, and `GC.KeepAlive(dictionary)` at the end of `WriteDictionary`/`WriteDictionaryAsync`, each
+marked `[vgi-rpc-csharp patch]`. That covers every writer entry point: both `WriteRecordBatch` and
+`WriteRecordBatchAsync` overloads, and `ArrowFileWriter`, which delegates to them. The async paths
+were not observed failing — the compiler's state machine keeps its parameters — and the dictionary
+is also held by the writer's dictionary memo; there the keep-alive states the requirement rather
+than relying on either. `test/QueryFarm.VgiRpc.Tests/Wire/ArrowStreamWriterKeepAliveTests.cs`
+collects before every stream write, and fails deterministically without this patch in a Release
+build (only optimized code has the bug, which is why that project disables quick JIT).
+
+If/when this vendoring is removed, upstream needs the same keep-alive, or the more general fix of
+making the memory an `ArrowBuffer` exposes keep its `SharedMemoryHandle` alive: any consumer that
+holds an `ArrowBuffer`'s memory beyond the lifetime of the array that owns it has the same
+exposure.
+
 ## What's NOT vendored
 
 Only `src/Apache.Arrow/` and `src/Apache.Arrow.Scalars/` (Arrow's own dependency of the former).
@@ -214,7 +251,7 @@ This mirrors `vgi-go`'s equivalent fork (`github.com/Query-farm/arrow-go`, subst
 so the split here is: NuGet resolves the correct, unique package identity, while the assembly
 inside keeps its original name for source compatibility.
 
-`QueryFarm.Arrow` is version `23.0.0-queryfarm.2` — the upstream tag this fork is based on
+`QueryFarm.Arrow` is version `23.0.0-queryfarm.3` — the upstream tag this fork is based on
 (`v23.0.0`), with a prerelease suffix that can never collide with any official Apache.Arrow
 release. `QueryFarm.Arrow.Scalars` remains `23.0.0-queryfarm.1` because its source is unchanged;
 the fork package depends on that existing scalar package. Both are versioned independently of
