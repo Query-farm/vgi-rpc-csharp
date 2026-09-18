@@ -308,9 +308,10 @@ def conformance_http_introspect_port(worker_binary: Path) -> Iterator[int]:
 # One worker is safe here because IDENTITY_CONFORMANCE_FIXTURE.md §3 requires both hooks to be
 # pure functions of their arguments -- no clock, no counter, no shared state -- so this worker
 # answers identically on the first call and the thousandth. The one piece of per-worker state
-# that could have leaked across cases is the introspection rate limiter, and the fixture pins it
-# at 100000 for exactly this reason (§3.1). Nothing in the group drains, restarts or otherwise
-# mutates the worker.
+# that could once have leaked across cases was the introspection rate limiter, which the fixture
+# used to pin at 100000 for exactly this reason; introspection is no longer rate limited at all
+# (IDENTITY_V1_SPEC §4, and TestIntrospectionIsNotThrottled pins it), so there is nothing left
+# to leak. Nothing in the group drains, restarts or otherwise mutates the worker.
 @pytest.fixture(scope="session")
 def conformance_http_identity_port(worker_binary: Path) -> Iterator[int]:
     """An HTTP worker with both identity hooks configured -- resolve and mint."""
@@ -1335,7 +1336,7 @@ from vgi_rpc.conformance._external_bytestream_pytest import TestExternalByteStre
 # conformance_http_identity_introspect_only_port above -- plus TestIdentityAbsentByDefault, which
 # takes conformance_http_port and so needs no identity fixture at all.
 #
-# All twelve classes, not a subset: the group's own design is that several of them are only
+# All thirteen classes, not a subset: the group's own design is that several of them are only
 # non-vacuous in each other's company. TestRejectionsAreUniform is what licenses the
 # resolvable-probe shape every guard case in TestTheJwsTrap and TestTheCredentialSizeCap depends
 # on, and TestIdentityNarrowing's hash-difference case is what stops two digests being pinned to
@@ -1350,6 +1351,7 @@ from vgi_rpc.conformance._pytest_suite import (  # noqa: E402,F401
     TestIdentityWireShape,
     TestIntrospectionAuthorization,
     TestIntrospectionHappyPath,
+    TestIntrospectionIsNotThrottled,
     TestRejectionsAreUniform,
     TestTheCredentialSizeCap,
     TestTheJwsTrap,

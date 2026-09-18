@@ -63,7 +63,7 @@ public static class IdentityTestDoubles
 
         public IdentityImpl Impl { get; }
 
-        public Probe(int rateLimit = 20)
+        public Probe()
         {
             Impl = new IdentityImpl(
                 resolveToken: token =>
@@ -71,8 +71,7 @@ public static class IdentityTestDoubles
                     Seen.Add(token);
                     return new TokenIdentity("resolved-anything");
                 },
-                introspectPrincipals: ["proxy"],
-                introspectRateLimit: rateLimit);
+                introspectPrincipals: ["proxy"]);
         }
 
         /// <summary>Asserts the call refused <em>and</em> that the resolver was never reached.</summary>
@@ -111,8 +110,8 @@ public static class IdentityTestDoubles
 /// </remarks>
 public class IntrospectionIsLockedDownTests
 {
-    private static IdentityImpl Impl(int rateLimit = 20) =>
-        new(resolveToken: IdentityTestDoubles.Resolver, introspectPrincipals: ["proxy"], introspectRateLimit: rateLimit);
+    private static IdentityImpl Impl() =>
+        new(resolveToken: IdentityTestDoubles.Resolver, introspectPrincipals: ["proxy"]);
 
     /// <summary>The happy path, for the reverse proxy the method exists for.</summary>
     [Fact]
@@ -158,8 +157,8 @@ public class IntrospectionIsLockedDownTests
     }
 
     /// <summary>
-    /// The guard ORDER, pinned: authorization and the rate limit run before anything touches the
-    /// subject credential -- before its length is measured and before its shape is matched.
+    /// The guard ORDER, pinned: authorization runs before anything touches the subject
+    /// credential -- before its length is measured and before its shape is matched.
     /// </summary>
     /// <remarks>
     /// An unauthorized caller presenting an over-long or JWS-shaped token must still be told only
@@ -210,18 +209,6 @@ public class IntrospectionIsLockedDownTests
         Assert.Equal(MetadataKeys.ErrorKinds.IntrospectionRefused, exc.ErrorKind);
         Assert.Equal("caller is not an introspector", exc.ErrorMessage);
         Assert.DoesNotContain("length", exc.ErrorMessage, StringComparison.OrdinalIgnoreCase);
-    }
-
-    /// <summary>The rate limit also precedes the shape checks, for the same reason.</summary>
-    [Fact]
-    public void TheRateLimitPrecedesTheShapeChecks()
-    {
-        var impl = Impl(rateLimit: 1);
-        var ctx = IdentityTestDoubles.Ctx(IdentityTestDoubles.Auth("proxy"));
-        impl.IntrospectToken("good", ctx);
-
-        var exc = Assert.Throws<IntrospectionRefusedException>(() => impl.IntrospectToken("aaa.bbb.ccc", ctx));
-        Assert.Contains("rate limit", exc.ErrorMessage, StringComparison.Ordinal);
     }
 
     /// <summary>Unknown, malformed and over-long are one answer.</summary>
@@ -284,18 +271,73 @@ public class IntrospectionIsLockedDownTests
         Assert.IsNotAssignableFrom<ArgumentException>(exc);
     }
 
-    /// <summary>Bounds, rather than closes, the oracle an allowlisted caller still has.</summary>
+    /// <summary>The allowlisted caller is answered however often it asks.</summary>
+    /// <remarks>
+    /// The caller is the asker -- a proxy -- introspecting on behalf of every client that
+    /// presents a bearer, so a per-caller limit was one budget for every user's login. Five
+    /// hundred calls is twenty-five times the retired default of 20 a second, made well inside
+    /// one second.
+    /// </remarks>
     [Fact]
-    public void RateLimited()
+    public void IntrospectionIsNotRateLimited()
     {
-        var impl = Impl(rateLimit: 2);
+        var impl = Impl();
         var ctx = IdentityTestDoubles.Ctx(IdentityTestDoubles.Auth("proxy"));
 
-        Assert.Equal("bob", impl.IntrospectToken("good", ctx).Principal);
-        Assert.Equal("bob", impl.IntrospectToken("good", ctx).Principal);
+        for (var i = 0; i < 500; i++)
+        {
+            Assert.Equal("bob", impl.IntrospectToken("good", ctx).Principal);
+        }
+    }
 
-        var exc = Assert.Throws<IntrospectionRefusedException>(() => impl.IntrospectToken("good", ctx));
-        Assert.Contains("rate limit", exc.ErrorMessage, StringComparison.Ordinal);
+    /// <summary>Junk credentials sent through the asker cannot cost a valid one its answer.</summary>
+    /// <remarks>
+    /// The lockout the retired limiter caused, as demonstrated against Rowfence: unauthenticated
+    /// clients hand the asker junk bearers, the asker introspects each, and the budget they drain
+    /// is the one a real user's first login needed. Every junk credential must get the definitive
+    /// <c>token_unresolved</c> it deserves -- never <c>introspection_refused</c>, which the asker
+    /// may cache -- and the valid one must still resolve.
+    /// </remarks>
+    [Fact]
+    public void JunkCredentialsDoNotLockOutAValidOne()
+    {
+        var impl = Impl();
+        var ctx = IdentityTestDoubles.Ctx(IdentityTestDoubles.Auth("proxy"));
+
+        for (var i = 0; i < 100; i++)
+        {
+            var junk = $"junk-{i}";
+            var exc = Assert.Throws<TokenUnresolvedException>(() => impl.IntrospectToken(junk, ctx));
+            Assert.Equal(MetadataKeys.ErrorKinds.TokenUnresolved, exc.ErrorKind);
+        }
+
+        Assert.Equal("bob", impl.IntrospectToken("good", ctx).Principal);
+    }
+
+    /// <summary>A concurrent burst from the introspector is answered in full.</summary>
+    /// <remarks>
+    /// Every transport in this port dispatches concurrently, and the asker's logins arrive
+    /// concurrently -- so this is the shape in which a forgotten limiter (or any other shared
+    /// per-caller state) would refuse someone. The assertion is on the exact resolved count: a
+    /// refusal does not have to throw out of <c>Parallel.For</c> to be a lockout.
+    /// </remarks>
+    [Fact]
+    public void AConcurrentBurstIsAnsweredInFull()
+    {
+        const int burst = 4000;
+        var impl = Impl();
+        var ctx = IdentityTestDoubles.Ctx(IdentityTestDoubles.Auth("proxy"));
+        var resolved = 0;
+
+        System.Threading.Tasks.Parallel.For(0, burst, _ =>
+        {
+            if (impl.IntrospectToken("good", ctx).Principal == "bob")
+            {
+                System.Threading.Interlocked.Increment(ref resolved);
+            }
+        });
+
+        Assert.Equal(burst, resolved);
     }
 
     /// <summary>There is no permissive default, so it cannot be reached by omission.</summary>
@@ -518,83 +560,6 @@ public class IdentityDiagnosticsTests
     }
 }
 
-/// <summary>Fixed-window, because the state is two integers rather than an aged float.</summary>
-public class IdentityRateLimiterTests
-{
-    /// <summary>Within a window.</summary>
-    [Fact]
-    public void AdmitsUpToTheLimit()
-    {
-        var limiter = new IdentityRateLimiter(3);
-        Assert.Equal(
-            new[] { true, true, true, false },
-            Enumerable.Range(0, 4).Select(_ => limiter.Allow("a", now: 100.0)).ToArray());
-    }
-
-    /// <summary>A new window resets the count.</summary>
-    [Fact]
-    public void WindowRolls()
-    {
-        var limiter = new IdentityRateLimiter(1);
-        Assert.True(limiter.Allow("a", now: 100.0));
-        Assert.False(limiter.Allow("a", now: 100.5));
-        Assert.True(limiter.Allow("a", now: 101.5));
-    }
-
-    /// <summary>One caller exhausting its budget must not refuse another.</summary>
-    [Fact]
-    public void CallersAreIndependent()
-    {
-        var limiter = new IdentityRateLimiter(1);
-        Assert.True(limiter.Allow("a", now: 100.0));
-        Assert.True(limiter.Allow("b", now: 100.0));
-        Assert.False(limiter.Allow("a", now: 100.0));
-    }
-
-    /// <summary>Whole-map reset rather than per-key ageing, so an attacker cannot grow the map.</summary>
-    /// <remarks>
-    /// Per-key ageing would let a caller cycling keys grow the map without bound between sweeps.
-    /// </remarks>
-    [Fact]
-    public void CyclingKeysCannotGrowTheMap()
-    {
-        var limiter = new IdentityRateLimiter(1);
-        for (var i = 0; i < 1000; i++)
-        {
-            limiter.Allow($"k{i}", now: 100.0);
-        }
-
-        limiter.Allow("fresh", now: 200.0);
-        Assert.Equal(1, limiter.TrackedKeyCount);
-    }
-
-    /// <summary>Safe under this port's concurrency model.</summary>
-    /// <remarks>
-    /// The limiter is shared by every connection a server is handling, and every transport in
-    /// this port dispatches concurrently. A limiter that lost increments under contention would
-    /// admit more than its budget precisely when it is being hammered -- which is the only time
-    /// it matters. The assertion is on the exact admitted count, not on "no exception thrown":
-    /// a torn read-modify-write does not throw, it over-admits.
-    /// </remarks>
-    [Fact]
-    public void IsThreadSafe()
-    {
-        const int budget = 500;
-        var limiter = new IdentityRateLimiter(budget);
-        var admitted = 0;
-
-        System.Threading.Tasks.Parallel.For(0, 4000, _ =>
-        {
-            if (limiter.Allow("a", now: 100.0))
-            {
-                System.Threading.Interlocked.Increment(ref admitted);
-            }
-        });
-
-        Assert.Equal(budget, admitted);
-    }
-}
-
 /// <summary>Whitespace must not be a way to walk a JWS past the guard.</summary>
 /// <remarks>
 /// <para>
@@ -692,20 +657,6 @@ public class GuardsAreNotVacuousTests
         var probe = new IdentityTestDoubles.Probe();
         var exc = probe.Refuses<IntrospectionRefusedException>("good", principal: caller);
         Assert.Equal(MetadataKeys.ErrorKinds.IntrospectionRefused, exc.ErrorKind);
-    }
-
-    /// <summary>Mutation: make <c>IdentityRateLimiter.Allow</c> always true. Goes red.</summary>
-    [Fact]
-    public void TheRateLimitFiresRatherThanTheResolver()
-    {
-        var probe = new IdentityTestDoubles.Probe(rateLimit: 1);
-        var ctx = IdentityTestDoubles.Ctx(IdentityTestDoubles.Auth("proxy"));
-
-        Assert.Equal("resolved-anything", probe.Impl.IntrospectToken("good", ctx).Principal);
-        Assert.Single(probe.Seen);
-
-        var exc = probe.Refuses<IntrospectionRefusedException>("good");
-        Assert.Contains("rate limit", exc.ErrorMessage, StringComparison.Ordinal);
     }
 
     /// <summary>Mutation: delete the <c>CheckFreshness</c> call. Goes red.</summary>

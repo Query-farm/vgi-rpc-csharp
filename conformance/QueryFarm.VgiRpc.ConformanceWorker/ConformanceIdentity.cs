@@ -80,16 +80,6 @@ public static class ConformanceIdentity
     /// <summary>How recently a caller must have authenticated to mint -- the documented default.</summary>
     public const double MaxAuthAge = 900.0;
 
-    /// <summary>Introspections allowed per caller per second.</summary>
-    /// <remarks>
-    /// Deliberately far above the framework default of 20. Nearly every case in the shared group is
-    /// an introspection, and a production-tuned limiter would fire mid-group with every resulting
-    /// failure reading as the wrong guard. The limiter is not asserted there at all; it is covered
-    /// port-locally in <c>IdentityRateLimiterTests</c>, where its refusal is distinguishable by
-    /// message and so cannot be tested vacuously.
-    /// </remarks>
-    public const int IntrospectRateLimit = 100_000;
-
     /// <summary>The identity every resolvable credential maps to.</summary>
     public const string SubjectPrincipal = "subject@conformance.example";
 
@@ -226,7 +216,6 @@ public static class ConformanceIdentity
         resolveToken: ResolveToken,
         mintGrant: mint ? MintGrant : null,
         introspectPrincipals: [IntrospectorPrincipal],
-        introspectRateLimit: IntrospectRateLimit,
         maxAuthAge: MaxAuthAge);
 
     /// <summary>

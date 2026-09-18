@@ -46,8 +46,10 @@ public interface IIdentityProtocol
     /// then acts on using credentials the worker does not hold -- storage credentials,
     /// entitlement lookups, policy-tier selection. "Trust it as much as you trust the worker" is
     /// the wrong frame: it must be trusted <em>more</em>. Hence the guards: an introspector
-    /// allowlist with no permissive default, uniform rejections, a JWS-shaped subject refused
-    /// before the resolver runs, and rate limiting.
+    /// allowlist with no permissive default, uniform rejections, and a JWS-shaped subject refused
+    /// before the resolver runs. Deliberately not rate limited: the allowlist is the control, and
+    /// a per-caller budget on the asker is one budget for every user behind it (see
+    /// <see cref="IdentityImpl"/>).
     /// </para>
     /// <para>
     /// Deliberately <em>not</em> "replay the credential through the worker's own authenticate

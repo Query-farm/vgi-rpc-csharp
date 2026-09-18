@@ -5,9 +5,9 @@ namespace QueryFarm.VgiRpc.Identity;
 /// <summary>Applies this module's guards, then delegates to worker-supplied hooks.</summary>
 /// <remarks>
 /// <para>
-/// The framework owns the guards and owns none of the policy. It decides who may ask, how often,
-/// and what shape of credential is refused outright; the worker decides what a credential
-/// resolves to and whether a grant is minted. That split is deliberate -- the guards are the part
+/// The framework owns the guards and owns none of the policy. It decides who may ask and what
+/// shape of credential is refused outright; the worker decides what a credential resolves to and
+/// whether a grant is minted. That split is deliberate -- the guards are the part
 /// that is identical in every deployment and catastrophic to get wrong, and the policy is the
 /// part that is different in every deployment and cannot be guessed.
 /// </para>
@@ -19,6 +19,20 @@ namespace QueryFarm.VgiRpc.Identity;
 /// below are the belt to that braces -- both exist, because a caller can still reach a method
 /// through a path that never consulted the registration (and because a refusal is a better
 /// answer than a null-reference crash).
+/// </para>
+/// <para>
+/// <b>Introspection is deliberately not rate limited.</b> The allowlist is the control: the only
+/// callers are trusted askers, in practice a proxy. A per-caller limit there bounds only guessing,
+/// which is hopeless against a random credential at any rate, and not the real harm of a leaked
+/// introspector credential -- resolving a <em>stolen</em> credential to its owner takes one call.
+/// What it did do was harm: the asker calls on behalf of everyone who presents a bearer, so a
+/// per-caller budget is one budget for every user's login, drainable by unauthenticated junk
+/// credentials. Throttling untrusted traffic belongs where it arrives -- at the asker, per client
+/// -- and a throttled answer is never <see cref="IntrospectionRefusedException"/>, which a caller
+/// may cache as definitive (it would negative-cache valid credentials); it is
+/// <see cref="IdentityUnavailableException"/>. There was a limiter here, and its option, until
+/// the 2026-09-18 revision of the cross-port spec removed both; this port has no published caller
+/// that still passes the option, so it is gone outright rather than kept as a no-op.
 /// </para>
 /// </remarks>
 public sealed class IdentityImpl : IIdentityProtocol
@@ -44,7 +58,6 @@ public sealed class IdentityImpl : IIdentityProtocol
     private readonly TokenResolver? _resolveToken;
     private readonly GrantMinter? _mintGrant;
     private readonly IReadOnlySet<string> _principals;
-    private readonly IdentityRateLimiter _limiter;
     private readonly double _maxAuthAge;
 
     /// <param name="resolveToken">Resolves an opaque credential; see <see cref="TokenResolver"/>.
@@ -53,7 +66,6 @@ public sealed class IdentityImpl : IIdentityProtocol
     /// <c>issue_grant</c> is not hosted.</param>
     /// <param name="introspectPrincipals">Who may call <c>introspect_token</c>. Required whenever
     /// <paramref name="resolveToken"/> is supplied; there is no permissive default.</param>
-    /// <param name="introspectRateLimit">Introspections allowed per caller per second.</param>
     /// <param name="maxAuthAge">How recently a caller must have authenticated to mint a grant,
     /// in seconds.</param>
     /// <exception cref="ArgumentException"><paramref name="resolveToken"/> was supplied without an
@@ -63,7 +75,6 @@ public sealed class IdentityImpl : IIdentityProtocol
         TokenResolver? resolveToken = null,
         GrantMinter? mintGrant = null,
         IEnumerable<string>? introspectPrincipals = null,
-        int introspectRateLimit = 20,
         double maxAuthAge = 900.0)
     {
         _resolveToken = resolveToken;
@@ -72,7 +83,6 @@ public sealed class IdentityImpl : IIdentityProtocol
         _principals = resolveToken is null
             ? s_noPrincipals
             : IdentityGuards.NormalisePrincipals(introspectPrincipals);
-        _limiter = new IdentityRateLimiter(introspectRateLimit);
     }
 
     /// <summary>Returns the methods this deployment can actually answer.</summary>
@@ -103,8 +113,8 @@ public sealed class IdentityImpl : IIdentityProtocol
     /// <param name="ctx">Framework-injected call context.</param>
     /// <returns>The resolved identity.</returns>
     /// <remarks>
-    /// <b>The order of these guards is load bearing.</b> Authorization and the rate limit run
-    /// before anything looks at the subject credential -- before its length is measured, before
+    /// <b>The order of these guards is load bearing.</b> Authorization runs before anything looks
+    /// at the subject credential -- before its length is measured, before
     /// its shape is matched, and before the resolver sees it -- because an unauthorized caller
     /// must learn nothing about that credential, including how long looking at it took. Do not
     /// reorder for tidiness: an unauthorized caller presenting an over-long or JWS-shaped token
@@ -118,12 +128,7 @@ public sealed class IdentityImpl : IIdentityProtocol
             throw new IntrospectionRefusedException("this worker does not resolve credentials");
         }
 
-        var caller = IdentityGuards.CheckIntrospector(ctx.Auth, _principals);
-        if (!_limiter.Allow(caller))
-        {
-            throw new IntrospectionRefusedException("introspection rate limit exceeded");
-        }
-
+        IdentityGuards.CheckIntrospector(ctx.Auth, _principals);
         IdentityGuards.RejectJwsShaped(token);
 
         var identity = _resolveToken(token);

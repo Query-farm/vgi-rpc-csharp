@@ -36,12 +36,19 @@ public class IdentityRefusedException : RpcException
     }
 }
 
-/// <summary>The caller may not introspect.</summary>
+/// <summary>The caller may not introspect -- it is not on the allowlist.</summary>
 /// <remarks>
+/// <para>
 /// Definitive: a caller may cache this. Authentication is not the same capability as
 /// introspection -- a deployment where any valid credential may introspect lets any user test
 /// guesses of any other user's credential at unlimited rate, and resolve a stolen one to its
 /// owner.
+/// </para>
+/// <para>
+/// <b>Never a throttle.</b> Because a caller may cache it, a throttled introspection reported as
+/// this negative-caches valid credentials -- which is how the retired per-caller limit locked
+/// users out. Anything transient is <see cref="IdentityUnavailableException"/>.
+/// </para>
 /// </remarks>
 public sealed class IntrospectionRefusedException : IdentityRefusedException
 {
