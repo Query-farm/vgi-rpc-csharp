@@ -3,6 +3,7 @@ using Apache.Arrow;
 using Apache.Arrow.Types;
 using QueryFarm.VgiRpc.AccessLog;
 using QueryFarm.VgiRpc.Errors;
+using QueryFarm.VgiRpc.External;
 using QueryFarm.VgiRpc.Identity;
 using QueryFarm.VgiRpc.Logging;
 using QueryFarm.VgiRpc.Reflection;
@@ -70,6 +71,30 @@ public sealed class RpcServer
     public string ProtocolHash => BindingHashFor(ProtocolName);
 
     public string? ServerVersion { get; init; }
+
+    /// <summary>
+    /// External-storage externalization for the byte-stream transports this server serves
+    /// directly (<see cref="ServeAsync"/>: pipe, stdio, Unix socket, TCP). <see langword="null"/>
+    /// (the default) leaves every batch inline.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Pointer batches are not an HTTP feature (WIRE_PROTOCOL.md §12): a unary result or a
+    /// stream turn's data batch at or above <see cref="ServerExternalConfig.ExternalizeThresholdBytes"/>
+    /// is uploaded to <see cref="ServerExternalConfig.Storage"/> and replaced on the wire by a
+    /// zero-row pointer, exactly as the HTTP transport does with its own
+    /// <c>ExternalizationOptions</c>. A stream turn's object is written under the stream's
+    /// declared output schema (see
+    /// <see cref="External.ExternalLocation.MaybeExternalizeAsync(Apache.Arrow.RecordBatch, Apache.Arrow.Schema, IReadOnlyDictionary{string, string}?, ServerExternalConfig, CancellationToken)"/>).
+    /// </para>
+    /// <para>
+    /// Narrower than the reference, as the HTTP path already is: a turn's log batches stay inline
+    /// rather than riding in the object beside its data batch, and a stream header is never
+    /// externalized. HTTP-only settings -- the upload-URL provider and the externalized-response
+    /// cap -- do not apply here.
+    /// </para>
+    /// </remarks>
+    public ServerExternalConfig? ExternalConfig { get; init; }
 
     /// <summary>
     /// The registered methods, keyed by wire name — exposed for transports (see
@@ -557,6 +582,14 @@ public sealed class RpcServer
                 : ValueCodec.BuildRow(info.ResultSchema, [result]);
             IReadOnlyDictionary<string, string>? resultMetadata = null;
             using var resultOwner = new RecordBatchOwner(resultBatch);
+            if (ExternalConfig is { } externalConfig)
+            {
+                // Ahead of SHM: a pointer is zero-row, which the SHM path leaves inline.
+                (resultBatch, resultMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(
+                    resultBatch, info.ResultSchema, resultMetadata, externalConfig, cancellationToken).ConfigureAwait(false);
+                resultOwner.Replace(resultBatch);
+            }
+
             if (shmForUnary is not null)
             {
                 (resultBatch, resultMetadata) = await ShmPointerBatch.MaybeWriteAsync(resultBatch, null, shmForUnary, cancellationToken).ConfigureAwait(false);
@@ -785,6 +818,28 @@ public sealed class RpcServer
             {
                 using var emittedOwner = new RecordBatchOwner(emitted);
                 var emittedMetadata = collector.EmittedMetadata;
+                if (ExternalConfig is { } externalConfig)
+                {
+                    try
+                    {
+                        (emitted, emittedMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(
+                            emitted, outputSchema, emittedMetadata, externalConfig, cancellationToken).ConfigureAwait(false);
+                        emittedOwner.Replace(emitted);
+                    }
+                    catch (Exception exc) when (!cancellationToken.IsCancellationRequested)
+                    {
+                        // The turn's data cannot be delivered, so the stream ends in an error the
+                        // client can read -- not in an exception out of the serve loop, which
+                        // would take every later call on this connection with it.
+                        streamStatus = "error";
+                        streamErrorType = exc.GetType().Name;
+                        streamErrorMessage = exc.Message;
+                        streamHookError = exc;
+                        await outputWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outputSchema), LogMessage.FromException(exc).AddToMetadata(), cancellationToken).ConfigureAwait(false);
+                        break;
+                    }
+                }
+
                 if (ownedShm is not null)
                 {
                     (emitted, emittedMetadata) = await ShmPointerBatch.MaybeWriteAsync(emitted, emittedMetadata, ownedShm, cancellationToken).ConfigureAwait(false);

@@ -35,6 +35,11 @@ using var accessLog = options.AccessLogPath is { } accessLogPath ? new JsonlAcce
 // at all, which is the property that keeps a dependency upgrade from growing a
 // credential-to-identity oracle on every existing worker. Hosting it here by default would make
 // that assertion unfalsifiable and this flag meaningless.
+//
+// --fake-storage without --http externalizes over the byte stream itself (stdio, --unix, --tcp):
+// the shared suite's TestExternalByteStream boots `worker --fake-storage URL
+// --externalize-threshold 1` and counts the uploads, and without this the flag was parsed and
+// then silently ignored in every mode but HTTP. The HTTP mode wires its own options below.
 var server = new RpcServer(
     typeof(IConformanceService), new ConformanceServiceImpl(), accessLog: accessLog,
     expectedProtocolVersion: "2.0.0",
@@ -43,7 +48,17 @@ var server = new RpcServer(
         "both" => ConformanceIdentity.Build(mint: true),
         "introspect-only" => ConformanceIdentity.Build(mint: false),
         _ => null,
-    });
+    })
+{
+    ExternalConfig = !options.Http && options.FakeStorageUrl is { } byteStreamStorageUrl
+        ? new ServerExternalConfig
+        {
+            Storage = new FakeStorageBackend(byteStreamStorageUrl),
+            ExternalizeThresholdBytes = options.ExternalizeThresholdBytes,
+            Compression = options.CompressionAlgorithm == "zstd" ? new Compression() : null,
+        }
+        : null,
+};
 
 using var cts = new CancellationTokenSource();
 RegisterShutdownHandlers(cts);
