@@ -61,7 +61,8 @@ var server = new RpcServer(
 };
 
 using var cts = new CancellationTokenSource();
-RegisterShutdownHandlers(cts);
+// Held for the whole run: see RegisterShutdownHandlers.
+using var sigtermRegistration = RegisterShutdownHandlers(cts);
 
 if (options.UnixSocketPath is { } unixPath)
 {
@@ -305,7 +306,16 @@ var stdioTransport = new StdioTransport();
 await server.ServeAsync(stdioTransport, cts.Token);
 return 0;
 
-static void RegisterShutdownHandlers(CancellationTokenSource cts)
+// Returns the SIGTERM registration, which the caller must keep referenced for as long as the
+// process should answer SIGTERM. A PosixSignalRegistration nobody references is collected, and
+// collecting it unregisters the handler. Discarding it made the worker stop answering SIGTERM
+// after its first GCs -- a few hundred requests into a run -- leaving only ASP.NET's own
+// ConsoleLifetime handler, which cancels the signal's default action and stops an application
+// lifetime this program never waits on. A harness stopping the worker then waited out its own
+// timeout: this repo's kills it after five seconds, a session-scoped fixture under the reference
+// suite's five-second mark failed the teardown it was charged to, and the shared Rust harness,
+// which does not follow up with a kill, left the worker running.
+static IDisposable? RegisterShutdownHandlers(CancellationTokenSource cts)
 {
     Console.CancelKeyPress += (_, e) =>
     {
@@ -315,14 +325,16 @@ static void RegisterShutdownHandlers(CancellationTokenSource cts)
     // ProcessExit fires on normal exit too (not just signals) — by then `using var cts` in
     // Main may already have disposed it on the success path, so Cancel() here is best-effort.
     AppDomain.CurrentDomain.ProcessExit += (_, _) => TryCancel(cts);
-    if (!OperatingSystem.IsWindows())
+    if (OperatingSystem.IsWindows())
     {
-        PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx =>
-        {
-            ctx.Cancel = true;
-            TryCancel(cts);
-        });
+        return null;
     }
+
+    return PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx =>
+    {
+        ctx.Cancel = true;
+        TryCancel(cts);
+    });
 }
 
 static void TryCancel(CancellationTokenSource cts)
