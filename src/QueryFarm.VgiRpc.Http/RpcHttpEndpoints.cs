@@ -104,10 +104,11 @@ public static class RpcHttpEndpoints
     /// <param name="proxyHint">Non-null only on a service whose authentication depends on a
     /// reverse proxy (<c>docs/unauthorized-spec.md</c> §5) — added to every 401 this server
     /// produces, both as the body's <c>proxy_hint</c> field and via
-    /// <c>VGI-Auth-Proxy-Required: true</c>. There is no automatic discovery from installed
-    /// authenticators yet (Python's mTLS/proxy-proof authenticators self-declare which header
-    /// they read; this port doesn't have those yet — see docs/roadmap.md M9/M11), so this is
-    /// the spec's "direct way for an operator to state header names" fallback, always.</param>
+    /// <c>VGI-Auth-Proxy-Required: true</c>. Left null with <paramref name="proxyProofRequired"/>
+    /// set, the note is derived from the proof header (<see cref="ProxyProof.ProofHeader"/>), as
+    /// the reference derives it. Other authenticators do not self-declare the headers they read
+    /// in this port (Python's mTLS authenticators do — see docs/roadmap.md M9/M11), so for those
+    /// this remains the spec's "direct way for an operator to state header names".</param>
     /// <param name="corsPolicyName">Name of a CORS policy already registered via
     /// <see cref="Cors.AddVgiRpcCors"/> (on <c>builder.Services</c>, before this call) —
     /// <see langword="null"/> (the default) leaves every route CORS-unaware, matching Python's
@@ -147,6 +148,15 @@ public static class RpcHttpEndpoints
         ValidateResponseBudget(preferredResponseBytes, nameof(preferredResponseBytes));
         var effectiveMaxResponseBytes = MinLimit(maxResponseBytes, hostingMaxResponseBytes);
         var effectiveMaxRequestBytes = MinLimit(externalization?.MaxRequestBytes, hostingMaxRequestBytes);
+        // A require-mode proof gate is itself a proxy dependency: a request that reached the
+        // service without passing through the proxy is refused, and a 401 that does not say so
+        // reads as a bad credential. The reference derives the note from the proof header when
+        // proxy_proof_required is set; an operator-supplied hint still wins.
+        if (string.IsNullOrEmpty(proxyHint) && proxyProofRequired)
+        {
+            proxyHint = UnauthorizedResponseWriter.BuildProxyHint([ProxyProof.ProofHeader]);
+        }
+
         tokenKey ??= RandomNumberGenerator.GetBytes(32);
         var registry = new StreamCallRegistry();
         void Stamp(HttpContext context) => ApplyResponseBudgetCapabilities(
