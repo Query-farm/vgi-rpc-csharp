@@ -73,6 +73,29 @@ public sealed class AuthFailure(AuthReason reason, string detail = "") : Excepti
 /// </summary>
 public static class UnauthorizedResponseWriter
 {
+    /// <summary>
+    /// The operator-facing note for a service whose authentication depends on headers a trusted
+    /// reverse proxy must inject, or <see langword="null"/> when <paramref name="headers"/> is
+    /// empty. The reference's <c>build_proxy_hint</c>, word for word.
+    /// </summary>
+    public static string? BuildProxyHint(IEnumerable<string> headers)
+    {
+        var names = headers.Distinct(StringComparer.Ordinal).ToArray();
+        if (names.Length == 0)
+        {
+            return null;
+        }
+
+        var listed = string.Join(", ", names);
+        var noun = names.Length == 1 ? "header" : "headers";
+        var those = names.Length == 1 ? "that header" : "those headers";
+        return "This service only accepts requests that arrive through its configured reverse proxy, "
+            + $"which must set the {listed} {noun}. A rejection here is as likely to be a proxy that is "
+            + $"not forwarding {those} \u2014 or a request that reached the service without passing through "
+            + "the proxy at all \u2014 as it is a bad credential. Check the proxy configuration before "
+            + "rotating credentials.";
+    }
+
     /// <summary>Writes a §4-shaped 401 response. <paramref name="proxyHint"/> — non-empty only on
     /// a service whose authentication depends on a reverse proxy (§5) — adds
     /// <c>VGI-Auth-Proxy-Required: true</c> and the <c>proxy_hint</c> body field; omitted
