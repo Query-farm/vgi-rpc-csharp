@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Reflection;
 using Apache.Arrow;
 using QueryFarm.VgiRpc.Reflection;
+using QueryFarm.VgiRpc.Server;
 
 namespace QueryFarm.VgiRpc.Client;
 
@@ -35,7 +36,9 @@ public class RpcClientProxy<TContract> : DispatchProxy where TContract : class
         var cancellationToken = method.HasCancellationToken
             ? (CancellationToken)supplied[^1]!
             : CancellationToken.None;
-        var arguments = method.HasCancellationToken ? supplied[..^1] : supplied;
+        // The wire parameters are a prefix of the declared ones: everything before a trailing
+        // ICallContext and/or CancellationToken.
+        var arguments = supplied[..method.WireParameterCount];
         Task<object?> call = method.Kind switch
         {
             ClientMethodKind.Unary => CallUnaryAsync(method, arguments, cancellationToken),
@@ -123,7 +126,15 @@ public class RpcClientProxy<TContract> : DispatchProxy where TContract : class
             WireName = WireNaming.ForMethod(method);
             var parameters = method.GetParameters();
             HasCancellationToken = parameters.Length > 0 && parameters[^1].ParameterType == typeof(CancellationToken);
-            var wireParameters = HasCancellationToken ? parameters[..^1] : parameters;
+            var declared = HasCancellationToken ? parameters[..^1] : parameters;
+            // A contract shared with the server may end in the server's ICallContext parameter.
+            // The server injects it and never reads it off the wire (RpcMethodInfo drops it the
+            // same way), so it is not a wire field. Sending it as one -- a null `context` column
+            // -- went unnoticed only while the server ignored columns it did not declare; a
+            // server enforcing the declared parameter contract, as the reference does, refuses it.
+            var hasContext = declared.Length > 0 && typeof(ICallContext).IsAssignableFrom(declared[^1].ParameterType);
+            var wireParameters = hasContext ? declared[..^1] : declared;
+            WireParameterCount = wireParameters.Length;
             ParamsSchema = new Schema(
                 wireParameters.Select(parameter => SchemaDerivation.FieldForParameter(WireNaming.ForParameter(parameter), parameter)),
                 metadata: null);
@@ -160,6 +171,9 @@ public class RpcClientProxy<TContract> : DispatchProxy where TContract : class
         public Type ResultType { get; }
         public bool ReturnsValueTask { get; }
         public bool HasCancellationToken { get; }
+
+        /// <summary>How many leading declared parameters are wire fields.</summary>
+        public int WireParameterCount { get; }
         public bool HasHeader { get; }
 
         private static (Type ResultType, bool ValueTask) UnwrapReturn(Type returnType)
