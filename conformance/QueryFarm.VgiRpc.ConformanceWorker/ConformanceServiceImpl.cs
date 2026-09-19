@@ -154,14 +154,27 @@ public sealed class ConformanceServiceImpl : IConformanceService
         return Task.FromResult(value);
     }
 
+    /// <summary>One log per non-EXCEPTION level, each message <c>"{level}: {value}"</c> with the
+    /// level lower-cased -- the reference's <c>echo_with_all_log_levels</c>.</summary>
+    /// <remarks>
+    /// <c>EXCEPTION</c> is not a deliverable log level: on the wire it is the error channel, so a
+    /// client reads a batch carrying it as the call failing and raises instead of returning the
+    /// value. Emitting one here turned a successful echo into an error on every transport.
+    /// </remarks>
     public Task<string> EchoWithAllLogLevelsAsync(string value, ICallContext? ctx = null)
     {
-        ctx!.EmitLog(VgiLogLevel.Trace, value);
-        ctx.EmitLog(VgiLogLevel.Debug, value);
-        ctx.EmitLog(VgiLogLevel.Info, value);
-        ctx.EmitLog(VgiLogLevel.Warn, value);
-        ctx.EmitLog(VgiLogLevel.Error, value);
-        ctx.EmitLog(VgiLogLevel.Exception, value);
+        foreach (var (level, name) in new[]
+                 {
+                     (VgiLogLevel.Trace, "trace"),
+                     (VgiLogLevel.Debug, "debug"),
+                     (VgiLogLevel.Info, "info"),
+                     (VgiLogLevel.Warn, "warn"),
+                     (VgiLogLevel.Error, "error"),
+                 })
+        {
+            ctx!.EmitLog(level, $"{name}: {value}");
+        }
+
         return Task.FromResult(value);
     }
 
