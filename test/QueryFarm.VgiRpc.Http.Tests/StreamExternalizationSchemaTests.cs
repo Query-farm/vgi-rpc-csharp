@@ -129,6 +129,36 @@ public sealed class StreamExternalizationSchemaTests
         await AssertObjectMatchesPointerAsync(fromExchange, storage.Uploads[1]);
     }
 
+    /// <summary>A failed upload is the turn's typed error -- not an escaped exception, which the
+    /// host answered with a bare 500 that a capped client can only read as a protocol violation
+    /// ("Every capped RPC response must contain exactly one VGI-Accept-Max-Response-Bytes-Support").
+    /// </summary>
+    [Fact]
+    public async Task UploadFailure_OnAStreamTurn_IsATypedError()
+    {
+        var storage = new CapturingStorage { Fail = true };
+        await using var host = await StartHostAsync(storage);
+        await using var client = new HttpRpcClient(host.Address, new HttpRpcClientOptions { Protocol = Protocol });
+        using var parameters = new RecordBatch(
+            new Schema([new Field("count", Int64Type.Default, false)], null),
+            [new Int64Array.Builder().Append(2).Build()],
+            1);
+
+        var fromInit = await Assert.ThrowsAsync<Errors.RpcException>(() => client.OpenProducerAsync(
+            "produce_loosely", parameters, cancellationToken: TestContext.Current.CancellationToken));
+        Assert.Contains("storage unavailable", fromInit.ErrorMessage, StringComparison.Ordinal);
+
+        storage.Fail = false;
+        using var emptyParameters = new RecordBatch(new Schema([], null), [], 1);
+        await using var exchange = await client.OpenExchangeAsync(
+            "echo_input", emptyParameters, cancellationToken: TestContext.Current.CancellationToken);
+        storage.Fail = true;
+        using var input = Values(s_undeclaredNullability, 7);
+        var fromExchange = await Assert.ThrowsAsync<Errors.RpcException>(() => exchange.ExchangeAsync(
+            input, cancellationToken: TestContext.Current.CancellationToken));
+        Assert.Contains("storage unavailable", fromExchange.ErrorMessage, StringComparison.Ordinal);
+    }
+
     private static async Task AssertObjectMatchesPointerAsync(AnnotatedBatch? pointer, byte[] uploaded)
     {
         Assert.NotNull(pointer);
@@ -176,6 +206,8 @@ public sealed class StreamExternalizationSchemaTests
     {
         private readonly List<byte[]> _uploads = [];
 
+        public bool Fail { get; set; }
+
         public List<byte[]> Uploads
         {
             get
@@ -189,6 +221,11 @@ public sealed class StreamExternalizationSchemaTests
 
         public Task<string> UploadAsync(byte[] data, Schema schema, string? contentEncoding, CancellationToken cancellationToken)
         {
+            if (Fail)
+            {
+                throw new InvalidOperationException("storage unavailable");
+            }
+
             lock (_uploads)
             {
                 _uploads.Add(data);
