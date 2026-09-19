@@ -630,6 +630,15 @@ public sealed class RpcServer
             var actual = Unwrap(exc);
             _dispatchHook?.OnDispatchEnd(hookToken, hookInfo, actual);
             await WriteErrorStreamAsync(transport.Output, s_emptySchema, actual, cancellationToken).ConfigureAwait(false);
+            // A stream request is followed by a second IPC stream -- the client's tick/exchange
+            // input -- on the same channel, and a constructor that throws does not make the
+            // client take it back. Left unread, the next ServeOneAsync parses that input stream
+            // as a request ("missing vgi_rpc.method metadata") and answers the caller's *next*
+            // call with that error, so one refused open poisons the connection. Consume it
+            // through EOS, as the canonical Python server does (RpcServer._serve_stream). The
+            // error is written and flushed first: a lockstep client sends its input EOS only
+            // after it has read the error, so draining before replying would deadlock.
+            await DrainAbandonedInputStreamAsync(transport, cancellationToken).ConfigureAwait(false);
             await EmitAccessLogAsync(info.WireName, "stream", "error", actual.GetType().Name, actual.Message, start, streamId: streamId, cancellationToken: cancellationToken).ConfigureAwait(false);
             return true;
         }
@@ -1301,6 +1310,29 @@ public sealed class RpcServer
         catch (Exception)
         {
             return null;
+        }
+    }
+
+    /// <summary>
+    /// Reads and discards the client's tick/exchange input IPC stream (schema through EOS) for a
+    /// stream call that ended before its lockstep loop began.
+    /// </summary>
+    /// <remarks>
+    /// Best-effort, like the canonical Python server's own drain at the same point: a client
+    /// that disconnects instead of sending the stream leaves nothing to keep in sync, and the
+    /// serve loop's next read discovers the closed channel on its own.
+    /// </remarks>
+    private static async Task DrainAbandonedInputStreamAsync(IRpcTransport transport, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var inputReader = new WireReader(transport.Input);
+            _ = await inputReader.ReadSchemaAsync(cancellationToken).ConfigureAwait(false);
+            await inputReader.DrainRemainingBatchesAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            // The client closed the channel rather than sending its input stream.
         }
     }
 
