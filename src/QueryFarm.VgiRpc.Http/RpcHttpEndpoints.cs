@@ -523,6 +523,35 @@ public static class RpcHttpEndpoints
     }
 
     /// <summary>
+    /// The refusal for a request batch whose <c>vgi_rpc.request_version</c> is absent or is not
+    /// this framework's, or <see langword="null"/> when it is.
+    /// </summary>
+    /// <remarks>
+    /// The byte-stream server has always refused these (<see cref="RpcServer.ServeOneAsync"/>);
+    /// HTTP never read the key, so a request built for a different framing version was decoded
+    /// and dispatched anyway. It is the envelope version, checked before anything else in the
+    /// body is interpreted -- the reference's <c>_read_request</c> raises <c>VersionError</c>
+    /// here, which its HTTP layer answers with 400.
+    /// </remarks>
+    private static VersionException? RequestVersionFailure(AnnotatedBatch requestBatch)
+    {
+        var requestVersion = requestBatch.GetMetadata(MetadataKeys.RequestVersion);
+        if (requestVersion is null)
+        {
+            return new VersionException(
+                nameof(VersionException),
+                $"Missing '{MetadataKeys.RequestVersion}' in request batch custom_metadata. "
+                    + $"Set it to '{MetadataKeys.CurrentRequestVersion}'.");
+        }
+
+        return requestVersion == MetadataKeys.CurrentRequestVersion
+            ? null
+            : new VersionException(
+                nameof(VersionException),
+                $"Unsupported request_version '{requestVersion}' (expected '{MetadataKeys.CurrentRequestVersion}').");
+    }
+
+    /// <summary>
     /// Refuses a request whose <c>vgi_rpc.protocol</c> names a different protocol than the path
     /// resolved to. A no-op when the request carries no routing key at all.
     /// </summary>
@@ -979,6 +1008,12 @@ public static class RpcHttpEndpoints
             return;
         }
 
+        if (RequestVersionFailure(requestBatch) is { } unaryVersionFailure)
+        {
+            await ErrorResultAsync(server, protocol, method, unaryVersionFailure, StatusCodes.Status400BadRequest, info.ResultSchema, httpStatusForLog: StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
+            return;
+        }
+
         if (!await CheckProtocolAgreementAsync(
                 server, requestBatch, protocol, method, context, info.ResultSchema,
                 encoding, useCustomHeader, compressionLevel, "unary").ConfigureAwait(false))
@@ -1007,6 +1042,9 @@ public static class RpcHttpEndpoints
         object?[] args;
         try
         {
+            // After external resolution, as the reference does: the contract is the resolved
+            // batch's, not the pointer's.
+            info.ValidateRequestBatch(requestBatch.Batch);
             args = ValueCodec.ExtractRow(requestBatch.Batch, info.ParameterTypes);
         }
         catch (Exception exc)
@@ -1421,6 +1459,12 @@ public static class RpcHttpEndpoints
             return;
         }
 
+        if (RequestVersionFailure(requestBatch) is { } initVersionFailure)
+        {
+            await ErrorResultAsync(server, protocol, method, initVersionFailure, StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+
         if (!await CheckProtocolAgreementAsync(
                 server, requestBatch, protocol, method, context, s_emptySchema,
                 encoding, useCustomHeader, compressionLevel, "stream").ConfigureAwait(false))
@@ -1449,6 +1493,7 @@ public static class RpcHttpEndpoints
         object?[] args;
         try
         {
+            info.ValidateRequestBatch(requestBatch.Batch);
             args = ValueCodec.ExtractRow(requestBatch.Batch, info.ParameterTypes);
         }
         catch (Exception exc)

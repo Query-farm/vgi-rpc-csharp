@@ -510,6 +510,7 @@ public sealed class RpcServer
         object?[] args;
         try
         {
+            info.ValidateRequestBatch(request.Batch);
             args = ValueCodec.ExtractRow(request.Batch, info.ParameterTypes);
         }
         catch (Exception exc)

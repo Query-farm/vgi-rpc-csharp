@@ -180,6 +180,89 @@ public sealed class RpcMethodInfo
     }
 
     /// <summary>
+    /// Refuses a request batch that does not carry exactly this method's declared parameter
+    /// contract, before any argument is decoded or the method is dispatched.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Mirrors the canonical Python server (<c>_read_request</c>'s row check, then
+    /// <c>_validate_call_signature</c>): a non-empty request batch has exactly one row, and its
+    /// schema has the declared field count, and field by field the declared name, Arrow type and
+    /// top-level nullability. Schema and field metadata are not part of the contract.
+    /// </para>
+    /// <para>
+    /// Argument decoding is positional and lenient, so without this a request that disagreed
+    /// with the protocol reached the method anyway: an extra column was ignored, a renamed or
+    /// reordered one was read as whatever declared parameter shared its position, a second row
+    /// was dropped, and a nullability flip went unnoticed. The caller got an answer to a question
+    /// it did not ask instead of a refusal naming the disagreement.
+    /// </para>
+    /// <para>
+    /// Types are compared by their canonical protocol-hash token (<see cref="Hash.TypeTokens"/>),
+    /// the same normalisation that decides whether two ports declare the same protocol: child
+    /// nullability counts, a list's child field name does not.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="Errors.RpcException">The batch breaks the declared contract.</exception>
+    internal void ValidateRequestBatch(RecordBatch batch)
+    {
+        var actual = batch.Schema;
+        if (actual.FieldsList.Count > 0 && batch.Length != 1)
+        {
+            throw new Errors.RpcException(
+                "ProtocolError",
+                $"Expected 1 row in request batch, got {batch.Length}. Each parameter is a column (not a row).");
+        }
+
+        var declared = ParamsSchema;
+        if (actual.FieldsList.Count != declared.FieldsList.Count)
+        {
+            throw new Errors.RpcException(
+                "TypeError",
+                $"{WireName}() parameter schema expected {declared.FieldsList.Count} fields, got {actual.FieldsList.Count}");
+        }
+
+        for (var index = 0; index < declared.FieldsList.Count; index++)
+        {
+            var expected = declared.GetFieldByIndex(index);
+            var field = actual.GetFieldByIndex(index);
+            if (field.Name != expected.Name)
+            {
+                throw new Errors.RpcException(
+                    "TypeError",
+                    $"{WireName}() parameter schema field {index} expected name '{expected.Name}', got '{field.Name}'");
+            }
+
+            if (!SameArrowType(field, expected))
+            {
+                throw new Errors.RpcException(
+                    "TypeError",
+                    $"{WireName}() parameter '{field.Name}' expected Arrow type {expected.DataType} but the request batch carried {field.DataType}");
+            }
+
+            if (field.IsNullable != expected.IsNullable)
+            {
+                throw new Errors.RpcException(
+                    "TypeError",
+                    $"{WireName}() parameter '{field.Name}' expected nullable={expected.IsNullable}, but the request batch carried nullable={field.IsNullable}");
+            }
+        }
+    }
+
+    private static bool SameArrowType(Field field, Field expected)
+    {
+        try
+        {
+            return Hash.TypeTokens.TypeToken(field) == Hash.TypeTokens.TypeToken(expected);
+        }
+        catch (Hash.TypeTokens.UnsupportedArrowTypeException)
+        {
+            // A type with no canonical token is not one any declared parameter has.
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Invokes the method against <paramref name="implementation"/> with positional
     /// <paramref name="wireArgs"/> (in <see cref="Parameters"/> order — <paramref name="context"/>
     /// is appended automatically when <see cref="HasContextParameter"/>), awaiting a Task/ValueTask
