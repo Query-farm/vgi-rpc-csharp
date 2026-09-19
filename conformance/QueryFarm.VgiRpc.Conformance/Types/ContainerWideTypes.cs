@@ -16,5 +16,6 @@ public sealed class ContainerWideTypes
     /// carry it as a list.</summary>
     public HashSet<long> FrozensetInt { get; set; } = [];
 
-    public List<long> ListOptionalInt { get; set; } = [];
+    /// <summary>Mirrors <c>list[int | None]</c>: the elements themselves may be null.</summary>
+    public List<long?> ListOptionalInt { get; set; } = [];
 }

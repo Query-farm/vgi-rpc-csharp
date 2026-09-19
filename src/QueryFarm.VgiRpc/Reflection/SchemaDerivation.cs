@@ -78,7 +78,8 @@ public static class SchemaDerivation
         FieldForMember(
             wireName, parameter.ParameterType, new NullabilityInfoContext().Create(parameter),
             nested: false, largeWidth: parameter.IsDefined(typeof(LargeWidthAttribute)),
-            fixedBinaryWidth: parameter.GetCustomAttribute<FixedBinaryAttribute>()?.ByteWidth ?? 0);
+            fixedBinaryWidth: parameter.GetCustomAttribute<FixedBinaryAttribute>()?.ByteWidth ?? 0,
+            dictionaryEncoded: parameter.IsDefined(typeof(DictionaryEncodedAttribute)));
 
     /// <summary>
     /// The unary <c>result</c> field, resolved from the method's actual return annotation.
@@ -103,7 +104,8 @@ public static class SchemaDerivation
             wireName, resultClrType, info, nested: false,
             largeWidth: method.ReturnParameter.IsDefined(typeof(LargeWidthAttribute)),
             fixedBinaryWidth:
-                method.ReturnParameter.GetCustomAttribute<FixedBinaryAttribute>()?.ByteWidth ?? 0);
+                method.ReturnParameter.GetCustomAttribute<FixedBinaryAttribute>()?.ByteWidth ?? 0,
+            dictionaryEncoded: method.ReturnParameter.IsDefined(typeof(DictionaryEncodedAttribute)));
     }
 
     /// <summary>Same as <see cref="FieldForParameter"/>, for a property of a dataclass-equivalent's own fields.</summary>
@@ -115,24 +117,43 @@ public static class SchemaDerivation
             // entitled to declare large or fixed width as a method parameter is,
             // and silently ignoring the attribute made the declaration a no-op.
             largeWidth: property.IsDefined(typeof(LargeWidthAttribute)),
-            fixedBinaryWidth: property.GetCustomAttribute<FixedBinaryAttribute>()?.ByteWidth ?? 0);
+            fixedBinaryWidth: property.GetCustomAttribute<FixedBinaryAttribute>()?.ByteWidth ?? 0,
+            dictionaryEncoded: property.IsDefined(typeof(DictionaryEncodedAttribute)));
 
     private static Field FieldForMember(
         string wireName, Type clrType, NullabilityInfo info, bool nested, bool largeWidth,
-        int fixedBinaryWidth = 0)
+        int fixedBinaryWidth = 0, bool dictionaryEncoded = false)
     {
         if (Nullable.GetUnderlyingType(clrType) is { } underlying)
         {
-            return new Field(wireName, ArrowTypeForNonNullable(underlying, nested, largeWidth, fixedBinaryWidth), nullable: true);
+            return new Field(wireName, ArrowTypeForNonNullable(underlying, nested, largeWidth, fixedBinaryWidth, dictionaryEncoded), nullable: true);
         }
 
         var nullable = info.WriteState is NullabilityState.Nullable || !clrType.IsValueType && info.WriteState != NullabilityState.NotNull;
-        return new Field(wireName, ArrowTypeForNonNullable(clrType, nested, largeWidth, fixedBinaryWidth), nullable);
+        return new Field(wireName, ArrowTypeForNonNullable(clrType, nested, largeWidth, fixedBinaryWidth, dictionaryEncoded), nullable);
     }
 
     private static IArrowType ArrowTypeForNonNullable(
-        Type type, bool nested, bool largeWidth = false, int fixedBinaryWidth = 0)
+        Type type, bool nested, bool largeWidth = false, int fixedBinaryWidth = 0, bool dictionaryEncoded = false)
     {
+        // [DictionaryEncoded]: the string itself, or each string element of a collection. It is
+        // the enum wire shape with open-ended values -- see DictionaryEncodedAttribute.
+        if (dictionaryEncoded)
+        {
+            if (type == typeof(string))
+            {
+                return new DictionaryType(Int16Type.Default, StringType.Default, ordered: false);
+            }
+
+            if (TryGetElementType(type, out var encodedElement))
+            {
+                return new ListType(ElementField("item", encodedElement, nested: true, forceNonNullable: false, dictionaryEncoded: true));
+            }
+
+            throw new InvalidOperationException(
+                $"[DictionaryEncoded] applies to string or a collection of string, not '{type}'.");
+        }
+
         // A declared fixed width wins over the variable-width type a byte[]
         // would otherwise infer: they are different Arrow types, and only the
         // declaration says which one the protocol means.
@@ -254,13 +275,14 @@ public static class SchemaDerivation
             return new DictionaryType(Int16Type.Default, StringType.Default, ordered: false);
         }
 
-        // A RecordBatch always serializes as an opaque binary blob (embedded IPC bytes) — never
-        // subject to the nested/top-level dataclass two-tier rule below, since it isn't a
-        // dataclass-equivalent with properties to reflect over; it's serialized directly by
-        // ValueCodec's RecordBatch-as-binary build/extract helpers. Matches Python's own rule
-        // (pa.RecordBatch/pa.Schema -> pa.binary(), see _infer_arrow_type) — only RecordBatch is
-        // implemented here; pa.Schema-as-field has no CLR-side caller yet.
-        if (type == typeof(RecordBatch))
+        // A RecordBatch or a Schema always serializes as an opaque binary blob (embedded IPC
+        // bytes) — never subject to the nested/top-level dataclass two-tier rule below, since
+        // neither is a dataclass-equivalent with properties to reflect over; ValueCodec's
+        // RecordBatch-/Schema-as-binary helpers serialize them directly. Matches Python's own rule
+        // (pa.RecordBatch/pa.Schema -> pa.binary(), see _infer_arrow_type). A Schema used to fall
+        // through to that rule and be reflected over as if it were a record, so EmbeddedArrow's
+        // `schema` field could be neither read nor written.
+        if (type == typeof(RecordBatch) || type == typeof(Schema))
         {
             return BinaryType.Default;
         }
@@ -292,10 +314,10 @@ public static class SchemaDerivation
     /// <see cref="NullabilityInfoContext"/> source for a bare generic-argument type, so
     /// reference-type elements default to nullable, matching <see cref="ArrowTypeFor(Type, out bool)"/>'s
     /// top-level-parameter behavior).</summary>
-    private static Field ElementField(string name, Type elementType, bool nested, bool forceNonNullable)
+    private static Field ElementField(string name, Type elementType, bool nested, bool forceNonNullable, bool dictionaryEncoded = false)
     {
         var underlying = Nullable.GetUnderlyingType(elementType);
-        var type = ArrowTypeForNonNullable(underlying ?? elementType, nested);
+        var type = ArrowTypeForNonNullable(underlying ?? elementType, nested, dictionaryEncoded: dictionaryEncoded);
         // A list item and a map value are nullable by Arrow's convention,
         // regardless of the CLR element type -- which describes the *values*, not
         // the type. Deriving nullability from `IsClass` instead made
@@ -380,10 +402,20 @@ public static class SchemaDerivation
     private static StructType NestedStructTypeFor(Type type) =>
         s_nestedStructTypeCache.GetOrAdd(type, static t => new StructType(PropertyFields(t, nested: true)));
 
+    // Reads the width declarations from the property, exactly as FieldForProperty does. This is
+    // the derivation a record's own embedded schema (and a nested struct's type) is built from,
+    // so hardcoding largeWidth: false here made [LargeWidth]/[FixedBinary] on a record field a
+    // no-op for the one schema that actually goes on the wire: WideTypes' large_string_field and
+    // fixed_binary_field went out as utf8 and binary while the reference declares large_utf8 and
+    // fixed_size_binary(8).
     private static Field[] PropertyFields(Type type, bool nested) =>
         type
             .GetProperties(BindingFlags.Public | BindingFlags.Instance)
             .Where(p => p.CanRead && p.GetIndexParameters().Length == 0)
-            .Select(p => FieldForMember(WireNaming.ForProperty(p), p.PropertyType, new NullabilityInfoContext().Create(p), nested, largeWidth: false))
+            .Select(p => FieldForMember(
+                WireNaming.ForProperty(p), p.PropertyType, new NullabilityInfoContext().Create(p), nested,
+                largeWidth: p.IsDefined(typeof(LargeWidthAttribute)),
+                fixedBinaryWidth: p.GetCustomAttribute<FixedBinaryAttribute>()?.ByteWidth ?? 0,
+                dictionaryEncoded: p.IsDefined(typeof(DictionaryEncodedAttribute))))
             .ToArray();
 }
