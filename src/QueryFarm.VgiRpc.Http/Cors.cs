@@ -2,6 +2,9 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Cors.Infrastructure;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace QueryFarm.VgiRpc.Http;
 
@@ -32,22 +35,42 @@ public static class Cors
     /// <summary>
     /// Computes the <c>Access-Control-Expose-Headers</c> list for a server configured with the
     /// given options — every custom response header a browser client would otherwise be unable
-    /// to read cross-origin. Matches Python's conditional-append pattern in <c>_factory.py</c>
-    /// exactly (a header is exposed if and only if the corresponding feature is actually
-    /// configured), narrowed to what this port currently implements — extend this list as later
-    /// milestones (sticky sessions, proxy proof) add their own headers.
+    /// to read cross-origin. Follows Python's list in <c>_factory.py</c>.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Only the two headers this method is told about stay conditional. The rest are exposed
+    /// unconditionally, because <see cref="AddVgiRpcCors"/> is registered separately from
+    /// <c>MapVgiRpc</c> and cannot see whether request caps, externalization, uploads, sticky
+    /// sessions or proxy proof are configured -- and naming a header a server never sends has no
+    /// effect, while leaving out one it does send hides it from every browser client. That is
+    /// what this list used to do for <c>VGI-Max-Request-Bytes</c>, <c>VGI-Max-Upload-Bytes</c>,
+    /// the externalized-response cap, the proof and sticky headers and <c>X-Request-ID</c>, all of
+    /// which the reference exposes (reference suite <c>TestCors</c>).
+    /// </para>
+    /// </remarks>
     public static string[] ExposedHeaders(long? maxResponseBytes = null, string? proxyHint = null)
     {
         var headers = new List<string>
         {
+            "WWW-Authenticate",
+            "X-Request-ID",
             RpcHttpEndpoints.RpcErrorHeader,
             "X-VGI-Content-Encoding",
             "VGI-Auth-Reason",
+            "VGI-Max-Request-Bytes",
+            "VGI-Max-Externalized-Response-Bytes",
             "VGI-Externalization-Enabled",
             "VGI-Upload-URL-Support",
+            "VGI-Max-Upload-Bytes",
             "VGI-Supported-Encodings",
             RpcHttpEndpoints.AcceptMaxResponseBytesSupportHeader,
+            ProxyProof.ProofRequiredHeader,
+            "VGI-Sticky-Enabled",
+            "VGI-Sticky-Default-TTL",
+            "VGI-Sticky-Echo-Headers",
+            "VGI-Session",
+            "VGI-Session-Close",
         };
         if (maxResponseBytes is not null)
         {
@@ -90,7 +113,7 @@ public static class Cors
     {
         var exposedHeaders = ExposedHeaders(maxResponseBytes, proxyHint);
         var effectiveMaxAge = maxAge ?? TimeSpan.FromHours(2);
-        return services.AddCors(options => options.AddPolicy(policyName, policy =>
+        services.AddCors(options => options.AddPolicy(policyName, policy =>
         {
             policy.WithOrigins([.. origins])
                 .WithMethods("GET", "HEAD", "POST", "OPTIONS")
@@ -98,6 +121,32 @@ public static class Cors
                 .WithExposedHeaders(exposedHeaders)
                 .SetPreflightMaxAge(effectiveMaxAge);
         }));
+        services.Replace(ServiceDescriptor.Transient<ICorsService, PreflightExposingCorsService>());
+        return services;
+    }
+
+    /// <summary>
+    /// ASP.NET Core's <see cref="CorsService"/>, which also writes
+    /// <c>Access-Control-Expose-Headers</c> on an allowed preflight.
+    /// </summary>
+    /// <remarks>
+    /// The stock service writes the exposed list only on the actual response. The reference server
+    /// (Falcon's <c>CORSMiddleware</c>) writes it on every CORS response, preflight included, and
+    /// the reference suite's <c>TestCors</c> reads the list off the preflight. A browser takes it
+    /// from the actual response, where both already agreed, so this changes what a conformance
+    /// probe sees and nothing a browser does.
+    /// </remarks>
+    private sealed class PreflightExposingCorsService(IOptions<CorsOptions> options, ILoggerFactory loggerFactory)
+        : CorsService(options, loggerFactory)
+    {
+        public override void ApplyResult(CorsResult result, HttpResponse response)
+        {
+            base.ApplyResult(result, response);
+            if (result.IsPreflightRequest && result.IsOriginAllowed && result.AllowedExposedHeaders.Count > 0)
+            {
+                response.Headers.AccessControlExposeHeaders = string.Join(",", result.AllowedExposedHeaders);
+            }
+        }
     }
 
     /// <summary>
