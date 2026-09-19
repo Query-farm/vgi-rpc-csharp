@@ -1665,7 +1665,21 @@ public static class RpcHttpEndpoints
             // Under the declared output schema, not the emitted batch's own: the pointer is written
             // into a stream of outputSchema, and the object must name the schema the pointer
             // does. See ExternalLocation.MaybeExternalizeAsync(..., streamSchema, ...).
-            (tickEmitted, tickEmittedMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(tickEmitted, outputSchema, tickEmittedMetadata, externalConfig, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                (tickEmitted, tickEmittedMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(tickEmitted, outputSchema, tickEmittedMetadata, externalConfig, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception exc) when (!cancellationToken.IsCancellationRequested)
+            {
+                // A failed upload is this call's error, answered like any other: left to escape,
+                // it became the host's bare 500 -- no Arrow body, none of the response headers a
+                // capped client requires -- and the client could only report a protocol violation.
+                registry.Remove(callKey);
+                stickyState?.ReleaseLockIfHeld();
+                await ErrorResultAsync(server, protocol, method, exc, StatusCodes.Status500InternalServerError, outputSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
+                return;
+            }
+
             tickEmittedOwner!.Replace(tickEmitted);
         }
 
@@ -2060,7 +2074,23 @@ public static class RpcHttpEndpoints
             }
 
             // Under the declared output schema -- see the matching comment in HandleStreamInitAsync.
-            (emittedBatch, emittedBatchMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(emittedBatch, outputSchema, emittedBatchMetadata, externalConfig, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                (emittedBatch, emittedBatchMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(emittedBatch, outputSchema, emittedBatchMetadata, externalConfig, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception exc) when (!cancellationToken.IsCancellationRequested)
+            {
+                // As at /init: a failed upload is answered as this turn's error, not escaped.
+                registry.Remove(callKey);
+                if (stickyState is not null)
+                {
+                    FinishSticky(context, sticky!, stickyState);
+                }
+
+                await ErrorResultAsync(server, protocol, method, exc, StatusCodes.Status500InternalServerError, outputSchema, StatusCodes.Status200OK, context, encoding, useCustomHeader, compressionLevel, methodType: "stream", streamId: callKey).ConfigureAwait(false);
+                return;
+            }
+
             emittedBatchOwner!.Replace(emittedBatch);
         }
 
