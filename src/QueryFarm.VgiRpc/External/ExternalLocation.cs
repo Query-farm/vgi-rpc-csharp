@@ -71,10 +71,18 @@ public static class ExternalLocation
 
     /// <summary>Serializes a single batch (schema + one batch + EOS) as a standalone IPC stream —
     /// the exact bytes uploaded to storage or fetched back on resolution.</summary>
-    public static async Task<byte[]> SerializeBatchAsync(RecordBatch batch, IReadOnlyDictionary<string, string>? metadata, CancellationToken cancellationToken = default)
+    public static Task<byte[]> SerializeBatchAsync(RecordBatch batch, IReadOnlyDictionary<string, string>? metadata, CancellationToken cancellationToken = default) =>
+        SerializeBatchAsync(batch, batch.Schema, metadata, cancellationToken);
+
+    /// <summary>Serializes a single batch as a standalone IPC stream whose schema message is
+    /// <paramref name="schema"/> rather than <paramref name="batch"/>'s own.</summary>
+    /// <remarks>An IPC record batch message carries no schema: the stream's schema message
+    /// describes it. This is the same substitution an inline response makes when it writes an
+    /// emitted batch into a stream opened with the method's declared schema.</remarks>
+    public static async Task<byte[]> SerializeBatchAsync(RecordBatch batch, Schema schema, IReadOnlyDictionary<string, string>? metadata, CancellationToken cancellationToken = default)
     {
         using var buffer = new MemoryStream();
-        await using (var writer = new WireWriter(buffer, batch.Schema))
+        await using (var writer = new WireWriter(buffer, schema))
         {
             await writer.WriteBatchAsync(new AnnotatedBatch(batch, metadata), cancellationToken).ConfigureAwait(false);
         }
@@ -91,9 +99,38 @@ public static class ExternalLocation
     /// <see cref="PredictExternalizeBytes"/> <i>before</i> calling this (the whole point of a
     /// predict/refuse split — see that method's doc comment).
     /// </summary>
+    public static Task<(RecordBatch Batch, IReadOnlyDictionary<string, string>? Metadata, int ExternalBytes)> MaybeExternalizeAsync(
+        RecordBatch batch, IReadOnlyDictionary<string, string>? metadata, ServerExternalConfig config, CancellationToken cancellationToken = default) =>
+        MaybeExternalizeAsync(batch, batch.Schema, metadata, config, cancellationToken);
+
+    /// <summary>
+    /// <see cref="MaybeExternalizeAsync(RecordBatch, IReadOnlyDictionary{string, string}?, ServerExternalConfig, CancellationToken)"/>
+    /// for a batch that will be written into an IPC stream whose schema is
+    /// <paramref name="streamSchema"/> -- a stream turn's output, whose declared schema can differ
+    /// from the schema object the state built its batch with.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The pointer and the object must agree. The pointer is a batch of the stream it is written
+    /// into, so its schema is <paramref name="streamSchema"/> whatever the pointer batch was built
+    /// with; the object is a standalone IPC stream that names its own schema. A reader resolving
+    /// the pointer compares the two exactly, nullability included (the reference raises
+    /// "Schema mismatch in ExternalLocation").
+    /// </para>
+    /// <para>
+    /// Serializing the object with <paramref name="batch"/>'s own schema broke that whenever the
+    /// two differed only where an inline response never shows it: an exchange that emits its
+    /// input batch carries the <em>client's</em> schema, typically <c>value: double</c>, into a
+    /// stream declared <c>value: double not null</c>. Inline, the batch body is read under the
+    /// declared schema and nothing is visible; externalized, the object said nullable and the
+    /// pointer said not, and the turn failed. Writing both halves under the stream schema makes
+    /// the externalized object exactly what the inline response would have carried.
+    /// </para>
+    /// </remarks>
     public static async Task<(RecordBatch Batch, IReadOnlyDictionary<string, string>? Metadata, int ExternalBytes)> MaybeExternalizeAsync(
-        RecordBatch batch, IReadOnlyDictionary<string, string>? metadata, ServerExternalConfig config, CancellationToken cancellationToken = default)
+        RecordBatch batch, Schema streamSchema, IReadOnlyDictionary<string, string>? metadata, ServerExternalConfig config, CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(streamSchema);
         if (config.Storage is null || batch.Length == 0)
         {
             return (batch, metadata, 0);
@@ -104,7 +141,7 @@ public static class ExternalLocation
             return (batch, metadata, 0);
         }
 
-        var ipcBytes = await SerializeBatchAsync(batch, metadata, cancellationToken).ConfigureAwait(false);
+        var ipcBytes = await SerializeBatchAsync(batch, streamSchema, metadata, cancellationToken).ConfigureAwait(false);
         var dataSha256 = Convert.ToHexStringLower(SHA256.HashData(ipcBytes));
 
         string? contentEncoding = null;
@@ -115,8 +152,8 @@ public static class ExternalLocation
             contentEncoding = compression.Algorithm;
         }
 
-        var url = await config.Storage.UploadAsync(ipcBytes, batch.Schema, contentEncoding, cancellationToken).ConfigureAwait(false);
-        var (pointerBatch, pointerMetadata) = MakePointerBatch(batch.Schema, url, dataSha256);
+        var url = await config.Storage.UploadAsync(ipcBytes, streamSchema, contentEncoding, cancellationToken).ConfigureAwait(false);
+        var (pointerBatch, pointerMetadata) = MakePointerBatch(streamSchema, url, dataSha256);
         return (pointerBatch, pointerMetadata, rawSize);
     }
 

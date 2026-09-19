@@ -1607,7 +1607,10 @@ public static class RpcHttpEndpoints
                 return;
             }
 
-            (tickEmitted, tickEmittedMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(tickEmitted, tickEmittedMetadata, externalConfig, cancellationToken).ConfigureAwait(false);
+            // Under the declared output schema, not the emitted batch's own: the pointer is written
+            // into a stream of outputSchema, and the object must name the schema the pointer
+            // does. See ExternalLocation.MaybeExternalizeAsync(..., streamSchema, ...).
+            (tickEmitted, tickEmittedMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(tickEmitted, outputSchema, tickEmittedMetadata, externalConfig, cancellationToken).ConfigureAwait(false);
             tickEmittedOwner!.Replace(tickEmitted);
         }
 
@@ -2001,7 +2004,8 @@ public static class RpcHttpEndpoints
                 return;
             }
 
-            (emittedBatch, emittedBatchMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(emittedBatch, emittedBatchMetadata, externalConfig, cancellationToken).ConfigureAwait(false);
+            // Under the declared output schema -- see the matching comment in HandleStreamInitAsync.
+            (emittedBatch, emittedBatchMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(emittedBatch, outputSchema, emittedBatchMetadata, externalConfig, cancellationToken).ConfigureAwait(false);
             emittedBatchOwner!.Replace(emittedBatch);
         }
 
