@@ -954,7 +954,11 @@ def _arrow_request_body(method: str) -> bytes:
     from vgi_rpc.utils import new_ipc_stream
 
     buf = __import__("io").BytesIO()
-    schema = pa.schema([pa.field("value", pa.utf8())])
+    # Non-nullable, as echo_string declares it: the parameter contract includes top-level
+    # nullability, and a server enforcing it -- as the reference does and this port now does --
+    # refuses pyarrow's default nullable field with 400 before the test sees the response it
+    # is actually about.
+    schema = pa.schema([pa.field("value", pa.utf8(), nullable=False)])
     with new_ipc_stream(buf, schema) as writer:
         writer.write_batch(
             pa.RecordBatch.from_pydict({"value": ["x"]}, schema=schema),
