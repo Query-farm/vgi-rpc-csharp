@@ -252,7 +252,8 @@ public interface IConformanceService
 
     /// <summary>A dictionary-encoded string echoed as itself. Distinct from
     /// <c>echo_enum</c>: the wire type is the same, but this one is not a closed set.</summary>
-    Task<Status> EchoDictEncodedStringAsync(Status value);
+    [return: DictionaryEncoded]
+    Task<string> EchoDictEncodedStringAsync([DictionaryEncoded] string value);
 
     /// <summary>An 8-byte fixed-width binary echo -- <c>fixed_size_binary(8)</c>, not the
     /// variable-width <c>binary</c> a bare byte[] infers.</summary>

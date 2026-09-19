@@ -1,5 +1,6 @@
 using System.Reflection;
 using Apache.Arrow;
+using Apache.Arrow.Arrays;
 using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
 
@@ -18,8 +19,11 @@ namespace QueryFarm.VgiRpc.Reflection;
 /// enums (dictionary-encoded), nested dataclass-equivalents (embedded-IPC-in-binary — see
 /// <see cref="BuildEmbeddedRecordArray"/>), and <see cref="RecordBatch"/> as a field value
 /// (embedded IPC bytes directly, no property reflection — see
-/// <see cref="BuildRecordBatchBinaryArray"/>). The wide/temporal/decimal-in-container and
-/// dictionary-encoding-override Arrow types are still deferred — see docs/roadmap.md.</para>
+/// <see cref="BuildRecordBatchBinaryArray"/>), a <see cref="Schema"/> field (the schema message
+/// alone — see <see cref="BuildSchemaBinaryArray"/>), <c>fixed_size_binary</c>, dictionary-encoded
+/// strings (<see cref="DictionaryEncodedAttribute"/>), and list/map elements of any type a
+/// top-level field supports (decimal, date, timestamp and the like are built element by element
+/// — see <see cref="BuildElementValues"/>).</para>
 /// </summary>
 public static class ValueCodec
 {
@@ -167,6 +171,7 @@ public static class ValueCodec
             StringType => new StringArray.Builder().Append((string)value).Build(),
             BinaryType when value is byte[] bytes => new BinaryArray.Builder().Append(bytes).Build(),
             BinaryType when value is RecordBatch recordBatchValue => BuildRecordBatchBinaryArray(recordBatchValue),
+            BinaryType when value is Schema schemaValue => BuildSchemaBinaryArray(schemaValue),
             BinaryType => BuildEmbeddedRecordArray(value),
             // LargeStringType/LargeBinaryType: only reachable via a [LargeWidth] parameter/return
             // (see LargeWidthAttribute) — used for the conformance suite's echo_large_string/
@@ -195,8 +200,12 @@ public static class ValueCodec
             Time64Type time64Type => new Time64Array.Builder(time64Type).Append((TimeOnly)value).Build(),
             DurationType durationType => new DurationArray.Builder(durationType).Append((TimeSpan)value).Build(),
             Decimal128Type decimal128Type => new Decimal128Array.Builder(decimal128Type).Append((decimal)value).Build(),
+            // After Decimal128Type: in this Arrow binding the decimal types derive from
+            // FixedSizeBinaryType, so this arm would otherwise swallow them.
+            FixedSizeBinaryType fixedSizeBinaryType => BuildFixedSizeBinaryArray(fixedSizeBinaryType, (byte[])value),
             ListType listType => BuildListArray(listType, (System.Collections.IEnumerable)value),
             StructType structType => BuildStructArray(structType, value, isEmpty: false),
+            DictionaryType dictType when value is string text => BuildDictionaryStringArray(dictType, [text]),
             DictionaryType dictType => BuildEnumArray(dictType, value),
             MapType mapType => BuildMapArray(mapType, (System.Collections.IDictionary)value),
             var other => throw NotSupportedYet(other),
@@ -357,6 +366,16 @@ public static class ValueCodec
             return BuildListOfEnumArray(listType, elementDictType, items);
         }
 
+        // The builder path below appends through AppendScalarToBuilder, which knows only the
+        // common scalar types, and ArrowArrayBuilderFactory builds some element builders with a
+        // default rather than the declared type (a timestamp's unit and zone). Anything else --
+        // decimal, date, timestamp, the fixed and large widths -- is built one element at a time
+        // by the same single-value path a top-level field uses, then concatenated.
+        if (!IsBuilderAppendable(listType.ValueDataType))
+        {
+            return BuildListFromElementArrays(listType, items);
+        }
+
         var builder = new ListArray.Builder(listType.ValueField);
         if (items is null)
         {
@@ -423,7 +442,11 @@ public static class ValueCodec
 
         var elements = items.Cast<object?>().ToList();
         var enumClrType = InferEnumClrTypeFromEnumerable(items, elements);
-        var values = BuildEnumArrayMulti(elementType, enumClrType, elements);
+        // A [DictionaryEncoded] List<string> shares this wire shape with a list of enum; its
+        // dictionary is the values themselves rather than a closed set of member names.
+        var values = enumClrType == typeof(string)
+            ? BuildDictionaryStringArray(elementType, elements.Cast<string?>().ToList())
+            : BuildEnumArrayMulti(elementType, enumClrType, elements);
 
         var offsetsBuilder = new ArrowBuffer.Builder<int>();
         offsetsBuilder.Append(0);
@@ -592,6 +615,38 @@ public static class ValueCodec
     }
 
     /// <summary>
+    /// Encodes a <see cref="Schema"/> field value as the IPC schema message alone -- what
+    /// Python's <c>pa.Schema.serialize()</c> produces and <c>pa.ipc.read_schema</c> reads back.
+    /// No record batch and no end-of-stream marker follow it, which is what distinguishes it from
+    /// <see cref="BuildRecordBatchBinaryArray"/>'s whole stream.
+    /// </summary>
+    private static IArrowArray BuildSchemaBinaryArray(Schema schema)
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new ArrowStreamWriter(stream, schema, leaveOpen: true))
+        {
+            writer.WriteStart();
+        }
+
+        return new BinaryArray.Builder().Append(stream.ToArray()).Build();
+    }
+
+    /// <summary>Inverse of <see cref="BuildSchemaBinaryArray"/>. Zero bytes read as absent, as
+    /// the reference does: a genuinely empty schema still serializes to a full schema message,
+    /// so an empty buffer only comes from a producer that skipped the field.</summary>
+    private static Schema? ExtractSchemaFromBinary(byte[] bytes)
+    {
+        if (bytes.Length == 0)
+        {
+            return null;
+        }
+
+        using var stream = new MemoryStream(bytes);
+        using var reader = new ArrowStreamReader(stream);
+        return reader.Schema;
+    }
+
+    /// <summary>
     /// Builds a single-row dictionary-encoded array for an enum value: the dictionary holds
     /// every member's wire name (in declaration order — a stable, deterministic ordering both
     /// sides can reproduce independently), and the one index selects <paramref name="value"/>'s
@@ -692,6 +747,12 @@ public static class ValueCodec
         if (mapType.ValueField.DataType is DictionaryType)
         {
             return BuildMapArrayWithEnumValues(mapType, entries);
+        }
+
+        // Same limits as the list builder path -- see BuildListArray.
+        if (!IsBuilderAppendable(mapType.KeyField.DataType) || !IsBuilderAppendable(mapType.ValueField.DataType))
+        {
+            return BuildMapFromEntryArrays(mapType, entries);
         }
 
         var builder = new MapArray.Builder(mapType);
@@ -817,6 +878,161 @@ public static class ValueCodec
         throw new InvalidOperationException($"No property on '{clrType}' maps to wire field '{wireField.Name}'.");
     }
 
+    /// <summary>True for an element type <see cref="AppendScalarToBuilder"/> can append to a
+    /// builder from <c>ArrowArrayBuilderFactory</c> with the declared type intact.</summary>
+    private static bool IsBuilderAppendable(IArrowType type) => type switch
+    {
+        StringType or BinaryType or BooleanType or Int32Type or Int64Type or DoubleType or FloatType => true,
+        ListType inner => IsBuilderAppendable(inner.ValueDataType),
+        _ => false,
+    };
+
+    /// <summary>The values of a list or map column, built one element at a time through
+    /// <see cref="BuildSingleValueArray"/> and concatenated -- every element type a top-level
+    /// field supports, at the cost of an array per element.</summary>
+    private static IArrowArray BuildElementValues(Field elementField, IReadOnlyList<object?> elements)
+    {
+        if (elements.Count == 0)
+        {
+            return BuildEmptyArray(elementField.DataType);
+        }
+
+        var arrays = new List<IArrowArray>(elements.Count);
+        try
+        {
+            foreach (var element in elements)
+            {
+                arrays.Add(BuildSingleValueArray(elementField, element));
+            }
+
+            return arrays.Count == 1 ? arrays[0] : ArrowArrayConcatenator.Concatenate(arrays);
+        }
+        finally
+        {
+            if (arrays.Count > 1)
+            {
+                foreach (var array in arrays)
+                {
+                    array.Dispose();
+                }
+            }
+        }
+    }
+
+    private static IArrowArray BuildListFromElementArrays(ListType listType, System.Collections.IEnumerable? items)
+    {
+        if (items is null)
+        {
+            var nullOffsets = new ArrowBuffer.Builder<int>().Append(0).Append(0).Build();
+            var nullValidity = new ArrowBuffer.BitmapBuilder().Append(false).Build();
+            return new ListArray(new ArrayData(
+                listType, length: 1, nullCount: 1, 0, [nullValidity, nullOffsets],
+                [BuildEmptyArray(listType.ValueDataType).Data]));
+        }
+
+        var elements = items.Cast<object?>().ToList();
+        var values = BuildElementValues(listType.ValueField, elements);
+        var offsets = new ArrowBuffer.Builder<int>().Append(0).Append(elements.Count).Build();
+        return new ListArray(new ArrayData(
+            listType, length: 1, nullCount: 0, 0, [ArrowBuffer.Empty, offsets], [values.Data]));
+    }
+
+    private static IArrowArray BuildMapFromEntryArrays(MapType mapType, System.Collections.IDictionary? entries)
+    {
+        var entryType = new StructType([mapType.KeyField, mapType.ValueField]);
+        if (entries is null)
+        {
+            var emptyEntries = BuildStructArray(entryType, value: null, isEmpty: true);
+            var nullOffsets = new ArrowBuffer.Builder<int>().Append(0).Append(0).Build();
+            var nullValidity = new ArrowBuffer.BitmapBuilder().Append(false).Build();
+            return new MapArray(new ArrayData(mapType, length: 1, nullCount: 1, 0, [nullValidity, nullOffsets], [emptyEntries.Data]));
+        }
+
+        // A foreach over the IDictionary-typed reference, not Cast<DictionaryEntry>() -- see
+        // BuildMapArrayWithEnumValues for why the latter enumerates KeyValuePair<K,V> instead.
+        var keys = new List<object?>();
+        var values = new List<object?>();
+        foreach (System.Collections.DictionaryEntry entry in entries)
+        {
+            keys.Add(entry.Key);
+            values.Add(entry.Value);
+        }
+
+        var keyArray = BuildElementValues(mapType.KeyField, keys);
+        var valueArray = BuildElementValues(mapType.ValueField, values);
+        var entriesArray = new StructArray(new ArrayData(
+            entryType, length: keys.Count, nullCount: 0, 0, [ArrowBuffer.Empty], [keyArray.Data, valueArray.Data]));
+        var offsets = new ArrowBuffer.Builder<int>().Append(0).Append(keys.Count).Build();
+        return new MapArray(new ArrayData(mapType, length: 1, nullCount: 0, 0, [ArrowBuffer.Empty, offsets], [entriesArray.Data]));
+    }
+
+    /// <summary>
+    /// A <c>dictionary&lt;int16, utf8&gt;</c> column of plain strings -- a
+    /// <see cref="DictionaryEncodedAttribute"/> value, or each element of one. The dictionary is
+    /// the distinct values in first-seen order; a null element is a null index.
+    /// </summary>
+    /// <remarks>
+    /// Shares its wire shape with an enum but not its semantics: an enum's dictionary is a closed
+    /// set of member names, this one is whatever the values are. Reading one as the other is
+    /// what made every value but a <c>Status</c> member name fail with "Enum ... has no member
+    /// matching wire name 'hello'".
+    /// </remarks>
+    private static IArrowArray BuildDictionaryStringArray(DictionaryType dictType, IReadOnlyList<string?> values)
+    {
+        if (dictType.IndexType is not Int16Type || dictType.ValueType is not StringType)
+        {
+            throw new NotSupportedException(
+                $"Dictionary-encoded strings are built as dictionary<int16, utf8>, not {dictType}.");
+        }
+
+        var dictionary = new List<string>();
+        var positions = new Dictionary<string, short>(StringComparer.Ordinal);
+        var indices = new Int16Array.Builder();
+        foreach (var value in values)
+        {
+            if (value is null)
+            {
+                indices.AppendNull();
+                continue;
+            }
+
+            if (!positions.TryGetValue(value, out var position))
+            {
+                position = checked((short)dictionary.Count);
+                positions[value] = position;
+                dictionary.Add(value);
+            }
+
+            indices.Append(position);
+        }
+
+        return new DictionaryArray(dictType, indices.Build(), new StringArray.Builder().AppendRange(dictionary).Build());
+    }
+
+    /// <summary>One dictionary-encoded string, whatever the index width of the array that
+    /// carries it -- a peer is free to choose any integer index type.</summary>
+    private static string ExtractDictionaryString(DictionaryArray array, int index)
+    {
+        long position = array.Indices switch
+        {
+            Int8Array a => a.Values[index],
+            UInt8Array a => a.Values[index],
+            Int16Array a => a.Values[index],
+            UInt16Array a => a.Values[index],
+            Int32Array a => a.Values[index],
+            UInt32Array a => a.Values[index],
+            Int64Array a => a.Values[index],
+            var other => throw new NotSupportedException($"Dictionary index type {other.Data.DataType} is not supported."),
+        };
+
+        return array.Dictionary switch
+        {
+            StringArray values => values.GetString(checked((int)position)),
+            LargeStringArray values => values.GetString(checked((int)position)),
+            var other => throw new NotSupportedException($"Dictionary value type {other.Data.DataType} is not a string type."),
+        };
+    }
+
     private static void AppendScalarToBuilder(IArrowArrayBuilder<IArrowArray, IArrowArrayBuilder<IArrowArray>> builder, IArrowType elementType, object? value)
     {
         switch (elementType)
@@ -901,6 +1117,7 @@ public static class ValueCodec
             LargeBinaryArray a when effectiveType == typeof(byte[]) => ExtractLargeBinaryValue(a, index),
             BinaryArray a when effectiveType == typeof(byte[]) => a.GetBytes(index).ToArray(),
             BinaryArray a when effectiveType == typeof(RecordBatch) => ExtractRecordBatchFromBinary(a.GetBytes(index).ToArray()),
+            BinaryArray a when effectiveType == typeof(Schema) => ExtractSchemaFromBinary(a.GetBytes(index).ToArray()),
             BinaryArray a => ExtractEmbeddedRecord(a.GetBytes(index).ToArray(), effectiveType),
             BooleanArray a => a.GetValue(index)!.Value,
             Int8Array a => a.Values[index],
@@ -924,12 +1141,31 @@ public static class ValueCodec
             Time64Array a => a.GetTime(index)!.Value,
             DurationArray a => a.GetTimeSpan(index)!.Value,
             Decimal128Array a => a.GetValue(index)!.Value,
+            // After Decimal128Array, which derives from FixedSizeBinaryArray in this binding.
+            FixedSizeBinaryArray a when effectiveType == typeof(byte[]) => a.GetBytes(index).ToArray(),
             MapArray a => ExtractMap(a, index, effectiveType),
             ListArray a => ExtractList(a, index, effectiveType),
             StructArray a => ExtractStruct(a, index, effectiveType),
+            DictionaryArray a when effectiveType == typeof(string) => ExtractDictionaryString(a, index),
             DictionaryArray a => ExtractEnum(a, index, effectiveType),
             _ => throw NotSupportedYet(array.Data.DataType),
         };
+    }
+
+    /// <summary>One row of <c>fixed_size_binary(n)</c>. The width is part of the type, so a value
+    /// of any other length is refused rather than padded or truncated.</summary>
+    private static FixedSizeBinaryArray BuildFixedSizeBinaryArray(FixedSizeBinaryType type, byte[] value)
+    {
+        if (value.Length != type.ByteWidth)
+        {
+            throw new ArgumentException(
+                $"fixed_size_binary({type.ByteWidth}) value must be exactly {type.ByteWidth} bytes, got {value.Length}.",
+                nameof(value));
+        }
+
+        return new FixedSizeBinaryArray(new ArrayData(
+            type, length: 1, nullCount: 0, offset: 0,
+            [ArrowBuffer.Empty, new ArrowBuffer.Builder<byte>(value.Length).Append(value).Build()]));
     }
 
     private static LargeBinaryArray BuildLargeBytesArray(LargeBytesBuffer value)
@@ -1013,13 +1249,30 @@ public static class ValueCodec
             return typedArray;
         }
 
-        var listInstance = (System.Collections.IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(elementType))!;
+        var listType = typeof(List<>).MakeGenericType(elementType);
+        var listInstance = (System.Collections.IList)Activator.CreateInstance(listType)!;
         foreach (var item in list)
         {
             listInstance.Add(item);
         }
 
-        return listInstance;
+        if (clrListType.IsAssignableFrom(listType))
+        {
+            return listInstance;
+        }
+
+        // A set (frozenset on the wire is a list -- Arrow has no set type): HashSet<T>, ISet<T>,
+        // IReadOnlySet<T>. Returning the List<T> unconditionally worked only where nothing typed
+        // it -- a set-typed record field or parameter failed PropertyInfo.SetValue with "Object of
+        // type List<T> cannot be converted to type HashSet<T>".
+        var setType = typeof(HashSet<>).MakeGenericType(elementType);
+        if (clrListType.IsAssignableFrom(setType))
+        {
+            return Activator.CreateInstance(setType, listInstance)!;
+        }
+
+        throw new NotSupportedException(
+            $"Cannot materialize an Arrow list as '{clrListType}': supported shapes are T[], List<T> and its interfaces, and HashSet<T> and its interfaces.");
     }
 
     private static NotSupportedException NotSupportedYet(IArrowType type) =>

@@ -189,7 +189,8 @@ public sealed class ConformanceServiceImpl : IConformanceService
 
     public Task<EmbeddedArrow> EchoEmbeddedArrowAsync(EmbeddedArrow data) => Task.FromResult(data);
 
-    public Task<Status> EchoDictEncodedStringAsync(Status value) => Task.FromResult(value);
+    [return: DictionaryEncoded]
+    public Task<string> EchoDictEncodedStringAsync([DictionaryEncoded] string value) => Task.FromResult(value);
 
     [return: FixedBinary(8)]
     public Task<byte[]> EchoFixedBinaryAsync([FixedBinary(8)] byte[] value) => Task.FromResult(value);
