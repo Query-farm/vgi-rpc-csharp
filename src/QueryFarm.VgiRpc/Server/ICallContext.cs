@@ -73,4 +73,36 @@ public interface ICallContext
     /// <see cref="OpenSession"/>'s doc comment for why).</exception>
     void CloseSession() =>
         throw new RpcException("RuntimeError", "sticky sessions not available on this transport");
+
+    /// <summary>
+    /// Answers this unary call with a pre-published <see cref="External.ExternalRef"/> instead of
+    /// the method's return value — this port's spelling of the canonical Python repo's "return
+    /// an <c>ExternalRef</c> from a unary method".
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The method still returns a value of its declared type to satisfy the compiler; the server
+    /// ignores it (no null check, no result batch) and writes the ref's ExternalLocation pointer
+    /// batch directly: no serialization, compression or upload, never inline and never through
+    /// shared memory, regardless of the server's external storage configuration and
+    /// <c>externalize_threshold_bytes</c>, and not counted toward
+    /// <c>max_externalized_response_bytes</c>. Log messages emitted during the call still precede
+    /// the pointer. A second call replaces the first; an exception thrown by the method after
+    /// calling this still answers with that error.
+    /// </para>
+    /// <para>
+    /// Unary calls only, on every transport. Stream calls (and their init) refuse it.
+    /// </para>
+    /// <code>
+    /// public async Task&lt;string&gt; CatalogAsync(ICallContext? ctx = null)
+    /// {
+    ///     ctx!.RespondWithExternalRef(await GetOrPublishCatalogRefAsync());
+    ///     return null!; // ignored
+    /// }
+    /// </code>
+    /// </remarks>
+    /// <exception cref="RpcException">This call is not a unary call (reports as the wire type
+    /// <c>"RuntimeError"</c>).</exception>
+    void RespondWithExternalRef(External.ExternalRef reference) =>
+        throw new RpcException("RuntimeError", "an ExternalRef can only answer a unary call");
 }

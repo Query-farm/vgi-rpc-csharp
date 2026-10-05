@@ -558,7 +558,7 @@ public sealed class RpcServer
         using var ownedLargeBytesArguments = new LargeBytesBufferArgumentsOwner(args);
         using var shmForUnary = shm;
         await using var writer = new WireWriter(transport.Output, info.ResultSchema);
-        var context = info.HasContextParameter ? new BufferedCallContext() : null;
+        var context = info.HasContextParameter ? new BufferedCallContext(unary: true) : null;
         var status = "ok";
         var errorType = "";
         var errorMessage = "";
@@ -577,9 +577,16 @@ public sealed class RpcServer
                 }
             }
 
-            var resultBatch = info.ResultSchema.FieldsList.Count == 0
-                ? ValueCodec.EmptyRow(info.ResultSchema)
-                : ValueCodec.BuildRow(info.ResultSchema, [result]);
+            if (context?.ExternalRef is { } externalRef)
+            {
+                // A pre-published reference: write its pointer as-is. Nothing to build,
+                // validate, serialize or upload, and never inline or through SHM.
+                var (pointerBatch, pointerMetadata) = externalRef.PointerBatch(info.ResultSchema);
+                await writer.WriteOwnedBatchAsync(pointerBatch, pointerMetadata, cancellationToken).ConfigureAwait(false);
+                return true;
+            }
+
+            var resultBatch = info.BuildResultBatch(result);
             IReadOnlyDictionary<string, string>? resultMetadata = null;
             using var resultOwner = new RecordBatchOwner(resultBatch);
             if (ExternalConfig is { } externalConfig)
@@ -1014,15 +1021,30 @@ public sealed class RpcServer
     /// runs to completion before <see cref="ServeOneAsync"/> gets a chance to write anything,
     /// buffer-then-flush produces the same wire sequence true incremental interleaving would.
     /// </summary>
-    private sealed class BufferedCallContext : ICallContext
+    private sealed class BufferedCallContext(bool unary = false) : ICallContext
     {
         private readonly PeerConnectionIdentity _identity = PeerIdentityScope.Current;
         public AuthContext Auth => _identity.Auth;
         public PeerEvidenceSet PeerEvidence => _identity.Evidence;
         public List<LogMessage> Buffered { get; } = [];
 
+        /// <summary>The ref <see cref="ICallContext.RespondWithExternalRef"/> asked to answer
+        /// with, if any — unary dispatch writes its pointer instead of the return value.</summary>
+        public ExternalRef? ExternalRef { get; private set; }
+
         public void EmitLog(VgiLogLevel level, string message, IReadOnlyDictionary<string, object?>? extra = null) =>
             Buffered.Add(new LogMessage(level, message, extra));
+
+        public void RespondWithExternalRef(ExternalRef reference)
+        {
+            ArgumentNullException.ThrowIfNull(reference);
+            if (!unary)
+            {
+                throw new RpcException("RuntimeError", "an ExternalRef can only answer a unary call");
+            }
+
+            ExternalRef = reference;
+        }
     }
 
     private static readonly Schema s_emptySchema = new([], metadata: null);

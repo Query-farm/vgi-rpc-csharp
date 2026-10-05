@@ -4,6 +4,7 @@ using Apache.Arrow.Types;
 using QueryFarm.VgiRpc.Conformance;
 using QueryFarm.VgiRpc.Conformance.Errors;
 using QueryFarm.VgiRpc.Conformance.Types;
+using QueryFarm.VgiRpc.External;
 using QueryFarm.VgiRpc.Logging;
 using QueryFarm.VgiRpc.Reflection;
 using QueryFarm.VgiRpc.Server;
@@ -12,8 +13,43 @@ using QueryFarm.VgiRpc.Streaming;
 namespace QueryFarm.VgiRpc.ConformanceWorker;
 
 /// <summary>A C# port of <c>vgi_rpc.conformance._impl</c> for the methods <see cref="IConformanceService"/> declares.</summary>
-public sealed class ConformanceServiceImpl : IConformanceService
+/// <param name="externalStorage">The worker's external storage backend, if any.
+/// <see cref="PublishedStringAsync"/> publishes through it; without one that method fails.</param>
+/// <param name="externalCompression">The worker's configured compression for externalized data,
+/// applied when <see cref="PublishedStringAsync"/> publishes.</param>
+public sealed class ConformanceServiceImpl(IExternalStorage? externalStorage = null, Compression? externalCompression = null) : IConformanceService
 {
+    private static readonly RpcMethodInfo s_publishedString =
+        ServiceRegistry.GetMethods(typeof(IConformanceService))["published_string"];
+
+    private readonly Dictionary<(string Value, bool IncludeSha256), ExternalRef> _published = [];
+    private readonly SemaphoreSlim _publishedLock = new(1, 1);
+
+    public async Task<string> PublishedStringAsync(string value, bool includeSha256, ICallContext? ctx = null)
+    {
+        ArgumentNullException.ThrowIfNull(ctx);
+        var storage = externalStorage ?? throw new RuntimeError("published_string requires external storage");
+        var key = (value, includeSha256);
+        ExternalRef? reference;
+        await _publishedLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (!_published.TryGetValue(key, out reference))
+            {
+                using var batch = s_publishedString.BuildResultBatch(value);
+                reference = await ExternalLocation.PublishExternalAsync(batch, storage, externalCompression, includeSha256).ConfigureAwait(false);
+                _published[key] = reference;
+            }
+        }
+        finally
+        {
+            _publishedLock.Release();
+        }
+
+        ctx.RespondWithExternalRef(reference);
+        return value; // ignored: the ref answers the call
+    }
+
     public Task<string> EchoStringAsync(string value) => Task.FromResult(value);
 
     public Task<byte[]> EchoBytesAsync(byte[] data) => Task.FromResult(data);

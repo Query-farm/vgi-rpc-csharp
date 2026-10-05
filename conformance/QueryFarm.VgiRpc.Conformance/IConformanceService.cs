@@ -141,6 +141,20 @@ public interface IConformanceService
     [return: LargeWidth]
     Task<string> EchoLargeStringAsync([LargeWidth] string value);
 
+    /// <summary>Returns <paramref name="value"/> through a pre-published
+    /// <see cref="External.ExternalRef"/> (publish once, reuse).</summary>
+    /// <remarks>Requires the worker's external storage (<c>--fake-storage</c>). The worker keeps a
+    /// per-process cache keyed by <c>(value, include_sha256)</c>; on a miss it builds the result
+    /// batch <c>{result: [value]}</c>, calls <c>PublishExternalAsync</c> (with the worker's
+    /// configured compression, and a digest only when <paramref name="includeSha256"/>) and caches
+    /// the ref. Every call answers with the cached ref through
+    /// <see cref="ICallContext.RespondWithExternalRef"/>, so the response is always a pointer
+    /// batch -- regardless of the externalization threshold -- and repeated calls name the same
+    /// URL without uploading again. Without storage the call fails with "published_string requires
+    /// external storage". The context parameter is not a wire field, so the wire signature is the
+    /// reference's <c>published_string(value: str, include_sha256: bool) -> str</c>.</remarks>
+    Task<string> PublishedStringAsync(string value, bool includeSha256, ICallContext? ctx = null);
+
     // -- Large payload (M17) --------------------------------------------------
 
     /// <summary>Zero-copy <c>large_binary</c> echo matching the reference's

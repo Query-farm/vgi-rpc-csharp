@@ -263,6 +263,17 @@ public sealed class RpcMethodInfo
     }
 
     /// <summary>
+    /// Builds this unary method's result batch for <paramref name="value"/>: one row against
+    /// <see cref="ResultSchema"/>, or a zero-row batch for a method with no result. The batch the
+    /// dispatchers write for an ordinary return, and the one
+    /// <see cref="External.ExternalLocation.PublishExternalAsync"/> expects.
+    /// </summary>
+    public RecordBatch BuildResultBatch(object? value) =>
+        ResultSchema.FieldsList.Count == 0
+            ? ValueCodec.EmptyRow(ResultSchema)
+            : ValueCodec.BuildRow(ResultSchema, [value]);
+
+    /// <summary>
     /// Invokes the method against <paramref name="implementation"/> with positional
     /// <paramref name="wireArgs"/> (in <see cref="Parameters"/> order — <paramref name="context"/>
     /// is appended automatically when <see cref="HasContextParameter"/>), awaiting a Task/ValueTask

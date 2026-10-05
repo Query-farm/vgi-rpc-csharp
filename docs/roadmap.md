@@ -1319,5 +1319,29 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       fixture names its transport explicitly rather than inferring it from the absence of flags,
       which is the documented way that harness deadlocks once `--fake-storage` is added.
 
+- [x] **M24 — Pre-published unary results (`ExternalRef`).** Port of the reference's
+      `vgi_rpc.external.ExternalRef`/`publish_external` (WIRE_PROTOCOL.md §12, "pre-published
+      references"). `ExternalRef(url, sha256)` validates like Python (non-empty URL; digest is 64
+      lowercase hex or null). `ExternalLocation.PublishExternalAsync(batch, storage, compression,
+      includeSha256)` serializes a 1-row result batch exactly as the per-call externalizer does and
+      uploads once; both now share one hash/compress/upload helper. `RpcMethodInfo.BuildResultBatch`
+      builds the batch for a method and value.
+
+      Answering with a ref: Python lets a unary method *return* an `ExternalRef` in place of its
+      value. A C# implementation must return its interface's declared type, so the port's
+      spelling is a call on the injected context, `ICallContext.RespondWithExternalRef(ref)`; the
+      return value is then ignored (no null check, no result batch). Both unary dispatchers
+      (`RpcServer` for pipe/stdio/unix/tcp, `RpcHttpEndpoints` for HTTP) write the ref's pointer
+      directly: never inline or over SHM, no upload, independent of `ExternalConfig`/threshold, and
+      outside the `max_externalized_response_bytes` pre-flight (the HTTP wire-body cap still sees
+      the tiny pointer). Stream calls refuse it. This port logs no per-batch routes, so there is
+      no `route=external_ref` debug line.
+
+      Conformance: `published_string(value, include_sha256) -> str` on the worker, publishing once
+      per `(value, include_sha256)` through the worker's `--fake-storage` backend and
+      `--compression` on every transport; `TestExternalRef` is imported into
+      test_csharp_conformance.py and the pinned ConformanceService protocol hash moved with the
+      reference's regenerated golden (90 methods).
+
 Full rationale for each milestone's sequencing lives in the plan this repo was bootstrapped from;
 see `CLAUDE.md` for where cross-language wire-alignment decisions are recorded as they're made.

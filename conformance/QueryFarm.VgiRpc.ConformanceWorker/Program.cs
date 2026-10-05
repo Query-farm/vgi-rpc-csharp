@@ -40,8 +40,15 @@ using var accessLog = options.AccessLogPath is { } accessLogPath ? new JsonlAcce
 // the shared suite's TestExternalByteStream boots `worker --fake-storage URL
 // --externalize-threshold 1` and counts the uploads, and without this the flag was parsed and
 // then silently ignored in every mode but HTTP. The HTTP mode wires its own options below.
+// published_string publishes through the worker's own storage + compression, on every
+// transport (the HTTP mode below builds an equivalent FakeStorageBackend for the same URL; the
+// adapter is stateless, so the two agree on where objects go).
+var workerCompression = options.CompressionAlgorithm == "zstd" ? new Compression() : null;
+var implementation = new ConformanceServiceImpl(
+    options.FakeStorageUrl is { } publishStorageUrl ? new FakeStorageBackend(publishStorageUrl) : null,
+    workerCompression);
 var server = new RpcServer(
-    typeof(IConformanceService), new ConformanceServiceImpl(), accessLog: accessLog,
+    typeof(IConformanceService), implementation, accessLog: accessLog,
     expectedProtocolVersion: "2.0.0",
     identity: options.Identity switch
     {
@@ -55,7 +62,7 @@ var server = new RpcServer(
         {
             Storage = new FakeStorageBackend(byteStreamStorageUrl),
             ExternalizeThresholdBytes = options.ExternalizeThresholdBytes,
-            Compression = options.CompressionAlgorithm == "zstd" ? new Compression() : null,
+            Compression = workerCompression,
         }
         : null,
 };
@@ -239,7 +246,7 @@ if (options.Http)
         {
             Storage = backend,
             ExternalizeThresholdBytes = options.ExternalizeThresholdBytes,
-            Compression = options.CompressionAlgorithm == "zstd" ? new Compression() : null,
+            Compression = workerCompression,
             FetchConfig = new FetchConfig
             {
                 MaxFetchBytes = options.MaxFetchBytes ?? new FetchConfig().MaxFetchBytes,

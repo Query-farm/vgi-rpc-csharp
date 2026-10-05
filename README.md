@@ -299,6 +299,51 @@ app.MapVgiRpc(server, externalization: externalization);
 the equivalent integration for Google Cloud Storage. Both implementations support server-managed
 uploads and signed upload/download URL pairs.
 
+### Pre-published results (`ExternalRef`)
+
+A large unary result that rarely changes (a catalog, say) can be published once and handed back
+by reference on every later call: the server writes the pointer batch directly, with no
+serialization, compression, or upload during the call. Publish with
+`ExternalLocation.PublishExternalAsync`, cache the `ExternalRef`, and answer through the injected
+`ICallContext`:
+
+```csharp
+using QueryFarm.VgiRpc.External;
+using QueryFarm.VgiRpc.Reflection;
+using QueryFarm.VgiRpc.Server;
+
+public interface ICatalogService
+{
+    Task<string> CatalogAsync(ICallContext? ctx = null);   // wire: catalog() -> str
+}
+
+public sealed class CatalogService(IExternalStorage storage) : ICatalogService
+{
+    private static readonly RpcMethodInfo s_catalog = ServiceRegistry.GetMethods(typeof(ICatalogService))["catalog"];
+    private ExternalRef? _published;
+
+    public async Task<string> CatalogAsync(ICallContext? ctx = null)
+    {
+        if (_published is null)
+        {
+            using var batch = s_catalog.BuildResultBatch(BuildCatalogJson());
+            _published = await ExternalLocation.PublishExternalAsync(batch, storage, new Compression());
+        }
+
+        ctx!.RespondWithExternalRef(_published);
+        return null!; // ignored: the ref answers the call
+    }
+}
+```
+
+A ref is always sent as a pointer -- whether or not the server has external storage configured,
+regardless of `ExternalizeThresholdBytes`, never inline or over SHM -- and it does not count toward
+`MaxExternalizedResponseBytes`. `new ExternalRef(url, sha256: null)` (or `includeSha256: false`)
+omits `vgi_rpc.location.sha256`, so clients skip the content check. Clients need no change. Unary
+methods only, on every transport. The caller owns the object's lifecycle: keep a long-lived ref out
+of any short-TTL lifecycle rule used for per-call uploads, re-sign pre-signed URLs before they
+expire, and only return a ref to callers who are all entitled to the same content.
+
 ## Error handling
 
 Remote errors surface as `RpcException` and include a stable error kind, the remote exception

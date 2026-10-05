@@ -142,19 +142,85 @@ public static class ExternalLocation
         }
 
         var ipcBytes = await SerializeBatchAsync(batch, streamSchema, metadata, cancellationToken).ConfigureAwait(false);
+        var (url, dataSha256, rawSize) = await UploadIpcBytesAsync(ipcBytes, streamSchema, config.Storage, config.Compression, cancellationToken).ConfigureAwait(false);
+        var (pointerBatch, pointerMetadata) = MakePointerBatch(streamSchema, url, dataSha256);
+        return (pointerBatch, pointerMetadata, rawSize);
+    }
+
+    /// <summary>
+    /// Publishes a unary result batch once and returns a reusable <see cref="ExternalRef"/> — a
+    /// port of the canonical Python repo's <c>vgi_rpc.external.publish_external</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Serializes <paramref name="batch"/> exactly as the per-call externalizer does (an IPC
+    /// stream of the schema plus this one batch), hashes the raw bytes, compresses when
+    /// <paramref name="compression"/> is given, and calls
+    /// <see cref="IExternalStorage.UploadAsync"/> once. Cache the returned ref and answer later
+    /// calls with it through <see cref="Server.ICallContext.RespondWithExternalRef"/>; the server
+    /// then writes the pointer directly.
+    /// </para>
+    /// <para>
+    /// Build <paramref name="batch"/> against the method's result schema —
+    /// <see cref="RpcMethodInfo.BuildResultBatch"/> does it for a given value:
+    /// <code>
+    /// var method = ServiceRegistry.GetMethods(typeof(IMyService))["catalog"];
+    /// using var batch = method.BuildResultBatch(value);
+    /// var reference = await ExternalLocation.PublishExternalAsync(batch, storage, compression);
+    /// </code>
+    /// </para>
+    /// </remarks>
+    /// <param name="batch">The 1-row result batch (single <c>result</c> column).</param>
+    /// <param name="storage">Storage backend to upload to.</param>
+    /// <param name="compression">Optional compression applied before upload (pass the server's
+    /// <see cref="ServerExternalConfig.Compression"/> to match it).</param>
+    /// <param name="includeSha256">When <see langword="false"/> the ref carries no digest, so
+    /// clients skip the content check.</param>
+    /// <param name="cancellationToken">Cancels serialization and the upload.</param>
+    /// <exception cref="ArgumentException"><paramref name="batch"/> does not have exactly one row.</exception>
+    public static async Task<ExternalRef> PublishExternalAsync(
+        RecordBatch batch,
+        IExternalStorage storage,
+        Compression? compression = null,
+        bool includeSha256 = true,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(batch);
+        ArgumentNullException.ThrowIfNull(storage);
+        if (batch.Length != 1)
+        {
+            throw new ArgumentException($"PublishExternalAsync expects a 1-row result batch, got {batch.Length} rows", nameof(batch));
+        }
+
+        var ipcBytes = await SerializeBatchAsync(batch, batch.Schema, metadata: null, cancellationToken).ConfigureAwait(false);
+        var (url, dataSha256, _) = await UploadIpcBytesAsync(ipcBytes, batch.Schema, storage, compression, cancellationToken).ConfigureAwait(false);
+        return new ExternalRef(url, includeSha256 ? dataSha256 : null);
+    }
+
+    /// <summary>
+    /// Hashes, optionally compresses, and uploads one serialized IPC stream — the single choke
+    /// point shared by every server-side externalization path (<see cref="MaybeExternalizeAsync(RecordBatch, Schema, IReadOnlyDictionary{string, string}?, ServerExternalConfig, CancellationToken)"/>
+    /// and <see cref="PublishExternalAsync"/>), so the bytes a pointer names are always produced
+    /// the same way.
+    /// </summary>
+    /// <returns>The URL returned by the backend, the hex SHA-256 of the raw (pre-compression)
+    /// IPC bytes, and the raw byte count.</returns>
+    private static async Task<(string Url, string Sha256, int RawSize)> UploadIpcBytesAsync(
+        byte[] ipcBytes, Schema schema, IExternalStorage storage, Compression? compression, CancellationToken cancellationToken)
+    {
+        // SHA-256 of the raw IPC bytes (pre-compression) for end-to-end verification.
         var dataSha256 = Convert.ToHexStringLower(SHA256.HashData(ipcBytes));
+        var rawSize = ipcBytes.Length;
 
         string? contentEncoding = null;
-        var rawSize = ipcBytes.Length;
-        if (config.Compression is { } compression)
+        if (compression is not null)
         {
             ipcBytes = ExternalCompression.Compress(compression.Algorithm, ipcBytes, compression.Level);
             contentEncoding = compression.Algorithm;
         }
 
-        var url = await config.Storage.UploadAsync(ipcBytes, streamSchema, contentEncoding, cancellationToken).ConfigureAwait(false);
-        var (pointerBatch, pointerMetadata) = MakePointerBatch(streamSchema, url, dataSha256);
-        return (pointerBatch, pointerMetadata, rawSize);
+        var url = await storage.UploadAsync(ipcBytes, schema, contentEncoding, cancellationToken).ConfigureAwait(false);
+        return (url, dataSha256, rawSize);
     }
 
     /// <summary>

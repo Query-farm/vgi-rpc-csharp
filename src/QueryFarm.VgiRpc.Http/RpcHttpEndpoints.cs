@@ -1087,7 +1087,7 @@ public static class RpcHttpEndpoints
                 stickyState,
                 PeerIdentityAuthentication.GetAuth(context),
                 PeerIdentityAuthentication.GetEvidence(context),
-                responseLimitBytes, preferredLimitBytes)
+                responseLimitBytes, preferredLimitBytes, unary: true)
             : null;
 
         var responseBuffer = new MemoryStream();
@@ -1107,25 +1107,35 @@ public static class RpcHttpEndpoints
                         }
                     }
 
-                    var resultBatch = info.ResultSchema.FieldsList.Count == 0
-                        ? ValueCodec.EmptyRow(info.ResultSchema)
-                        : ValueCodec.BuildRow(info.ResultSchema, [result]);
-
-                    using var resultBatchOwner = new RecordBatchOwner(resultBatch);
-                    IReadOnlyDictionary<string, string>? resultMetadata = null;
-                    if (externalization?.External is { } externalConfig)
+                    if (callContext?.ExternalRef is { } externalRef)
                     {
-                        var predicted = ExternalLocation.PredictExternalizeBytes(resultBatch, externalConfig);
-                        if (externalization.MaxExternalizedResponseBytes is { } externalCap && predicted > externalCap)
-                        {
-                            throw new RpcException("RuntimeError", $"Externalised payload exceeds max_externalized_response_bytes ({predicted} > {externalCap}) for method '{method}'");
-                        }
-
-                        (resultBatch, resultMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(resultBatch, null, externalConfig, cancellationToken).ConfigureAwait(false);
+                        // A pre-published reference: write its pointer as-is. No result batch to
+                        // build or validate and nothing to upload, so the external-channel
+                        // pre-flight does not apply; the wire-body budget below still sees the
+                        // (tiny) pointer.
+                        var (pointerBatch, pointerMetadata) = externalRef.PointerBatch(info.ResultSchema);
+                        await writer.WriteOwnedBatchAsync(pointerBatch, pointerMetadata, cancellationToken).ConfigureAwait(false);
                     }
-                    resultBatchOwner.Replace(resultBatch);
+                    else
+                    {
+                        var resultBatch = info.BuildResultBatch(result);
 
-                    await writer.WriteBatchAsync(new AnnotatedBatch(resultBatch, resultMetadata), cancellationToken).ConfigureAwait(false);
+                        using var resultBatchOwner = new RecordBatchOwner(resultBatch);
+                        IReadOnlyDictionary<string, string>? resultMetadata = null;
+                        if (externalization?.External is { } externalConfig)
+                        {
+                            var predicted = ExternalLocation.PredictExternalizeBytes(resultBatch, externalConfig);
+                            if (externalization.MaxExternalizedResponseBytes is { } externalCap && predicted > externalCap)
+                            {
+                                throw new RpcException("RuntimeError", $"Externalised payload exceeds max_externalized_response_bytes ({predicted} > {externalCap}) for method '{method}'");
+                            }
+
+                            (resultBatch, resultMetadata, _) = await ExternalLocation.MaybeExternalizeAsync(resultBatch, null, externalConfig, cancellationToken).ConfigureAwait(false);
+                        }
+                        resultBatchOwner.Replace(resultBatch);
+
+                        await writer.WriteBatchAsync(new AnnotatedBatch(resultBatch, resultMetadata), cancellationToken).ConfigureAwait(false);
+                    }
                 }
                 catch (Exception exc)
                 {
@@ -2419,9 +2429,25 @@ public static class RpcHttpEndpoints
         AuthContext? auth = null,
         PeerEvidenceSet? peerEvidence = null,
         long? responseLimitBytes = null,
-        long? preferredResponseBytes = null) : Server.ICallContext
+        long? preferredResponseBytes = null,
+        bool unary = false) : Server.ICallContext
     {
         public List<LogMessage> Buffered { get; } = [];
+
+        /// <summary>The ref <see cref="Server.ICallContext.RespondWithExternalRef"/> asked to
+        /// answer with, if any — unary dispatch writes its pointer instead of the return value.</summary>
+        public ExternalRef? ExternalRef { get; private set; }
+
+        public void RespondWithExternalRef(ExternalRef reference)
+        {
+            ArgumentNullException.ThrowIfNull(reference);
+            if (!unary)
+            {
+                throw new RpcException("RuntimeError", "an ExternalRef can only answer a unary call");
+            }
+
+            ExternalRef = reference;
+        }
 
         public AuthContext Auth { get; } = auth ?? AuthContext.Anonymous;
 
