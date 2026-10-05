@@ -74,6 +74,40 @@ public sealed class WideTypeCodecTests
         Assert.Equal(record.Fixed, echoed.Fixed);
     }
 
+    public sealed class LargeElementRecord
+    {
+        [LargeWidth]
+        public List<byte[]> LargeBlobs { get; set; } = [];
+
+        [LargeWidth]
+        public List<string>? LargeTexts { get; set; }
+    }
+
+    /// <summary>A width declared on a collection reaches its elements: the reference declares
+    /// <c>list&lt;large_binary&gt;</c> for values (join keys, split tokens) that can outgrow 32-bit
+    /// offsets, and that is a different Arrow type from <c>list&lt;binary&gt;</c>.</summary>
+    [Fact]
+    public void CollectionWidthDeclarations_ReachTheElements()
+    {
+        var schema = SchemaDerivation.InnerSchemaFor(typeof(LargeElementRecord));
+
+        var blobs = Assert.IsType<ListType>(schema.GetFieldByName("large_blobs").DataType);
+        Assert.IsType<LargeBinaryType>(blobs.ValueDataType);
+        var texts = Assert.IsType<ListType>(schema.GetFieldByName("large_texts").DataType);
+        Assert.IsType<LargeStringType>(texts.ValueDataType);
+    }
+
+    [Fact]
+    public void RecordWithLargeElements_RoundTrips()
+    {
+        var record = new LargeElementRecord { LargeBlobs = [[1, 2], [], [3]], LargeTexts = ["a", "bc"] };
+
+        var echoed = RoundTrip(record);
+
+        Assert.Equal(record.LargeBlobs, echoed.LargeBlobs);
+        Assert.Equal(record.LargeTexts, echoed.LargeTexts);
+    }
+
     public sealed class ContainerRecord
     {
         public HashSet<long> Set { get; set; } = [];

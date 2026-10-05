@@ -20,5 +20,7 @@ namespace QueryFarm.VgiRpc.Reflection;
 /// </summary>
 // Also valid on a property: a record field is as entitled to declare large
 // width as a method parameter is, and the derivation now reads it from both.
+// On a collection of string/byte[] it declares the ELEMENTS large:
+// `[LargeWidth] List<byte[]>` is `list<large_binary>`.
 [AttributeUsage(AttributeTargets.Parameter | AttributeTargets.ReturnValue | AttributeTargets.Property)]
 public sealed class LargeWidthAttribute : Attribute;

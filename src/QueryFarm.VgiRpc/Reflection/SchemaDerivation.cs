@@ -294,7 +294,12 @@ public static class SchemaDerivation
             // the TOP-LEVEL value gets the embedded-IPC-in-binary treatment; anything inside a
             // container is already native Arrow, so a dataclass element is a struct, not another
             // layer of embedded binary.
-            return new ListType(ElementField("item", elementType, nested: true, forceNonNullable: false));
+            //
+            // A [LargeWidth] on a collection declares its string/byte[] ELEMENTS large, the way
+            // [DictionaryEncoded] does for its string elements: `list<large_binary>` is a
+            // different Arrow type from `list<binary>`, and the reference declares it (a set of
+            // join keys can exceed what 32-bit offsets address).
+            return new ListType(ElementField("item", elementType, nested: true, forceNonNullable: false, largeWidth: largeWidth));
         }
 
         if (TryGetMapTypes(type, out var keyType, out var valueType))
@@ -314,10 +319,11 @@ public static class SchemaDerivation
     /// <see cref="NullabilityInfoContext"/> source for a bare generic-argument type, so
     /// reference-type elements default to nullable, matching <see cref="ArrowTypeFor(Type, out bool)"/>'s
     /// top-level-parameter behavior).</summary>
-    private static Field ElementField(string name, Type elementType, bool nested, bool forceNonNullable, bool dictionaryEncoded = false)
+    private static Field ElementField(
+        string name, Type elementType, bool nested, bool forceNonNullable, bool dictionaryEncoded = false, bool largeWidth = false)
     {
         var underlying = Nullable.GetUnderlyingType(elementType);
-        var type = ArrowTypeForNonNullable(underlying ?? elementType, nested, dictionaryEncoded: dictionaryEncoded);
+        var type = ArrowTypeForNonNullable(underlying ?? elementType, nested, largeWidth, dictionaryEncoded: dictionaryEncoded);
         // A list item and a map value are nullable by Arrow's convention,
         // regardless of the CLR element type -- which describes the *values*, not
         // the type. Deriving nullability from `IsClass` instead made
