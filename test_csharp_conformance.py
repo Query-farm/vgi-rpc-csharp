@@ -12,6 +12,7 @@ Run directly: `python -m pytest test_csharp_conformance.py -v`
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -89,9 +90,15 @@ IMPLEMENTED_FILTER = ",".join(
 
 
 
-@pytest.fixture(scope="session")
-def worker_binary() -> Path:
-    """Builds the conformance worker once per test session."""
+def publish_worker() -> None:
+    """Publishes the conformance worker into WORKER_OUTPUT.
+
+    Called once from conftest.py's ``pytest_sessionstart`` -- outside every test -- rather than
+    from the first fixture that needs the binary: the shared suite puts per-test timeouts (some
+    five seconds) on its groups, and a publish inside a test's setup is charged to whichever test
+    happens to run first. ``VGI_CS_CONFIGURATION`` overrides the build configuration (default
+    Release, as CI uses).
+    """
     if WORKER_OUTPUT.exists():
         shutil.rmtree(WORKER_OUTPUT)
 
@@ -101,7 +108,7 @@ def worker_binary() -> Path:
             "publish",
             str(WORKER_PROJECT),
             "-c",
-            "Release",
+            os.environ.get("VGI_CS_CONFIGURATION", "Release"),
             "-o",
             str(WORKER_OUTPUT),
         ],
@@ -109,6 +116,10 @@ def worker_binary() -> Path:
         check=True,
     )
 
+
+@pytest.fixture(scope="session")
+def worker_binary() -> Path:
+    """The conformance worker published at session start (see publish_worker)."""
     exe = WORKER_OUTPUT / "QueryFarm.VgiRpc.ConformanceWorker"
     if not exe.exists():
         # Windows publishes with a .exe suffix.
@@ -483,9 +494,9 @@ def conformance_http_externalized_cap_port(worker_binary: Path, conformance_fake
 # The client under test is therefore this port's RpcClient, reached through the same JSONL driver
 # the cross-language client-role legs use (VGI_CLIENT_DRIVER), so no value marshaling happens
 # Python-side and a driver defect cannot be papered over by the reference's own client.
-@pytest.fixture(scope="session")
-def client_driver_binary() -> Path:
-    """Publishes the JSONL client driver once per test session."""
+def publish_client_driver() -> None:
+    """Publishes the JSONL client driver; called from conftest.py's pytest_sessionstart, for the
+    same reason as publish_worker."""
     if CLIENT_DRIVER_OUTPUT.exists():
         shutil.rmtree(CLIENT_DRIVER_OUTPUT)
 
@@ -495,7 +506,7 @@ def client_driver_binary() -> Path:
             "publish",
             str(CLIENT_DRIVER_PROJECT),
             "-c",
-            "Release",
+            os.environ.get("VGI_CS_CONFIGURATION", "Release"),
             "-o",
             str(CLIENT_DRIVER_OUTPUT),
         ],
@@ -503,6 +514,10 @@ def client_driver_binary() -> Path:
         check=True,
     )
 
+
+@pytest.fixture(scope="session")
+def client_driver_binary() -> Path:
+    """The JSONL client driver published at session start."""
     exe = CLIENT_DRIVER_OUTPUT / "QueryFarm.VgiRpc.ConformanceClientDriver"
     if not exe.exists():
         exe = CLIENT_DRIVER_OUTPUT / "QueryFarm.VgiRpc.ConformanceClientDriver.exe"
@@ -711,6 +726,9 @@ def _run_vgi_rpc_test(
     return json.loads(result.stdout)
 
 
+# The shared suite's module-level pytestmark (a short per-test timeout) is star-imported into
+# this module and so applies here too; this drives a whole vgi-rpc-test run, not one call.
+@pytest.mark.timeout(1800)
 def test_implemented_subset_fully_conformant(worker_binary: Path) -> None:
     """The pipe-transport unary subset implemented so far must pass 100%."""
     report = _run_vgi_rpc_test(str(worker_binary), filter_pattern=IMPLEMENTED_FILTER)
@@ -734,6 +752,9 @@ def test_implemented_subset_fully_conformant(worker_binary: Path) -> None:
         "this still gates every real push."
     ),
 )
+# The shared suite's module-level pytestmark (a short per-test timeout) is star-imported into
+# this module and so applies here too; this drives a whole vgi-rpc-test run, not one call.
+@pytest.mark.timeout(1800)
 def test_shm_transport_implemented_subset_fully_conformant(worker_binary: Path) -> None:
     """The same implemented subset, driven over the SHM side channel (M14, docs/roadmap.md) —
     the client owns an 8 MiB segment and both directions (request params, unary/stream results)
@@ -750,6 +771,9 @@ def test_shm_transport_implemented_subset_fully_conformant(worker_binary: Path) 
     assert report["passed"] > 0, "Expected at least one test to run."
 
 
+# The shared suite's module-level pytestmark (a short per-test timeout) is star-imported into
+# this module and so applies here too; this drives a whole vgi-rpc-test run, not one call.
+@pytest.mark.timeout(1800)
 def test_unix_transport_implemented_subset_fully_conformant(unix_worker: str) -> None:
     """The full IMPLEMENTED_FILTER, streaming included, driven over a Unix domain socket (M17,
     docs/roadmap.md) — RpcServer's core dispatch loop (ServeAsync/ServeOneAsync) is
@@ -768,6 +792,9 @@ def test_unix_transport_implemented_subset_fully_conformant(unix_worker: str) ->
     assert report["passed"] > 0, "Expected at least one test to run."
 
 
+# The shared suite's module-level pytestmark (a short per-test timeout) is star-imported into
+# this module and so applies here too; this drives a whole vgi-rpc-test run, not one call.
+@pytest.mark.timeout(1800)
 def test_tcp_transport_implemented_subset_fully_conformant(tcp_worker: str) -> None:
     """Same as test_unix_transport_implemented_subset_fully_conformant, over TCP loopback."""
     report = _run_vgi_rpc_test(tcp=tcp_worker, filter_pattern=IMPLEMENTED_FILTER)
@@ -778,6 +805,9 @@ def test_tcp_transport_implemented_subset_fully_conformant(tcp_worker: str) -> N
     assert report["passed"] > 0, "Expected at least one test to run."
 
 
+# The shared suite's module-level pytestmark (a short per-test timeout) is star-imported into
+# this module and so applies here too; this drives a whole vgi-rpc-test run, not one call.
+@pytest.mark.timeout(1800)
 def test_full_suite_status(worker_binary: Path) -> None:
     """Informational: reports full-suite status without failing the build on known gaps
     (streaming, large_payload, and the wide-Arrow-type/list-of-struct dataclass methods —
@@ -799,6 +829,9 @@ _CONFORMANCE_PROTOCOL_HASH = "05479410c96f34410a2b10a4f6a49d59dcfd9d6d1d45ce9a98
 
 
 @pytest.mark.parametrize("debug", [False, True], ids=["info", "debug"])
+# The shared suite's module-level pytestmark (a short per-test timeout) is star-imported into
+# this module and so applies here too; this drives a whole vgi-rpc-test run, not one call.
+@pytest.mark.timeout(1800)
 def test_access_log_conforms(worker_binary: Path, tmp_path: Path, debug: bool) -> None:
     """The JSONL the worker writes via --access-log (and --access-log-debug, which additionally
     requires request_data to round-trip as a self-contained Arrow IPC stream — see
@@ -854,6 +887,9 @@ def test_access_log_conforms(worker_binary: Path, tmp_path: Path, debug: bool) -
     )
 
 
+# The shared suite's module-level pytestmark (a short per-test timeout) is star-imported into
+# this module and so applies here too; this drives a whole vgi-rpc-test run, not one call.
+@pytest.mark.timeout(1800)
 def test_wide_arrow_types_round_trip(worker_binary: Path) -> None:
     """The wide-Arrow-type echo methods (int8/16/uint8/16/32/64, date, timestamp[_utc], time,
     duration, decimal — see docs/roadmap.md "M2, continued") round-trip correctly.
@@ -905,6 +941,9 @@ def test_wide_arrow_types_round_trip(worker_binary: Path) -> None:
     assert not failed, "Wide-Arrow-type round-trip failures:\n" + "\n".join(failed)
 
 
+# The shared suite's module-level pytestmark (a short per-test timeout) is star-imported into
+# this module and so applies here too; this drives a whole vgi-rpc-test run, not one call.
+@pytest.mark.timeout(1800)
 def test_http_subset_conformant(http_worker: str) -> None:
     """The same IMPLEMENTED_FILTER subset gated over stdio (unary + full streaming — /init,
     /exchange, headers, cancel, dynamic schemas) must pass 100% against the real Python reference
@@ -966,6 +1005,10 @@ def _arrow_request_body(method: str) -> bytes:
                 b"vgi_rpc.method": method.encode(),
                 b"vgi_rpc.request_version": b"1",
                 b"vgi_rpc.protocol": _CONFORMANCE_PROTOCOL.encode(),
+                # The HTTP dispatch gates the protocol version per binding, as the reference
+                # does; ConformanceService declares 2.0.0, so a request without it is refused
+                # with protocol_version_mismatch before the mTLS case reaches its response.
+                b"vgi_rpc.protocol_version": b"2.0.0",
             },
         )
     return buf.getvalue()
@@ -976,7 +1019,7 @@ def _arrow_request_body(method: str) -> bytes:
 # fixtures (conformance_http_auth_port, etc.) are wired through that repo's own conftest
 # machinery that this repo doesn't hook into, so these check the same properties directly against
 # the real HTTP responses instead — reading straight off the spec doc rather than guessing.
-class TestUnauthorized:
+class TestUnauthorizedCSharp:
     """Mirrors docs/unauthorized-spec.md §7's TestUnauthorized table."""
 
     def test_reason_header_present(self, http_auth_worker: str) -> None:
@@ -1121,7 +1164,7 @@ class TestUnauthorized:
 # at all. These check the real preflight + actual-response behavior directly, mirroring
 # TestUnauthorized's approach for the same underlying reason (no shared pytest fixture machinery
 # with the canonical Python repo for this either).
-class TestCors:
+class TestCorsCSharp:
     """Verifies Cors.cs's ASP.NET Core wiring against a worker started with
     --conformance-cors-origin (see the cors_worker fixture)."""
 
@@ -1325,3 +1368,248 @@ from vgi_rpc.conformance._pytest_suite import (  # noqa: E402,F401
     TestTheJwsTrap,
     TestUnavailableIsTransient,
 )
+
+
+# ---------------------------------------------------------------------------------------------
+# The whole shared suite.
+#
+# This file used to import a hand-picked list of groups, so the C# server was measured against a
+# fraction of what every other port is (Go/Rust/Java import `_pytest_suite` whole). A narrowed
+# import is a silent skip: a group nobody listed is a group nobody ran. Everything is imported
+# below; the transport fixtures the suite parametrizes over (`conformance_conn`,
+# `conformance_raw_conn`, `conformance_describe`, `conformance_protocol_connector`) reach one
+# session-scoped C# worker per transport. Known gaps are skipped *by root cause* at the bottom of
+# this file, each naming what is missing -- never by dropping an import.
+_CONN_TRANSPORTS = ("pipe", "subprocess", "shm", "http", "http_externalize_always", "unix", "tcp")
+_RAW_TRANSPORTS = ("pipe", "subprocess", "shm", "unix", "tcp")
+
+
+@pytest.fixture(scope="session")
+def cs_transport(worker_binary: Path) -> Iterator[object]:
+    from vgi_rpc.rpc import SubprocessTransport
+
+    transport = SubprocessTransport([str(worker_binary)])
+    try:
+        yield transport
+    finally:
+        transport.close()
+
+
+@pytest.fixture(scope="session")
+def cs_unix_path(worker_binary: Path) -> Iterator[str]:
+    yield from _spawn_unix_worker(worker_binary)
+
+
+@pytest.fixture(scope="session")
+def cs_tcp_addr(worker_binary: Path) -> Iterator[tuple[str, int]]:
+    for addr in _spawn_tcp_worker(worker_binary):
+        host, port = addr.rsplit(":", 1)
+        yield host, int(port)
+
+
+@pytest.fixture(scope="session")
+def cs_http_port(worker_binary: Path) -> Iterator[int]:
+    yield from _spawn_http_worker_port(worker_binary, "--max-response-bytes", str(8 * 1024 * 1024))
+
+
+@pytest.fixture(scope="session")
+def conformance_http_externalize_always_port(worker_binary: Path, conformance_fake_storage: str) -> Iterator[int]:
+    """Externalizes every non-empty response batch. The inline *request* cap stays loose: without
+    --max-request-bytes the worker defaults it to the externalize threshold (1 byte) and every
+    request is a 413 -- this variant exercises response-side externalization."""
+    yield from _spawn_http_worker_port(
+        worker_binary, "--fake-storage", conformance_fake_storage, "--externalize-threshold", "1",
+        "--max-request-bytes", "1048576", "--max-response-bytes", str(8 * 1024 * 1024),
+    )
+
+
+@pytest.fixture(scope="session")
+def conformance_http_auth_port(worker_binary: Path) -> Iterator[int]:
+    """Every RPC call 401s, its reason read from X-Conformance-Auth-Reason."""
+    yield from _spawn_http_worker_port(worker_binary, "--conformance-auth-reason")
+
+
+@pytest.fixture(scope="session")
+def conformance_http_auth_reason_port(conformance_http_auth_port: int) -> int:
+    """The same worker under the name the reason-code tests look up."""
+    return conformance_http_auth_port
+
+
+@pytest.fixture(scope="session")
+def conformance_http_strict_cap_port(worker_binary: Path) -> Iterator[int]:
+    """A strict 1 MiB wire cap and no external storage, so an oversized response is the wire cap's
+    refusal rather than the externalized-payload cap's."""
+    yield from _spawn_http_worker_port(worker_binary, "--max-response-bytes", "1048576")
+
+
+@pytest.fixture(scope="session")
+def conformance_http_cors_port(worker_binary: Path, conformance_fake_storage: str) -> Iterator[int]:
+    """Allows the suite's fixed origin; storage mode so the optional capability headers (size caps,
+    upload URLs) are advertised and their CORS exposure is checked too."""
+    yield from _spawn_http_worker_port(
+        worker_binary, "--fake-storage", conformance_fake_storage, "--max-request-bytes", "1048576",
+        "--conformance-cors-origin", "https://conformance.example",
+    )
+
+
+class _ShmAdapter:
+    """A SubprocessTransport plus a client-owned shared-memory segment (as ShmPipeTransport)."""
+
+    def __init__(self, inner: object, shm: object) -> None:
+        self._inner = inner
+        self._shm = shm
+
+    @property
+    def reader(self) -> object:
+        return self._inner.reader  # type: ignore[attr-defined]
+
+    @property
+    def writer(self) -> object:
+        return self._inner.writer  # type: ignore[attr-defined]
+
+    @property
+    def shm(self) -> object:
+        return self._shm
+
+    def close(self) -> None:
+        self._inner.close()  # type: ignore[attr-defined]
+
+
+def _bind(protocol: type, transport: str, request: pytest.FixtureRequest, on_log: object = None) -> object:
+    """A proxy bound to *protocol* on the C# worker *transport* reaches."""
+    import contextlib
+
+    from vgi_rpc.http import http_connect
+    from vgi_rpc.rpc import SubprocessTransport, _RpcProxy, tcp_connect, unix_connect
+
+    worker_binary = request.getfixturevalue("worker_binary")
+    if transport == "pipe":
+
+        @contextlib.contextmanager
+        def _pipe() -> Iterator[object]:
+            sub = SubprocessTransport([str(worker_binary)])
+            try:
+                yield _RpcProxy(protocol, sub, on_log)
+            finally:
+                sub.close()
+
+        return _pipe()
+    if transport == "shm":
+
+        @contextlib.contextmanager
+        def _shm() -> Iterator[object]:
+            from vgi_rpc.shm import ShmSegment
+
+            segment = ShmSegment.create(8 * 1024 * 1024)
+            sub = SubprocessTransport([str(worker_binary)])
+            try:
+                yield _RpcProxy(protocol, _ShmAdapter(sub, segment), on_log)
+            finally:
+                sub.close()
+                with contextlib.suppress(BufferError):
+                    segment.close()
+                segment.unlink()
+
+        return _shm()
+    if transport == "subprocess":
+        shared = request.getfixturevalue("cs_transport")
+
+        @contextlib.contextmanager
+        def _shared() -> Iterator[object]:
+            yield _RpcProxy(protocol, shared, on_log)
+
+        return _shared()
+    if transport == "unix":
+        return unix_connect(protocol, request.getfixturevalue("cs_unix_path"), on_log=on_log)
+    if transport == "tcp":
+        host, port = request.getfixturevalue("cs_tcp_addr")
+        return tcp_connect(protocol, host, port, on_log=on_log)
+    if transport == "http":
+        return http_connect(protocol, f"http://127.0.0.1:{request.getfixturevalue('cs_http_port')}", on_log=on_log)
+    if transport == "http_externalize_always":
+        from vgi_rpc.external import ExternalLocationConfig
+
+        port = request.getfixturevalue("conformance_http_externalize_always_port")
+        return http_connect(
+            protocol, f"http://127.0.0.1:{port}", on_log=on_log,
+            external_location=ExternalLocationConfig(url_validator=None),
+        )
+    raise ValueError(f"no conformance transport named {transport!r}")
+
+
+@pytest.fixture(params=_CONN_TRANSPORTS)
+def conformance_conn(request: pytest.FixtureRequest) -> Callable[..., object]:
+    """``conn(on_log=None)`` -- a ConformanceService proxy on the transport this test runs over."""
+    from vgi_rpc.conformance import ConformanceService
+
+    def factory(on_log: "Callable[[Message], None] | None" = None) -> object:
+        return _bind(ConformanceService, request.param, request, on_log)
+
+    return factory
+
+
+@pytest.fixture(params=_RAW_TRANSPORTS)
+def conformance_raw_conn(request: pytest.FixtureRequest) -> Callable[..., object]:
+    """Byte-stream transports only -- the adversarial raw-frame groups write onto the socket."""
+    from vgi_rpc.conformance import ConformanceService
+
+    def factory(on_log: "Callable[[Message], None] | None" = None) -> object:
+        return _bind(ConformanceService, request.param, request, on_log)
+
+    return factory
+
+
+@pytest.fixture(params=_CONN_TRANSPORTS)
+def conformance_describe(request: pytest.FixtureRequest) -> object:
+    """A ServiceDescription from real reflection calls against the C# worker."""
+    import socket
+
+    from vgi_rpc.http import http_introspect
+    from vgi_rpc.introspect import introspect
+    from vgi_rpc.rpc import SubprocessTransport, TcpTransport, UnixTransport
+
+    param = request.param
+    if param in ("pipe", "shm"):
+        transport = SubprocessTransport([str(request.getfixturevalue("worker_binary"))])
+        try:
+            return introspect(transport)
+        finally:
+            transport.close()
+    if param == "subprocess":
+        return introspect(request.getfixturevalue("cs_transport"))
+    if param == "unix":
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(request.getfixturevalue("cs_unix_path"))
+        unix = UnixTransport(sock)
+        try:
+            return introspect(unix)
+        finally:
+            unix.close()
+    if param == "tcp":
+        tcp = TcpTransport(socket.create_connection(request.getfixturevalue("cs_tcp_addr")))
+        try:
+            return introspect(tcp)
+        finally:
+            tcp.close()
+    if param == "http_externalize_always":
+        from vgi_rpc.external import ExternalLocationConfig
+
+        port = request.getfixturevalue("conformance_http_externalize_always_port")
+        return http_introspect(
+            base_url=f"http://127.0.0.1:{port}", external_location=ExternalLocationConfig(url_validator=None)
+        )
+    return http_introspect(base_url=f"http://127.0.0.1:{request.getfixturevalue('cs_http_port')}")
+
+
+@pytest.fixture(scope="session")
+def conformance_protocol_connector(request: pytest.FixtureRequest) -> Callable[..., object]:
+    """``connector(transport, protocol, on_log=None)`` -- MULTI_PROTOCOL_HOSTING.md §4: a proxy
+    bound to *protocol* on the same C# worker a ``conformance_conn`` transport reaches."""
+
+    def connect(transport: str, protocol: type, on_log: "Callable[[Message], None] | None" = None) -> object:
+        return _bind(protocol, transport, request, on_log)
+
+    return connect
+
+
+from vgi_rpc.conformance._pytest_suite import *  # noqa: E402,F401,F403

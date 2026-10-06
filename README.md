@@ -162,6 +162,23 @@ A service method may also declare a trailing optional `ICallContext` parameter. 
 injects it for access to request-scoped logging and HTTP sticky-session state; it is excluded from
 the wire schema.
 
+### Hosting several protocols
+
+A server hosts one primary protocol plus any number of additional application protocols, fixed
+when the server is built and hosted on every transport it serves. Each is routed by its own wire
+name, gated against its own version, hashed on its own, and listed by
+`vgi_rpc.Reflection.v1` after the primary, in registration order:
+
+```csharp
+var server = new RpcServer(
+    typeof(IMyService), new MyService(), expectedProtocolVersion: "2.0.0",
+    additionalProtocols: [HostedProtocol.For<IReports>(new Reports(), protocolVersion: "1.0.0")]);
+```
+
+The protocol is the unit of optionality: there is no way to host a subset of a protocol's
+methods. A name under the reserved `vgi_rpc.` prefix, a repeated name, or an implementation that
+does not implement its interface is refused at construction.
+
 ## Transports
 
 | Transport | Server API | C# client API |
@@ -346,11 +363,35 @@ expire, and only return a ref to callers who are all entitled to the same conten
 
 ## Error handling
 
-Remote errors surface as `RpcException` and include a stable error kind, the remote exception
-type, message, and traceback. A failed call does not invalidate an otherwise healthy persistent
+Errors follow gRPC's `google.rpc.Status` shape (WIRE_PROTOCOL.md §8). Every error batch carries
+a canonical code (`vgi_rpc.error_code`, one of the sixteen names in `ErrorCodes`, `UNKNOWN` when
+unclassified), an optional reason (`vgi_rpc.error_kind`) and typed details from a fixed catalog
+(`vgi_rpc.error_details`: `RetryInfo`, `ErrorInfo`, `BadRequest`, `PreconditionFailure`,
+`QuotaFailure`, `ResourceInfo`, `Help`, `LocalizedMessage`). Raise one from a method with
+`StatusException`:
+
+```csharp
+throw new StatusException("report is being rebuilt", ErrorCodes.Unavailable,
+    kind: "report_rebuilding", details: [new RetryInfo(30)]);
+```
+
+A details array over 4 KiB, or one that repeats a type or invents a `vgi_rpc.*` type, is dropped
+whole; the code and kind are sent regardless. Tracebacks are included on every transport by
+default; `RpcServer.IncludeTracebacks = false` omits them everywhere.
+
+Remote errors surface as `RpcException`, carrying `ErrorCode` (verbatim; `""` from a server that
+predates the model), `ErrorKind`, `ErrorDetails` (every element, unknown types included), typed
+accessors (`GetRetryInfo()`, `GetBadRequest()`, ...) and `IsRetryable()` — `UNAVAILABLE`, or
+`RESOURCE_EXHAUSTED` with `RetryInfo`. No client retries an RPC error automatically: a method
+may not be idempotent. A failed call does not invalidate an otherwise healthy persistent
 connection. Common protocol conditions have typed exceptions, including
 `MethodNotImplementedException`, `ProtocolVersionException`, `SessionLostException`,
 `ServerDrainingException`, and `PayloadTooLargeException`.
+
+An identity hook (`IdentityImpl`'s resolver or minter) that cannot reach its store should throw
+`AuthUnavailableException` — the same error an HTTP authenticate delegate throws to get a 503
+with `Retry-After` (`PeerIdentityUnavailableException` is one). The framework reports it as
+`identity_unavailable` carrying that retry hint as `RetryInfo`.
 
 ## Examples
 

@@ -97,6 +97,23 @@ public static class ConformanceIdentity
     /// </remarks>
     public const string UnavailableToken = "conformance-unavailable-token";
 
+    /// <summary>The credential whose lookup raises the <em>transport-auth</em> unavailable error,
+    /// with a 7-second hint.</summary>
+    /// <remarks>
+    /// <see cref="Errors.AuthUnavailableException"/>, not <see cref="IdentityUnavailableException"/>:
+    /// the framework must translate it to <c>identity_unavailable</c> carrying <em>this</em> hint
+    /// (WIRE_PROTOCOL.md §16). Raising the identity error here instead would make the test pass
+    /// while the rule stays unimplemented. 7 is deliberately not any port's default.
+    /// </remarks>
+    public const string AuthUnavailableToken = "conformance-auth-unavailable-token";
+
+    /// <summary>The purpose whose mint raises the transport-auth unavailable error, with a
+    /// 7-second hint -- the translation rule covers both hooks.</summary>
+    public const string AuthUnavailablePurpose = "conformance-auth-unavailable";
+
+    /// <summary>The retry hint the two auth-unavailable probes carry.</summary>
+    public const int AuthUnavailableRetryAfter = 7;
+
     /// <summary>Resolves with <c>ttl_seconds = 0</c>, which must survive the wire as zero.</summary>
     /// <remarks>
     /// A resolver naming zero is saying <em>do not cache this</em>. This port is exactly where that
@@ -168,7 +185,8 @@ public static class ConformanceIdentity
     /// </remarks>
     public static TokenIdentity? ResolveToken(string token) => token switch
     {
-        UnavailableToken => throw new IdentityUnavailableException("conformance: mapping store unreachable"),
+        UnavailableToken => throw new IdentityUnavailableException("conformance: mapping store unreachable", retryAfterSeconds: 5),
+        AuthUnavailableToken => throw new Errors.AuthUnavailableException("conformance: authority unreachable", AuthUnavailableRetryAfter),
         UnknownToken => null,
         ZeroTtlToken => new TokenIdentity(SubjectPrincipal, SubjectTokenName, ttlSeconds: 0),
         MinimalToken => new TokenIdentity(SubjectPrincipal),
@@ -190,6 +208,11 @@ public static class ConformanceIdentity
     public static IssuedGrant MintGrant(string principal, string purpose, List<string> scopes, long ttlSeconds)
     {
         _ = ttlSeconds;
+        if (purpose == AuthUnavailablePurpose)
+        {
+            throw new Errors.AuthUnavailableException("conformance: grant store unreachable", AuthUnavailableRetryAfter);
+        }
+
         if (purpose == RefusedPurpose)
         {
             throw new GrantRefusedException("conformance: this purpose is refused");

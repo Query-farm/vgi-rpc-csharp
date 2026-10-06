@@ -32,6 +32,15 @@ public static class MetadataKeys
     public const string LogMessage = "vgi_rpc.log_message";
     public const string LogExtra = "vgi_rpc.log_extra";
     public const string ErrorKind = "vgi_rpc.error_kind";
+
+    /// <summary>The canonical code's name on EXCEPTION batches (WIRE_PROTOCOL.md §8) -- closed
+    /// set, see <see cref="Errors.ErrorCodes"/>. Required whenever <see cref="ErrorKind"/> is set,
+    /// and emitted by this port on every EXCEPTION batch.</summary>
+    public const string ErrorCode = "vgi_rpc.error_code";
+
+    /// <summary>Typed error details on EXCEPTION batches: a JSON array of objects naming their
+    /// type in <c>@type</c>. At most 4 KiB serialized; omitted whole when larger.</summary>
+    public const string ErrorDetails = "vgi_rpc.error_details";
     public const string RequestVersion = "vgi_rpc.request_version";
     public const string CurrentRequestVersion = "1";
     public const string ServerId = "vgi_rpc.server_id";

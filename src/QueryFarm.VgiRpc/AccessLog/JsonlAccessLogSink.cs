@@ -47,6 +47,11 @@ public sealed class JsonlAccessLogSink : IAccessLogSink, IDisposable
             ["error_type"] = record.ErrorType,
         };
 
+        if (record.Status == "error" && !string.IsNullOrEmpty(record.ErrorCode))
+        {
+            fields["error_code"] = record.ErrorCode;
+        }
+
         if (record.ErrorMessage is not null)
         {
             fields["error_message"] = record.ErrorMessage;

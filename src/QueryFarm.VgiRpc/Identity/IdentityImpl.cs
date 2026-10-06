@@ -1,3 +1,4 @@
+using QueryFarm.VgiRpc.Errors;
 using QueryFarm.VgiRpc.Server;
 
 namespace QueryFarm.VgiRpc.Identity;
@@ -40,8 +41,9 @@ public sealed class IdentityImpl : IIdentityProtocol
     /// <summary>Resolves an opaque credential to an identity.</summary>
     /// <param name="token">The credential to resolve.</param>
     /// <returns>The identity, or <see langword="null"/> when the store answered and the
-    /// credential is unknown. Throw <see cref="IdentityUnavailableException"/> for "the answer is
-    /// not knowable" -- a caller that negative-caches the first must not cache the second.</returns>
+    /// credential is unknown. Throw <see cref="IdentityUnavailableException"/> -- or the
+    /// transport-auth <see cref="AuthUnavailableException"/>, which is translated to it with its
+    /// retry hint -- for "the answer is not knowable" -- a caller that negative-caches the first must not cache the second.</returns>
     public delegate TokenIdentity? TokenResolver(string token);
 
     /// <summary>Mints a standing grant for the calling principal.</summary>
@@ -131,7 +133,16 @@ public sealed class IdentityImpl : IIdentityProtocol
         IdentityGuards.CheckIntrospector(ctx.Auth, _principals);
         IdentityGuards.RejectJwsShaped(token);
 
-        var identity = _resolveToken(token);
+        TokenIdentity? identity;
+        try
+        {
+            identity = _resolveToken(token);
+        }
+        catch (AuthUnavailableException exc)
+        {
+            throw Unavailable(exc);
+        }
+
         if (identity is null)
         {
             // Uniform with malformed and expired: reporting which would confirm that a guessed
@@ -160,6 +171,26 @@ public sealed class IdentityImpl : IIdentityProtocol
 
         // The subject is the caller, never a parameter: cross-subject minting is closed by
         // construction rather than by a check that could be forgotten in one of seven ports.
-        return _mintGrant(ctx.Auth.Principal ?? "", purpose, scopes, ttlSeconds);
+        try
+        {
+            return _mintGrant(ctx.Auth.Principal ?? "", purpose, scopes, ttlSeconds);
+        }
+        catch (AuthUnavailableException exc)
+        {
+            throw Unavailable(exc);
+        }
     }
+
+    /// <summary>Translates the transport-auth "could not find out" into
+    /// <c>identity_unavailable</c>, keeping its retry hint (WIRE_PROTOCOL.md §16).</summary>
+    /// <remarks>
+    /// A hook calling the same backing store an authenticator does raises what an authenticator
+    /// raises when that store is down -- <see cref="AuthUnavailableException"/>, including
+    /// <see cref="PeerIdentityUnavailableException"/>. Left untranslated it reaches the wire with
+    /// no kind, and a caller can no longer tell an outage from a refusal, which is the one
+    /// distinction this protocol's error kinds exist to carry. The hint is kept because the store
+    /// that is down is the one that knows how long.
+    /// </remarks>
+    private static IdentityUnavailableException Unavailable(AuthUnavailableException exc) =>
+        new(string.IsNullOrEmpty(exc.Detail) ? "identity lookup unavailable" : exc.Detail, exc.RetryAfterSeconds);
 }

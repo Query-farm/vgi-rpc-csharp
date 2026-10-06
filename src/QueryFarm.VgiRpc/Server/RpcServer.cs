@@ -27,11 +27,15 @@ public sealed class RpcServer
     private readonly string _serverId;
     private readonly IAccessLogSink? _accessLog;
     private readonly IRpcDispatchHook? _dispatchHook;
-    private readonly string? _expectedProtocolVersion;
     private readonly IdentityImpl? _identity;
     private readonly IReadOnlyDictionary<string, RpcMethodInfo> _identityMethods;
-    private readonly IReadOnlySet<string> _methodNames;
     private readonly IReadOnlySet<string> _identityMethodNames;
+
+    /// <summary>The application protocols, in registration order -- the primary first.</summary>
+    private readonly IReadOnlyList<ProtocolBinding> _applicationBindings;
+
+    /// <summary><see cref="_applicationBindings"/>, keyed by wire name.</summary>
+    private readonly IReadOnlyDictionary<string, ProtocolBinding> _bindingsByName;
 
     /// <summary>Memoised <see cref="BindingHashFor"/> results, keyed by protocol name.</summary>
     /// <remarks>
@@ -97,6 +101,19 @@ public sealed class RpcServer
     public ServerExternalConfig? ExternalConfig { get; init; }
 
     /// <summary>
+    /// Whether EXCEPTION batches carry the remote traceback (<c>log_extra.traceback</c>,
+    /// <c>frames</c>, <c>cause</c>). Included by default on <b>every</b> transport; setting this to
+    /// <see langword="false"/> omits them on all transports. The exception type, message, code,
+    /// kind and details are sent either way (WIRE_PROTOCOL.md §8, "Tracebacks").
+    /// </summary>
+    /// <remarks>
+    /// One switch, no per-transport default: the DuckDB extension puts the remote traceback into
+    /// the user-visible error, so omitting it on HTTP hid chained causes. An operator who does not
+    /// want stack traces leaving the process turns them off here.
+    /// </remarks>
+    public bool IncludeTracebacks { get; init; } = true;
+
+    /// <summary>
     /// The registered methods, keyed by wire name — exposed for transports (see
     /// <c>QueryFarm.VgiRpc.Http</c>) that dispatch outside <see cref="ServeAsync"/>'s own loop
     /// and need to resolve a method themselves. Mirrors Python's public <c>RpcServer.methods</c>.
@@ -146,16 +163,27 @@ public sealed class RpcServer
     /// protocol is not hosted at all — absent rather than routed-and-refusing, which is what
     /// keeps a dependency upgrade from growing a credential-to-identity oracle on every existing
     /// worker. An instance with no hooks configured is treated the same way.</param>
+    /// <param name="additionalProtocols">Further application protocols to host beside the primary,
+    /// in order (WIRE_PROTOCOL.md §3.1, "Hosting several application protocols"). The set is fixed
+    /// for this server's lifetime and is what every transport serving it hosts. Each is routed by
+    /// its own wire name, gated against its own <see cref="HostedProtocol.ProtocolVersion"/>, hashed
+    /// on its own, and listed by reflection after the primary in this order. The protocol is the
+    /// unit of optionality: there is deliberately no way to host a subset of one's methods.</param>
+    /// <exception cref="ArgumentException">A protocol's name is malformed, claims the reserved
+    /// <c>vgi_rpc.</c> prefix (however the name was derived), or repeats another's; an
+    /// implementation does not implement its interface; or a declared version is not
+    /// <c>MAJOR.MINOR.PATCH</c>.</exception>
     public RpcServer(
         Type serviceInterface, object implementation, string? serverId = null, IAccessLogSink? accessLog = null,
         IReadOnlyList<IRpcDispatchHook>? dispatchHooks = null, string? expectedProtocolVersion = null,
-        IdentityImpl? identity = null)
+        IdentityImpl? identity = null, IReadOnlyList<HostedProtocol>? additionalProtocols = null)
     {
+        ArgumentNullException.ThrowIfNull(serviceInterface);
+        ArgumentNullException.ThrowIfNull(implementation);
         _methods = ServiceRegistry.GetMethods(serviceInterface);
         _implementation = implementation;
         _serverId = serverId ?? Guid.NewGuid().ToString("n");
         _accessLog = accessLog;
-        _expectedProtocolVersion = expectedProtocolVersion;
         _dispatchHook = dispatchHooks is { Count: > 0 } ? new CompositeDispatchHook(dispatchHooks) : null;
         // A [ProtocolName] declaration when the contract carries one, else the type name with
         // C#'s interface `I` prefix stripped: the protocol name is the wire identity, it is in
@@ -166,7 +194,58 @@ public sealed class RpcServer
         // duplicated, so the two cannot drift into hosting and addressing different names.
         // Resolved here, in the constructor: an unroutable declaration fails when the server is
         // built rather than on every request.
-        ProtocolName = WireNaming.ForProtocol(serviceInterface);
+        ProtocolName = ApplicationProtocolName(serviceInterface);
+        if (expectedProtocolVersion is not null && TryParseSemver(expectedProtocolVersion) is null)
+        {
+            throw new ArgumentException(
+                $"expectedProtocolVersion '{expectedProtocolVersion}' is not MAJOR.MINOR.PATCH.", nameof(expectedProtocolVersion));
+        }
+
+        var bindings = new List<ProtocolBinding>
+        {
+            new(ProtocolName, expectedProtocolVersion, _methods, implementation),
+        };
+        var byName = new Dictionary<string, ProtocolBinding>(StringComparer.Ordinal) { [ProtocolName] = bindings[0] };
+        foreach (var extra in additionalProtocols ?? [])
+        {
+            if (extra is null)
+            {
+                throw new ArgumentException("additionalProtocols contains a null entry.", nameof(additionalProtocols));
+            }
+
+            var methods = ServiceRegistry.GetMethods(extra.ServiceInterface);
+            if (!extra.ServiceInterface.IsInstanceOfType(extra.Implementation))
+            {
+                throw new ArgumentException(
+                    $"The implementation registered for {extra.ServiceInterface.FullName} "
+                    + $"({extra.Implementation?.GetType().FullName ?? "null"}) does not implement it.",
+                    nameof(additionalProtocols));
+            }
+
+            if (extra.ProtocolVersion is not null && TryParseSemver(extra.ProtocolVersion) is null)
+            {
+                throw new ArgumentException(
+                    $"The version declared for {extra.ServiceInterface.FullName} ('{extra.ProtocolVersion}') "
+                    + "is not MAJOR.MINOR.PATCH.", nameof(additionalProtocols));
+            }
+
+            var name = ApplicationProtocolName(extra.ServiceInterface);
+            var binding = new ProtocolBinding(name, extra.ProtocolVersion, methods, extra.Implementation!);
+            if (!byName.TryAdd(name, binding))
+            {
+                // Not last-writer-wins: two registrations under one name is a configuration
+                // error, and silently hosting one of them is how a fixture ends up answering
+                // for a protocol it was not meant to.
+                throw new ArgumentException(
+                    $"Protocol '{name}' ({extra.ServiceInterface.FullName}) is registered more than once on this server.",
+                    nameof(additionalProtocols));
+            }
+
+            bindings.Add(binding);
+        }
+
+        _applicationBindings = bindings;
+        _bindingsByName = byName;
 
         // Identity is registered AFTER reflection (which this port hosts unconditionally, and
         // which is listed ahead of it in HostedProtocols below) so that it appears in
@@ -184,22 +263,82 @@ public sealed class RpcServer
         _identityMethods = offered is { Count: > 0 }
             ? IdentityProtocol.MethodsFor(offered)
             : new Dictionary<string, RpcMethodInfo>(StringComparer.Ordinal);
-        _methodNames = new HashSet<string>(_methods.Keys, StringComparer.Ordinal);
         _identityMethodNames = new HashSet<string>(_identityMethods.Keys, StringComparer.Ordinal);
     }
 
     /// <summary>The protocols this server hosts, in registration order.</summary>
     /// <remarks>
-    /// The application protocol first (it is what <see cref="ProtocolName"/> reports and what
-    /// framework endpoints with no owning protocol log against), then <c>vgi_rpc.Reflection.v1</c>,
-    /// then <c>vgi_rpc.Identity.v1</c> when a deployment configured it. Mirrors the canonical
-    /// Python implementation's <c>RpcServer.bindings</c> ordering, and is the same order
-    /// reflection reports them in.
+    /// The application protocols first, in registration order with the primary leading (it is
+    /// what <see cref="ProtocolName"/> reports and what framework endpoints with no owning
+    /// protocol log against), then <c>vgi_rpc.Reflection.v1</c>, then <c>vgi_rpc.Identity.v1</c>
+    /// when a deployment configured it. Mirrors the canonical Python implementation's
+    /// <c>RpcServer.bindings</c> ordering, and is the same order reflection reports them in.
     /// </remarks>
-    public IReadOnlyList<string> HostedProtocols =>
-        _identity is null
-            ? [ProtocolName, ReflectionProtocol.ProtocolName]
-            : [ProtocolName, ReflectionProtocol.ProtocolName, IdentityProtocol.ProtocolName];
+    public IReadOnlyList<string> HostedProtocols
+    {
+        get
+        {
+            var names = _applicationBindings.Select(b => b.Name).ToList();
+            names.Add(ReflectionProtocol.ProtocolName);
+            if (_identity is not null)
+            {
+                names.Add(IdentityProtocol.ProtocolName);
+            }
+
+            return names;
+        }
+    }
+
+    /// <summary>The application protocols this server hosts, in registration order, primary
+    /// first -- <see cref="HostedProtocols"/> without the framework's own.</summary>
+    public IReadOnlyList<string> ApplicationProtocols => _applicationBindings.Select(b => b.Name).ToList();
+
+    /// <summary>The application binding hosted under <paramref name="protocolName"/>, or
+    /// <see langword="null"/> -- for transports that dispatch outside the serve loop.</summary>
+    internal ProtocolBinding? ApplicationBinding(string? protocolName) =>
+        protocolName is not null && _bindingsByName.TryGetValue(protocolName, out var binding) ? binding : null;
+
+    /// <summary>The version gate for one application binding: <see langword="null"/> when
+    /// <paramref name="request"/> may proceed, else the refusal to write back.</summary>
+    /// <remarks>
+    /// Per binding, never against the primary's version: a protocol that declares none is not
+    /// gated, so a client of a secondary protocol that has no version is not refused because the
+    /// primary has one (WIRE_PROTOCOL.md §13).
+    /// </remarks>
+    internal static ProtocolVersionException? GateVersion(ProtocolBinding binding, AnnotatedBatch request) =>
+        binding.Version is { } version ? CheckProtocolVersion(request, version, binding.Name) : null;
+
+    /// <summary>Resolves and validates the wire name an application protocol is hosted under.</summary>
+    /// <remarks>
+    /// The reserved-prefix rule applies to the <em>resolved</em> name, however it was derived --
+    /// declared with <see cref="Attributes.ProtocolNameAttribute"/> or taken from the type name --
+    /// because the rule is about what the server would answer to, not about how the name was
+    /// spelled (WIRE_PROTOCOL.md §3.1). A CLR simple type name cannot contain a dot today, so a
+    /// derived name cannot currently start with <c>vgi_rpc.</c>; the check does not depend on that.
+    /// </remarks>
+    private static string ApplicationProtocolName(Type serviceInterface)
+    {
+        var name = WireNaming.ForProtocol(serviceInterface);
+        if (!WireNaming.IsValidProtocolName(name))
+        {
+            throw new ArgumentException(
+                $"{serviceInterface.FullName} resolves to the protocol name '{name}', which is not routable: "
+                + $"expected [A-Za-z_][A-Za-z0-9_.]* of at most {WireNaming.MaxProtocolNameLength} bytes. "
+                + "Declare one with [ProtocolName].",
+                nameof(serviceInterface));
+        }
+
+        if (WireNaming.IsReservedProtocolName(name))
+        {
+            throw new ArgumentException(
+                $"{serviceInterface.FullName} resolves to the protocol name '{name}', which claims the reserved "
+                + $"'{WireNaming.ReservedProtocolPrefix}' prefix. That prefix is for protocols the framework "
+                + $"defines; an application protocol under it could shadow {ReflectionProtocol.ProtocolName}.",
+                nameof(serviceInterface));
+        }
+
+        return name;
+    }
 
     /// <summary>The method names <paramref name="protocolName"/> answers, or <see langword="null"/>
     /// if this server does not host that protocol.</summary>
@@ -212,7 +351,7 @@ public sealed class RpcServer
     /// </remarks>
     public IReadOnlySet<string>? MethodNamesForProtocol(string protocolName)
     {
-        if (protocolName == ProtocolName) return _methodNames;
+        if (ApplicationBinding(protocolName) is { } binding) return binding.MethodNames;
         if (protocolName == ReflectionProtocol.ProtocolName) return ReflectionProtocol.MethodNames;
         if (protocolName == IdentityProtocol.ProtocolName && _identity is not null) return _identityMethodNames;
         return null;
@@ -234,12 +373,12 @@ public sealed class RpcServer
     /// was written with, plus what to record about it. Handed back rather than logged here
     /// because a transport that dispatches on its own (HTTP) owns its own access record —
     /// including the HTTP status the framework knows nothing about.</summary>
-    internal readonly record struct FrameworkDispatch(Schema Schema, string Status, string ErrorType, string ErrorMessage)
+    internal readonly record struct FrameworkDispatch(Schema Schema, string Status, string ErrorType, string ErrorMessage, string ErrorCode = "")
     {
         public static FrameworkDispatch Ok(Schema schema) => new(schema, "ok", "", "");
 
-        public static FrameworkDispatch Failed(Schema schema, string errorType, string errorMessage) =>
-            new(schema, "error", errorType, errorMessage);
+        public static FrameworkDispatch Failed(Schema schema, Exception error) =>
+            new(schema, "error", error.GetType().Name, error.Message, ErrorModel.CodeOf(error));
     }
 
     /// <summary>Serves one unary call to a framework-owned protocol, writing the complete IPC
@@ -258,12 +397,12 @@ public sealed class RpcServer
     {
         if (protocolName == ReflectionProtocol.ProtocolName)
         {
-            return ServeReflectionAsync(output, methodName, request, cancellationToken);
+            return ServeReflectionAsync(output, methodName, request, IncludeTracebacks, cancellationToken);
         }
 
         if (protocolName == IdentityProtocol.ProtocolName && _identity is not null)
         {
-            return ServeIdentityAsync(output, methodName, request, callContext, emitAccessLog: false, cancellationToken);
+            return ServeIdentityAsync(output, methodName, request, callContext, emitAccessLog: false, IncludeTracebacks, cancellationToken);
         }
 
         throw new ArgumentException($"'{protocolName}' is not a framework protocol hosted here.", nameof(protocolName));
@@ -291,22 +430,32 @@ public sealed class RpcServer
     /// </remarks>
     public IReadOnlyDictionary<string, RpcMethodInfo>? MethodsForProtocol(string protocolName)
     {
-        if (protocolName == ProtocolName) return _methods;
+        if (ApplicationBinding(protocolName) is { } binding) return binding.Methods;
         if (protocolName == ReflectionProtocol.ProtocolName) return ReflectionProtocol.Methods;
         if (protocolName == IdentityProtocol.ProtocolName && _identity is not null) return _identityMethods;
         return null;
     }
 
-    /// <summary>Serves requests off <paramref name="transport"/> until the channel closes.</summary>
+    /// <summary>Serves requests off <paramref name="transport"/> until the channel closes or
+    /// <paramref name="cancellationToken"/> is cancelled.</summary>
+    /// <remarks>
+    /// Cancellation is a shutdown request, not a failure: it ends the loop and returns normally.
+    /// It used to escape as an <see cref="OperationCanceledException"/>, which a worker whose
+    /// SIGTERM handler cancels this token (the usual shape) did not catch -- so every SIGTERM to an
+    /// idle stdio worker became an unhandled exception, an abort, and a core dump that on a large
+    /// host took longer than a harness's five-second shutdown wait to write.
+    /// </remarks>
     public async Task ServeAsync(IRpcTransport transport, CancellationToken cancellationToken = default)
     {
-        while (true)
+        try
         {
-            var more = await ServeOneAsync(transport, cancellationToken).ConfigureAwait(false);
-            if (!more)
+            while (await ServeOneAsync(transport, cancellationToken).ConfigureAwait(false))
             {
-                return;
             }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Shutdown requested; see remarks.
         }
     }
 
@@ -319,6 +468,7 @@ public sealed class RpcServer
     /// </summary>
     public async Task<bool> ServeOneAsync(IRpcTransport transport, CancellationToken cancellationToken = default)
     {
+        var tracebacks = IncludeTracebacks;
         AnnotatedBatch? request;
         try
         {
@@ -350,7 +500,7 @@ public sealed class RpcServer
             // the wire before throwing this — the connection is still in sync, so refuse with a
             // normal typed error and keep serving instead of tearing the whole connection down.
             // See PayloadTooLargeException's doc comment and docs/roadmap.md M17.
-            await WriteErrorStreamAsync(transport.Output, s_emptySchema, exc, cancellationToken).ConfigureAwait(false);
+            await WriteErrorStreamAsync(transport.Output, s_emptySchema, exc, tracebacks, cancellationToken).ConfigureAwait(false);
             return true;
         }
         catch (Exception) when (!cancellationToken.IsCancellationRequested)
@@ -373,7 +523,7 @@ public sealed class RpcServer
         var methodName = request.GetMetadata(MetadataKeys.Method);
         if (methodName is null)
         {
-            await WriteErrorStreamAsync(transport.Output, s_emptySchema, new RpcException("RpcException", "Request batch is missing vgi_rpc.method metadata."), cancellationToken).ConfigureAwait(false);
+            await WriteErrorStreamAsync(transport.Output, s_emptySchema, new RpcException("RpcException", "Request batch is missing vgi_rpc.method metadata."), tracebacks, cancellationToken).ConfigureAwait(false);
             return true;
         }
 
@@ -384,7 +534,7 @@ public sealed class RpcServer
                 transport.Output,
                 s_emptySchema,
                 new VersionException(nameof(VersionException), $"Unsupported request_version '{requestVersion}' (expected '{MetadataKeys.CurrentRequestVersion}')."),
-                cancellationToken).ConfigureAwait(false);
+                tracebacks, cancellationToken).ConfigureAwait(false);
             return true;
         }
 
@@ -396,7 +546,7 @@ public sealed class RpcServer
         if (request.GetMetadata(MetadataKeys.Protocol) == ReflectionProtocol.ProtocolName)
         {
             var reflectionStart = System.Diagnostics.Stopwatch.GetTimestamp();
-            var reflectionOutcome = await ServeReflectionAsync(transport.Output, methodName, request, cancellationToken).ConfigureAwait(false);
+            var reflectionOutcome = await ServeReflectionAsync(transport.Output, methodName, request, tracebacks, cancellationToken).ConfigureAwait(false);
             // Logged here rather than inside ServeReflectionAsync because HTTP dispatches the
             // same method itself and owns its own record (including the HTTP status the
             // framework knows nothing about) -- the same split identity already uses. Logging it
@@ -408,6 +558,7 @@ public sealed class RpcServer
                 reflectionOutcome.ErrorMessage, reflectionStart,
                 requestForLog: request,
                 protocol: ReflectionProtocol.ProtocolName,
+                errorCode: reflectionOutcome.ErrorCode,
                 cancellationToken: cancellationToken).ConfigureAwait(false);
             return true;
         }
@@ -422,7 +573,7 @@ public sealed class RpcServer
         {
             _ = await ServeIdentityAsync(
                 transport.Output, methodName, request, new BufferedCallContext(),
-                emitAccessLog: true, cancellationToken).ConfigureAwait(false);
+                emitAccessLog: true, tracebacks, cancellationToken).ConfigureAwait(false);
             return true;
         }
 
@@ -440,7 +591,7 @@ public sealed class RpcServer
             await WriteErrorStreamAsync(
                 transport.Output, s_emptySchema,
                 new MethodNotImplementedException(RetiredDescribeMessage),
-                cancellationToken).ConfigureAwait(false);
+                tracebacks, cancellationToken).ConfigureAwait(false);
             return true;
         }
 
@@ -460,16 +611,29 @@ public sealed class RpcServer
         // above.
         // Requiring one of them to name a protocol would break the diagnostic path a mismatched
         // client uses to find out *what* mismatched.
-        if (!IsReservedMethodName(methodName)
-            && RoutingFailure(request) is { } routingFailure)
+        ProtocolBinding binding;
+        if (IsReservedMethodName(methodName))
         {
-            await WriteErrorStreamAsync(transport.Output, s_emptySchema, routingFailure, cancellationToken).ConfigureAwait(false);
-            return true;
+            // A built-in names no protocol of its own; gate it against the one it named, if any.
+            binding = ApplicationBinding(request.GetMetadata(MetadataKeys.Protocol)) ?? _applicationBindings[0];
+        }
+        else
+        {
+            var (resolved, routingFailure) = Route(request);
+            if (routingFailure is not null)
+            {
+                await WriteErrorStreamAsync(transport.Output, s_emptySchema, routingFailure, tracebacks, cancellationToken).ConfigureAwait(false);
+                return true;
+            }
+
+            binding = resolved!;
         }
 
-        if (_expectedProtocolVersion is not null && CheckProtocolVersion(request, _expectedProtocolVersion) is { } protocolMismatch)
+        // The version gate belongs to the binding the request resolved to, not to the server: the
+        // primary's version says nothing about a secondary protocol that declares none.
+        if (GateVersion(binding, request) is { } protocolMismatch)
         {
-            await WriteErrorStreamAsync(transport.Output, s_emptySchema, protocolMismatch, cancellationToken).ConfigureAwait(false);
+            await WriteErrorStreamAsync(transport.Output, s_emptySchema, protocolMismatch, tracebacks, cancellationToken).ConfigureAwait(false);
             return true;
         }
 
@@ -494,14 +658,14 @@ public sealed class RpcServer
             return true;
         }
 
-        if (!_methods.TryGetValue(methodName, out var info))
+        if (!binding.Methods.TryGetValue(methodName, out var info))
         {
-            var available = string.Join(", ", _methods.Keys.OrderBy(k => k, StringComparer.Ordinal));
+            var available = string.Join(", ", binding.Methods.Keys.OrderBy(k => k, StringComparer.Ordinal));
             await WriteErrorStreamAsync(
                 transport.Output,
                 s_emptySchema,
-                new MethodNotImplementedException($"Unknown method: '{methodName}'. Available methods: [{available}]"),
-                cancellationToken).ConfigureAwait(false);
+                new MethodNotImplementedException($"Protocol '{binding.Name}' has no method '{methodName}'. Available methods: [{available}]"),
+                tracebacks, cancellationToken).ConfigureAwait(false);
             return true;
         }
 
@@ -527,7 +691,7 @@ public sealed class RpcServer
             catch (Exception exc)
             {
                 shm.Dispose();
-                await WriteErrorStreamAsync(transport.Output, s_emptySchema, exc, cancellationToken).ConfigureAwait(false);
+                await WriteErrorStreamAsync(transport.Output, s_emptySchema, exc, tracebacks, cancellationToken).ConfigureAwait(false);
                 return true;
             }
         }
@@ -541,8 +705,8 @@ public sealed class RpcServer
         catch (Exception exc)
         {
             shm?.Dispose();
-            await WriteErrorStreamAsync(transport.Output, info.ResultSchema, exc, cancellationToken).ConfigureAwait(false);
-            await EmitAccessLogAsync(info.WireName, "unary", "error", exc.GetType().Name, exc.Message, System.Diagnostics.Stopwatch.GetTimestamp(), requestForLog: request, cancellationToken: cancellationToken).ConfigureAwait(false);
+            await WriteErrorStreamAsync(transport.Output, info.ResultSchema, exc, tracebacks, cancellationToken).ConfigureAwait(false);
+            await EmitAccessLogAsync(info.WireName, "unary", "error", exc.GetType().Name, exc.Message, System.Diagnostics.Stopwatch.GetTimestamp(), requestForLog: request, protocol: binding.Name, errorCode: ErrorModel.CodeOf(exc), cancellationToken: cancellationToken).ConfigureAwait(false);
             return true;
         }
 
@@ -552,7 +716,7 @@ public sealed class RpcServer
         {
             // ServeStreamAsync owns shm from here on (a stream's whole lifetime, across every
             // turn) — it disposes it, ServeOneAsync must not.
-            return await ServeStreamAsync(transport, info, args, start, shm, cancellationToken).ConfigureAwait(false);
+            return await ServeStreamAsync(transport, binding, info, args, start, shm, tracebacks, cancellationToken).ConfigureAwait(false);
         }
 
         using var ownedLargeBytesArguments = new LargeBytesBufferArgumentsOwner(args);
@@ -562,12 +726,13 @@ public sealed class RpcServer
         var status = "ok";
         var errorType = "";
         var errorMessage = "";
+        var errorCode = "";
         Exception? hookError = null;
-        var hookInfo = new DispatchHookInfo(info.WireName, "unary", ProtocolName, _serverId);
+        var hookInfo = new DispatchHookInfo(info.WireName, "unary", binding.Name, _serverId);
         var hookToken = _dispatchHook?.OnDispatchStart(hookInfo);
         try
         {
-            var result = await info.InvokeAsync(_implementation, args, context).ConfigureAwait(false);
+            var result = await info.InvokeAsync(binding.Implementation, args, context).ConfigureAwait(false);
             using var ownedLargeBytesResult = result as LargeBytesBuffer;
             if (context is not null)
             {
@@ -611,14 +776,15 @@ public sealed class RpcServer
             status = "error";
             errorType = actual.GetType().Name;
             errorMessage = actual.Message;
+            errorCode = ErrorModel.CodeOf(actual);
             hookError = actual;
-            var metadata = LogMessage.FromException(actual).AddToMetadata();
+            var metadata = LogMessage.FromException(actual, tracebacks).AddToMetadata();
             await writer.WriteOwnedBatchAsync(ValueCodec.EmptyRow(info.ResultSchema), metadata, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
             _dispatchHook?.OnDispatchEnd(hookToken, hookInfo, hookError);
-            await EmitAccessLogAsync(info.WireName, "unary", status, errorType, errorMessage, start, requestForLog: request, cancellationToken: cancellationToken).ConfigureAwait(false);
+            await EmitAccessLogAsync(info.WireName, "unary", status, errorType, errorMessage, start, requestForLog: request, protocol: binding.Name, errorCode: errorCode, cancellationToken: cancellationToken).ConfigureAwait(false);
         }
 
         return true;
@@ -632,6 +798,7 @@ public sealed class RpcServer
     /// WIRE_PROTOCOL.md's lockstep streaming section (canonical Python repo).
     /// </summary>
     /// <param name="transport">The transport this stream's turns are read from/written to.</param>
+    /// <param name="binding">The application protocol the request resolved to.</param>
     /// <param name="info">Reflection info for the RPC method that constructs this stream.</param>
     /// <param name="args">Already-extracted/resolved constructor arguments.</param>
     /// <param name="start">Timestamp (from <see cref="System.Diagnostics.Stopwatch.GetTimestamp"/>)
@@ -644,8 +811,10 @@ public sealed class RpcServer
     /// only ever sent once, on the request that establishes the call; confirmed against the
     /// canonical Python client's own `_write_request`/`_write_batch` split), so this one
     /// attachment must be reused across every subsequent turn, never re-derived per turn.</param>
+    /// <param name="tracebacks">Whether error batches carry the traceback (see
+    /// <see cref="IncludeTracebacks"/>).</param>
     /// <param name="cancellationToken">Cancellation token.</param>
-    private async Task<bool> ServeStreamAsync(IRpcTransport transport, RpcMethodInfo info, object?[] args, long start, ShmSegment? shm, CancellationToken cancellationToken)
+    private async Task<bool> ServeStreamAsync(IRpcTransport transport, ProtocolBinding binding, RpcMethodInfo info, object?[] args, long start, ShmSegment? shm, bool tracebacks, CancellationToken cancellationToken)
     {
         using var ownedShm = shm;
 
@@ -654,7 +823,7 @@ public sealed class RpcServer
         // Matches Python's uuid.uuid4().hex (32 lowercase hex chars).
         var streamId = Guid.NewGuid().ToString("N");
 
-        var hookInfo = new DispatchHookInfo(info.WireName, "stream", ProtocolName, _serverId);
+        var hookInfo = new DispatchHookInfo(info.WireName, "stream", binding.Name, _serverId);
         var hookToken = _dispatchHook?.OnDispatchStart(hookInfo);
 
         var invokeContext = info.HasContextParameter ? new BufferedCallContext() : null;
@@ -662,7 +831,7 @@ public sealed class RpcServer
         using var ownedLargeBytesArguments = new LargeBytesBufferArgumentsOwner(args);
         try
         {
-            var raw = await info.InvokeAsync(_implementation, args, invokeContext).ConfigureAwait(false);
+            var raw = await info.InvokeAsync(binding.Implementation, args, invokeContext).ConfigureAwait(false);
             stream = (IRpcStream)raw!;
             ownedLargeBytesArguments.Dispose();
         }
@@ -670,7 +839,7 @@ public sealed class RpcServer
         {
             var actual = Unwrap(exc);
             _dispatchHook?.OnDispatchEnd(hookToken, hookInfo, actual);
-            await WriteErrorStreamAsync(transport.Output, s_emptySchema, actual, cancellationToken).ConfigureAwait(false);
+            await WriteErrorStreamAsync(transport.Output, s_emptySchema, actual, tracebacks, cancellationToken).ConfigureAwait(false);
             // A stream request is followed by a second IPC stream -- the client's tick/exchange
             // input -- on the same channel, and a constructor that throws does not make the
             // client take it back. Left unread, the next ServeOneAsync parses that input stream
@@ -680,7 +849,7 @@ public sealed class RpcServer
             // error is written and flushed first: a lockstep client sends its input EOS only
             // after it has read the error, so draining before replying would deadlock.
             await DrainAbandonedInputStreamAsync(transport, cancellationToken).ConfigureAwait(false);
-            await EmitAccessLogAsync(info.WireName, "stream", "error", actual.GetType().Name, actual.Message, start, streamId: streamId, cancellationToken: cancellationToken).ConfigureAwait(false);
+            await EmitAccessLogAsync(info.WireName, "stream", "error", actual.GetType().Name, actual.Message, start, streamId: streamId, protocol: binding.Name, errorCode: ErrorModel.CodeOf(actual), cancellationToken: cancellationToken).ConfigureAwait(false);
             return true;
         }
 
@@ -732,13 +901,14 @@ public sealed class RpcServer
         {
             // client never opened the tick/exchange input stream
             _dispatchHook?.OnDispatchEnd(hookToken, hookInfo, null);
-            await EmitAccessLogAsync(info.WireName, "stream", "ok", "", "", start, streamId: streamId, cancellationToken: cancellationToken).ConfigureAwait(false);
+            await EmitAccessLogAsync(info.WireName, "stream", "ok", "", "", start, streamId: streamId, protocol: binding.Name, cancellationToken: cancellationToken).ConfigureAwait(false);
             return true;
         }
 
         var streamStatus = "ok";
         var streamErrorType = "";
         var streamErrorMessage = "";
+        var streamErrorCode = "";
         Exception? streamHookError = null;
         // Set false only on the natural-EOS exit below, where ReadNextAsync already consumed the
         // input stream's own EOS marker — there is nothing left to drain, and on a shared,
@@ -809,8 +979,9 @@ public sealed class RpcServer
                 streamStatus = "error";
                 streamErrorType = actual.GetType().Name;
                 streamErrorMessage = actual.Message;
+                streamErrorCode = ErrorModel.CodeOf(actual);
                 streamHookError = actual;
-                var metadata = LogMessage.FromException(actual).AddToMetadata();
+                var metadata = LogMessage.FromException(actual, tracebacks).AddToMetadata();
                 await outputWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outputSchema), metadata, cancellationToken).ConfigureAwait(false);
                 break;
             }
@@ -841,8 +1012,9 @@ public sealed class RpcServer
                         streamStatus = "error";
                         streamErrorType = exc.GetType().Name;
                         streamErrorMessage = exc.Message;
+                        streamErrorCode = ErrorModel.CodeOf(exc);
                         streamHookError = exc;
-                        await outputWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outputSchema), LogMessage.FromException(exc).AddToMetadata(), cancellationToken).ConfigureAwait(false);
+                        await outputWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outputSchema), LogMessage.FromException(exc, tracebacks).AddToMetadata(), cancellationToken).ConfigureAwait(false);
                         break;
                     }
                 }
@@ -898,7 +1070,7 @@ public sealed class RpcServer
         }
 
         _dispatchHook?.OnDispatchEnd(hookToken, hookInfo, streamHookError);
-        await EmitAccessLogAsync(info.WireName, "stream", streamStatus, streamErrorType, streamErrorMessage, start, streamId: streamId, cancellationToken: cancellationToken).ConfigureAwait(false);
+        await EmitAccessLogAsync(info.WireName, "stream", streamStatus, streamErrorType, streamErrorMessage, start, streamId: streamId, protocol: binding.Name, errorCode: streamErrorCode, cancellationToken: cancellationToken).ConfigureAwait(false);
         return true;
     }
 
@@ -919,6 +1091,7 @@ public sealed class RpcServer
         AnnotatedBatch? requestForLog = null,
         string? streamId = null,
         string? protocol = null,
+        string errorCode = "",
         CancellationToken cancellationToken = default)
     {
         if (_accessLog is null)
@@ -978,7 +1151,8 @@ public sealed class RpcServer
             StreamId: streamId,
             RequestData: requestData,
             Truncated: truncated,
-            OriginalRequestBytes: originalRequestBytes));
+            OriginalRequestBytes: originalRequestBytes,
+            ErrorCode: status == "error" ? errorCode : null));
     }
 
     /// <summary>
@@ -1099,7 +1273,7 @@ public sealed class RpcServer
     /// client discovers it the same way it discovers everything else.</para>
     /// </remarks>
     private async Task<FrameworkDispatch> ServeReflectionAsync(
-        Stream output, string methodName, AnnotatedBatch request, CancellationToken cancellationToken)
+        Stream output, string methodName, AnnotatedBatch request, bool tracebacks, CancellationToken cancellationToken)
     {
         byte[] payload;
         if (methodName == ReflectionProtocol.ListProtocolsMethod)
@@ -1124,8 +1298,8 @@ public sealed class RpcServer
                 // and a client probing for an optional protocol depends on the difference.
                 var unhosted = new ProtocolNotSupportedException(
                     $"This server does not host protocol '{requested}'. Hosted: [{string.Join(", ", HostedProtocols)}]");
-                await WriteErrorStreamAsync(output, s_emptySchema, unhosted, cancellationToken).ConfigureAwait(false);
-                return FrameworkDispatch.Failed(s_emptySchema, unhosted.GetType().Name, unhosted.Message);
+                await WriteErrorStreamAsync(output, s_emptySchema, unhosted, tracebacks, cancellationToken).ConfigureAwait(false);
+                return FrameworkDispatch.Failed(s_emptySchema, unhosted);
             }
 
             payload = ReflectionProtocol.BuildServiceDescription(
@@ -1136,8 +1310,8 @@ public sealed class RpcServer
             var unknown = new MethodNotImplementedException(
                 $"Protocol '{ReflectionProtocol.ProtocolName}' has no method '{methodName}'. "
                 + $"Available: [{string.Join(", ", ReflectionProtocol.MethodNames.OrderBy(k => k, StringComparer.Ordinal))}]");
-            await WriteErrorStreamAsync(output, s_emptySchema, unknown, cancellationToken).ConfigureAwait(false);
-            return FrameworkDispatch.Failed(s_emptySchema, unknown.GetType().Name, unknown.Message);
+            await WriteErrorStreamAsync(output, s_emptySchema, unknown, tracebacks, cancellationToken).ConfigureAwait(false);
+            return FrameworkDispatch.Failed(s_emptySchema, unknown);
         }
 
         // The framework's ordinary convention for a structured return: the
@@ -1174,7 +1348,7 @@ public sealed class RpcServer
     /// </remarks>
     private async Task<FrameworkDispatch> ServeIdentityAsync(
         Stream output, string methodName, AnnotatedBatch request, ICallContext callContext,
-        bool emitAccessLog, CancellationToken cancellationToken)
+        bool emitAccessLog, bool tracebacks, CancellationToken cancellationToken)
     {
         if (!_identityMethods.TryGetValue(methodName, out var info))
         {
@@ -1184,14 +1358,15 @@ public sealed class RpcServer
             var available = string.Join(", ", _identityMethods.Keys.OrderBy(k => k, StringComparer.Ordinal));
             var unknown = new MethodNotImplementedException(
                 $"Protocol '{IdentityProtocol.ProtocolName}' has no method '{methodName}'. Available: [{available}]");
-            await WriteErrorStreamAsync(output, s_emptySchema, unknown, cancellationToken).ConfigureAwait(false);
-            return FrameworkDispatch.Failed(s_emptySchema, unknown.GetType().Name, unknown.Message);
+            await WriteErrorStreamAsync(output, s_emptySchema, unknown, tracebacks, cancellationToken).ConfigureAwait(false);
+            return FrameworkDispatch.Failed(s_emptySchema, unknown);
         }
 
         var start = System.Diagnostics.Stopwatch.GetTimestamp();
         var status = "ok";
         var errorType = "";
         var errorMessage = "";
+        var errorCode = "";
         Exception? hookError = null;
         var hookInfo = new DispatchHookInfo(info.WireName, "unary", IdentityProtocol.ProtocolName, _serverId);
         var hookToken = _dispatchHook?.OnDispatchStart(hookInfo);
@@ -1210,13 +1385,14 @@ public sealed class RpcServer
             status = "error";
             errorType = actual.GetType().Name;
             errorMessage = actual.Message;
+            errorCode = ErrorModel.CodeOf(actual);
             hookError = actual;
             // LogMessage.FromException hoists an RpcException's ErrorKind to the top-level
             // vgi_rpc.error_kind metadata key. For this protocol that key is the whole
             // definitive-vs-transient signal a caller has, so it is not optional decoration.
             await writer.WriteOwnedBatchAsync(
                 ValueCodec.EmptyRow(info.ResultSchema),
-                LogMessage.FromException(actual).AddToMetadata(),
+                LogMessage.FromException(actual, tracebacks).AddToMetadata(),
                 cancellationToken).ConfigureAwait(false);
         }
         finally
@@ -1228,11 +1404,12 @@ public sealed class RpcServer
                     info.WireName, "unary", status, errorType, errorMessage, start,
                     requestForLog: request,
                     protocol: IdentityProtocol.ProtocolName,
+                    errorCode: errorCode,
                     cancellationToken: cancellationToken).ConfigureAwait(false);
             }
         }
 
-        return new FrameworkDispatch(info.ResultSchema, status, errorType, errorMessage);
+        return new FrameworkDispatch(info.ResultSchema, status, errorType, errorMessage, errorCode);
     }
 
     /// <summary>Whether <paramref name="methodName"/> is a framework built-in rather than a
@@ -1243,8 +1420,8 @@ public sealed class RpcServer
         && methodName.EndsWith("__", StringComparison.Ordinal);
 
     /// <summary>
-    /// The refusal this request's <c>vgi_rpc.protocol</c> routing key earns, or
-    /// <see langword="null"/> when it addresses the protocol this server hosts.
+    /// The application binding this request's <c>vgi_rpc.protocol</c> routing key addresses, or
+    /// the refusal it earns.
     /// </summary>
     /// <remarks>
     /// Reached only after the framework protocols have had their turn, so anything that still
@@ -1252,24 +1429,21 @@ public sealed class RpcServer
     /// "not hosted", not "no such method". The three answers stay distinct because a client
     /// probing for an optional protocol depends on the difference.
     /// </remarks>
-    private RpcException? RoutingFailure(AnnotatedBatch request)
+    private (ProtocolBinding? Binding, RpcException? Failure) Route(AnnotatedBatch request)
     {
         var declared = request.GetMetadata(MetadataKeys.Protocol);
         if (string.IsNullOrEmpty(declared))
         {
-            return new ProtocolNotSpecifiedException(
+            return (null, new ProtocolNotSpecifiedException(
                 $"Request carries no '{MetadataKeys.Protocol}' routing key. Every request must name the "
                 + $"protocol it addresses, including against a server hosting exactly one. This server "
-                + $"hosts: [{string.Join(", ", HostedProtocols)}].");
+                + $"hosts: [{string.Join(", ", HostedProtocols)}]."));
         }
 
-        if (!string.Equals(declared, ProtocolName, StringComparison.Ordinal))
-        {
-            return new ProtocolNotSupportedException(
-                $"This server does not host protocol '{declared}'. Hosted: [{string.Join(", ", HostedProtocols)}].");
-        }
-
-        return null;
+        return ApplicationBinding(declared) is { } binding
+            ? (binding, null)
+            : (null, new ProtocolNotSupportedException(
+                $"This server does not host protocol '{declared}'. Hosted: [{string.Join(", ", HostedProtocols)}]."));
     }
 
     /// <summary>The version a hosted protocol declares, or "" when it declares none.</summary>
@@ -1279,7 +1453,7 @@ public sealed class RpcServer
     /// routing failure a client can act on rather than a mis-parse.
     /// </remarks>
     private string VersionForProtocol(string protocolName) =>
-        protocolName == ProtocolName ? _expectedProtocolVersion ?? "" : "";
+        ApplicationBinding(protocolName)?.Version ?? "";
 
     /// <summary>The canonical protocol hash of one hosted protocol.</summary>
     /// <remarks>
@@ -1310,22 +1484,24 @@ public sealed class RpcServer
     /// ready to write back on the wire. Mirrors the canonical Python <c>_check_protocol_version</c>
     /// message shape exactly, including its four distinct "direction" phrasings, so cross-language
     /// error text stays recognizable regardless of which side authored the mismatch.</summary>
-    private static ProtocolVersionException? CheckProtocolVersion(AnnotatedBatch request, string serverVersion)
+    private static ProtocolVersionException? CheckProtocolVersion(AnnotatedBatch request, string serverVersion, string protocolName)
     {
         var clientVersion = request.GetMetadata(MetadataKeys.ProtocolVersion);
         if (clientVersion is null)
         {
             return new ProtocolVersionException(FormatProtocolMismatch(
-                null, serverVersion,
+                protocolName, null, serverVersion,
                 "the client did not send a vgi_rpc.protocol_version metadata key. This is either a " +
-                "vgi-rpc framework bug or a non-VGI client connecting to a VGI worker."));
+                "vgi-rpc framework bug or a non-VGI client connecting to a VGI worker."),
+                protocolName, null, serverVersion);
         }
 
         if (TryParseSemver(clientVersion) is not { } clientParts)
         {
             return new ProtocolVersionException(FormatProtocolMismatch(
-                clientVersion, serverVersion,
-                "client sent a malformed protocol_version. Expected canonical semver MAJOR.MINOR.PATCH."));
+                protocolName, clientVersion, serverVersion,
+                "client sent a malformed protocol_version. Expected canonical semver MAJOR.MINOR.PATCH."),
+                protocolName, clientVersion, serverVersion);
         }
 
         // A malformed server-declared version is this process's own misconfiguration, not
@@ -1344,11 +1520,13 @@ public sealed class RpcServer
             ? $"client is too old; upgrade the VGI extension/client to a version supporting protocol_version {serverVersion}."
             : $"server is too old; upgrade the VGI worker to a version supporting protocol_version {clientVersion}.";
 
-        return new ProtocolVersionException(FormatProtocolMismatch(clientVersion, serverVersion, direction));
+        return new ProtocolVersionException(
+            FormatProtocolMismatch(protocolName, clientVersion, serverVersion, direction),
+            protocolName, clientVersion, serverVersion);
     }
 
-    private static string FormatProtocolMismatch(string? clientVersion, string serverVersion, string direction) =>
-        $"VGI client/worker protocol_version mismatch.\n" +
+    private static string FormatProtocolMismatch(string protocolName, string? clientVersion, string serverVersion, string direction) =>
+        $"VGI client/worker protocol_version mismatch for protocol '{protocolName}'.\n" +
         $"  Client: {clientVersion ?? "<not declared>"}\n" +
         $"  Server: {serverVersion}\n" +
         $"  Direction: {direction}";
@@ -1414,9 +1592,9 @@ public sealed class RpcServer
         }
     }
 
-    private static async Task WriteErrorStreamAsync(Stream output, Schema schema, Exception exception, CancellationToken cancellationToken)
+    private static async Task WriteErrorStreamAsync(Stream output, Schema schema, Exception exception, bool includeTraceback, CancellationToken cancellationToken)
     {
-        var metadata = LogMessage.FromException(exception).AddToMetadata();
+        var metadata = LogMessage.FromException(exception, includeTraceback).AddToMetadata();
         await using var writer = new WireWriter(output, schema);
         await writer.WriteOwnedBatchAsync(ValueCodec.EmptyRow(schema), metadata, cancellationToken).ConfigureAwait(false);
     }

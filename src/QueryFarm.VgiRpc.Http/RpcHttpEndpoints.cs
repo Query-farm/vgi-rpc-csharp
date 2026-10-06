@@ -337,7 +337,7 @@ public static class RpcHttpEndpoints
 
         if (responseLimitBytes is { } cap && responseBuffer.Length > cap)
         {
-            var overshoot = new RpcException("ResponseTooLargeError",
+            var overshoot = ResponseTooLarge(
                 $"method '__upload_url__' exceeds max_response_bytes ({responseBuffer.Length} > {cap})");
             await ErrorResultAsync(server, server.ProtocolName, "__upload_url__", overshoot,
                 StatusCodes.Status500InternalServerError, s_emptySchema,
@@ -645,14 +645,21 @@ public static class RpcHttpEndpoints
             await UnauthorizedResponseWriter.WriteAsync(context, failure.Reason, failure.Detail, proxyHint, context.RequestAborted).ConfigureAwait(false);
             return true;
         }
-        catch (PeerIdentityUnavailableException unavailable)
+        catch (AuthUnavailableException unavailable)
         {
+            // "I could not find out" is a 503 with Retry-After, never a 401: a sidecar outage
+            // reported as a rejection re-prompts every caller at once. PeerIdentityUnavailable is
+            // one of these; any authenticate delegate may throw the base type for its own store.
             context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
             context.Response.ContentType = "application/json";
             context.Response.Headers.CacheControl = "no-store";
             context.Response.Headers.RetryAfter = unavailable.RetryAfterSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture);
             await context.Response.WriteAsJsonAsync(
-                new { error = "peer_identity_unavailable", detail = unavailable.Message },
+                new
+                {
+                    error = unavailable is PeerIdentityUnavailableException ? "peer_identity_unavailable" : "authentication_unavailable",
+                    detail = unavailable.Message,
+                },
                 context.RequestAborted).ConfigureAwait(false);
             return true;
         }
@@ -942,7 +949,8 @@ public static class RpcHttpEndpoints
             return;
         }
 
-        var info = server.Methods[method];
+        var binding = server.ApplicationBinding(protocol)!;
+        var info = binding.Methods[method];
 
         if (info.Kind == RpcMethodKind.Stream)
         {
@@ -1031,6 +1039,14 @@ public static class RpcHttpEndpoints
             return;
         }
 
+        // Gated against the binding the path resolved to -- the reference wires the same gate
+        // into its HTTP dispatch independently of the serve loop, and so must this.
+        if (RpcServer.GateVersion(binding, requestBatch) is { } unaryVersionMismatch)
+        {
+            await ErrorResultAsync(server, protocol, method, unaryVersionMismatch, StatusCodes.Status400BadRequest, info.ResultSchema, httpStatusForLog: StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
+            return;
+        }
+
         if (externalization?.External is not null)
         {
             try
@@ -1082,6 +1098,7 @@ public static class RpcHttpEndpoints
         var status = "ok";
         var errorType = "";
         var errorMessage = "";
+        var errorCode = "";
         var callContext = info.HasContextParameter
             ? new BufferedHttpCallContext(
                 stickyState,
@@ -1097,7 +1114,7 @@ public static class RpcHttpEndpoints
             {
                 try
                 {
-                    var result = await info.InvokeAsync(server.Implementation, args, callContext).ConfigureAwait(false);
+                    var result = await info.InvokeAsync(binding.Implementation, args, callContext).ConfigureAwait(false);
                     using var ownedLargeBytesResult = result as LargeBytesBuffer;
                     if (callContext is not null)
                     {
@@ -1143,7 +1160,8 @@ public static class RpcHttpEndpoints
                     status = "error";
                     errorType = actual.GetType().Name;
                     errorMessage = actual.Message;
-                    var metadata = LogMessage.FromException(actual).AddToMetadata();
+                    errorCode = ErrorModel.CodeOf(actual);
+                    var metadata = LogMessage.FromException(actual, server.IncludeTracebacks).AddToMetadata();
                     await writer.WriteOwnedBatchAsync(ValueCodec.EmptyRow(info.ResultSchema), metadata, cancellationToken).ConfigureAwait(false);
                 }
             }
@@ -1161,20 +1179,20 @@ public static class RpcHttpEndpoints
         // Python's _enforce_response_budgets + its post-overshoot re-write of resp_buf).
         if (status == "ok" && responseLimitBytes is { } cap && responseBuffer.Length > cap)
         {
-            var overshoot = new RpcException("ResponseTooLargeError", $"method '{method}' exceeds max_response_bytes ({responseBuffer.Length} > {cap})");
+            var overshoot = ResponseTooLarge($"method '{method}' exceeds max_response_bytes ({responseBuffer.Length} > {cap})");
             status = "error";
             errorType = "ResponseTooLargeError";
             errorMessage = overshoot.Message;
             responseBuffer = new MemoryStream();
             await using var errWriter = new WireWriter(responseBuffer, info.ResultSchema);
-            var errMetadata = LogMessage.FromException(overshoot).AddToMetadata();
+            var errMetadata = LogMessage.FromException(overshoot, server.IncludeTracebacks).AddToMetadata();
             await errWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(info.ResultSchema), errMetadata, cancellationToken).ConfigureAwait(false);
         }
 
         // status=error still answers HTTP 200 — the body carries a real in-band error batch, and
         // RpcErrorHeader is the signal a client checks instead of the status code (mirrors
         // Python's _set_http_status 500→200 translation).
-        EmitAccessLog(server, protocol, info.WireName, "unary", status, errorType, errorMessage, start, StatusCodes.Status200OK);
+        EmitAccessLog(server, protocol, info.WireName, "unary", status, errorType, errorMessage, start, StatusCodes.Status200OK, errorCode: errorCode);
 
         if (status == "error")
         {
@@ -1310,20 +1328,21 @@ public static class RpcHttpEndpoints
         var status = outcome.Status;
         var errorType = outcome.ErrorType;
         var errorMessage = outcome.ErrorMessage;
+        var errorCode = outcome.ErrorCode;
 
         if (status == "ok" && responseLimitBytes is { } cap && responseBuffer.Length > cap)
         {
-            var overshoot = new RpcException("ResponseTooLargeError", $"method '{method}' exceeds max_response_bytes ({responseBuffer.Length} > {cap})");
+            var overshoot = ResponseTooLarge($"method '{method}' exceeds max_response_bytes ({responseBuffer.Length} > {cap})");
             status = "error";
             errorType = "ResponseTooLargeError";
             errorMessage = overshoot.Message;
             responseBuffer = new MemoryStream();
             await using var errWriter = new WireWriter(responseBuffer, outcome.Schema);
-            var errMetadata = LogMessage.FromException(overshoot).AddToMetadata();
+            var errMetadata = LogMessage.FromException(overshoot, server.IncludeTracebacks).AddToMetadata();
             await errWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outcome.Schema), errMetadata, cancellationToken).ConfigureAwait(false);
         }
 
-        EmitAccessLog(server, protocol, method, "unary", status, errorType, errorMessage, start, StatusCodes.Status200OK);
+        EmitAccessLog(server, protocol, method, "unary", status, errorType, errorMessage, start, StatusCodes.Status200OK, errorCode: errorCode);
 
         if (status == "error")
         {
@@ -1415,13 +1434,14 @@ public static class RpcHttpEndpoints
         // unary application method gets here: the method exists, this is the wrong endpoint for
         // it. Checked before the application method table is consulted at all, since reflection's
         // methods are never in it.
-        if (RpcServer.IsFrameworkProtocol(protocol) || server.Methods[method].Kind != RpcMethodKind.Stream)
+        if (RpcServer.IsFrameworkProtocol(protocol) || server.ApplicationBinding(protocol)!.Methods[method].Kind != RpcMethodKind.Stream)
         {
             await ErrorResultAsync(server, protocol, method, new RpcException("TypeError", $"Method '{method}' is not a stream — call it as a plain unary POST {{prefix}}/{protocol}/{method} instead."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
         }
 
-        var info = server.Methods[method];
+        var binding = server.ApplicationBinding(protocol)!;
+        var info = binding.Methods[method];
 
         Stream requestBody;
         try
@@ -1492,6 +1512,12 @@ public static class RpcHttpEndpoints
             return;
         }
 
+        if (RpcServer.GateVersion(binding, requestBatch) is { } initVersionMismatch)
+        {
+            await ErrorResultAsync(server, protocol, method, initVersionMismatch, StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
+            return;
+        }
+
         if (externalization?.External is not null)
         {
             try
@@ -1549,7 +1575,7 @@ public static class RpcHttpEndpoints
         IRpcStream stream;
         try
         {
-            var raw = await info.InvokeAsync(server.Implementation, args, invokeContext).ConfigureAwait(false);
+            var raw = await info.InvokeAsync(binding.Implementation, args, invokeContext).ConfigureAwait(false);
             stream = (IRpcStream)raw!;
             ownedLargeBytesArguments.Dispose();
         }
@@ -1754,11 +1780,11 @@ public static class RpcHttpEndpoints
             var actual = responseBuffer.Length;
             responseBuffer.Dispose();
             responseBuffer = new MemoryStream();
-            var overshoot = new RpcException("ResponseTooLargeError",
+            var overshoot = ResponseTooLarge(
                 $"method '{method}' exceeds max_response_bytes ({actual} > {cap})");
             await using var errorWriter = new WireWriter(responseBuffer, outputSchema);
             await errorWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outputSchema),
-                LogMessage.FromException(overshoot).AddToMetadata(), cancellationToken).ConfigureAwait(false);
+                LogMessage.FromException(overshoot, server.IncludeTracebacks).AddToMetadata(), cancellationToken).ConfigureAwait(false);
             context.Response.Headers[RpcErrorHeader] = "true";
         }
 
@@ -1823,7 +1849,8 @@ public static class RpcHttpEndpoints
         }
 
         if (RpcServer.IsFrameworkProtocol(protocol)
-            || !server.Methods.TryGetValue(method, out var info) || info.Kind != RpcMethodKind.Stream)
+            || server.ApplicationBinding(protocol) is not { } binding
+            || !binding.Methods.TryGetValue(method, out var info) || info.Kind != RpcMethodKind.Stream)
         {
             await ErrorResultAsync(server, protocol, method, new MethodNotImplementedException($"Protocol '{protocol}' has no stream method '{method}'."), StatusCodes.Status404NotFound, s_emptySchema, StatusCodes.Status404NotFound, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;
@@ -2169,13 +2196,13 @@ public static class RpcHttpEndpoints
         // The decoded Arrow IPC budget is strict for every continuation shape.
         if (responseLimitBytes is { } cap && responseBuffer.Length > cap)
         {
-            var overshoot = new RpcException("ResponseTooLargeError", $"method '{method}' exceeds max_response_bytes ({responseBuffer.Length} > {cap})");
+            var overshoot = ResponseTooLarge($"method '{method}' exceeds max_response_bytes ({responseBuffer.Length} > {cap})");
             registry.Remove(callKey);
             responseBuffer.Dispose();
             responseBuffer = new MemoryStream();
             await using (var errWriter = new WireWriter(responseBuffer, outputSchema))
             {
-                var errMetadata = LogMessage.FromException(overshoot).AddToMetadata();
+                var errMetadata = LogMessage.FromException(overshoot, server.IncludeTracebacks).AddToMetadata();
                 await errWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outputSchema), errMetadata, cancellationToken).ConfigureAwait(false);
             }
 
@@ -2199,6 +2226,16 @@ public static class RpcHttpEndpoints
         await WriteBytesAsync(context, StatusCodes.Status200OK, WrittenMemory(responseBuffer), encoding, useCustomHeader, compressionLevel, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary><c>ResponseTooLargeError</c>: <c>RESOURCE_EXHAUSTED</c> with no
+    /// <c>RetryInfo</c> -- the same call against the same limits fails again, so it is not
+    /// retryable (MULTI_PROTOCOL_HOSTING.md decision 8).</summary>
+    private static RpcException ResponseTooLarge(string message) =>
+        new("ResponseTooLargeError", message, errorCode: ErrorCodes.ResourceExhausted);
+
+    /// <summary>The code an access record carries when the call site had only a type name.</summary>
+    private static string ErrorCodeFor(string errorType) =>
+        errorType == "ResponseTooLargeError" ? ErrorCodes.ResourceExhausted : ErrorCodes.Unknown;
+
     private static async Task ErrorResultAsync(
         RpcServer server,
         string protocol,
@@ -2218,11 +2255,11 @@ public static class RpcHttpEndpoints
         using var buffer = new MemoryStream();
         await using (var writer = new WireWriter(buffer, schema))
         {
-            var metadata = LogMessage.FromException(exception).AddToMetadata();
+            var metadata = LogMessage.FromException(exception, server.IncludeTracebacks).AddToMetadata();
             await writer.WriteOwnedBatchAsync(ValueCodec.EmptyRow(schema), metadata).ConfigureAwait(false);
         }
 
-        EmitAccessLog(server, protocol, method, methodType, "error", exception.GetType().Name, exception.Message, start, httpStatusForLog, streamId);
+        EmitAccessLog(server, protocol, method, methodType, "error", exception.GetType().Name, exception.Message, start, httpStatusForLog, streamId, ErrorModel.CodeOf(exception));
 
         // Matches Python's _set_http_status: only a 500 gets folded into 200+header — 4xx/415
         // protocol-level rejections keep their real status code.
@@ -2365,7 +2402,7 @@ public static class RpcHttpEndpoints
     /// it now says so at the call site instead of happening silently here.
     /// </para>
     /// </remarks>
-    private static void EmitAccessLog(RpcServer server, string protocol, string method, string methodType, string status, string errorType, string errorMessage, long startTimestamp, int httpStatus, string? streamId = null)
+    private static void EmitAccessLog(RpcServer server, string protocol, string method, string methodType, string status, string errorType, string errorMessage, long startTimestamp, int httpStatus, string? streamId = null, string errorCode = "")
     {
         if (server.AccessLog is not { } sink)
         {
@@ -2393,7 +2430,8 @@ public static class RpcHttpEndpoints
             ErrorType: errorType,
             ErrorMessage: string.IsNullOrEmpty(errorMessage) ? null : errorMessage,
             ServerVersion: server.ServerVersion,
-            StreamId: streamId));
+            StreamId: streamId,
+            ErrorCode: status == "error" ? (string.IsNullOrEmpty(errorCode) ? ErrorCodeFor(errorType) : errorCode) : null));
     }
 
     /// <summary>

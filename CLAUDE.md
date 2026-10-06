@@ -116,7 +116,15 @@ Filled in as each piece lands. Key decisions so far:
   PascalCase→snake_case conversion. The protocol's own wire name is `[ProtocolName("...")]`
   when the contract declares one (read from its *own* attributes, never inherited; validated
   and refused under the reserved `vgi_rpc.` prefix, at construction), else the type name minus
-  C#'s `I` prefix. See `docs/wire-protocol.md`.
+  C#'s `I` prefix. `RpcServer` re-checks the reserved prefix on every registered application
+  protocol's *resolved* name (primary and `additionalProtocols`), however it was derived. See
+  `docs/wire-protocol.md`.
+- **Multi-protocol hosting and the error model** (MULTI_PROTOCOL_HOSTING.md): extra application
+  protocols ride `RpcServer(..., additionalProtocols: [HostedProtocol...])`, each with its own
+  version gate (per binding, on byte streams *and* HTTP). Every EXCEPTION batch carries
+  `vgi_rpc.error_code`; codes/kinds/details live on `RpcException` (`Errors/ErrorModel.cs`).
+  `AuthUnavailableException` is this port's transport-auth "unavailable" error (the base of
+  `PeerIdentityUnavailableException`); `IdentityImpl` translates it to `identity_unavailable`.
 - **Width overrides**: no general `Annotated[T, ArrowType(...)]`-equivalent exists. Every scalar
   width already has a distinct CLR type to key off (`sbyte`→int8, `short`→int16, ... — see
   `SchemaDerivation`'s own type-mapping doc comment), so the only gap was `pa.large_string()`/

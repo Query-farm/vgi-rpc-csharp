@@ -62,3 +62,13 @@ def _configure() -> None:
 
 
 _configure()
+
+
+def pytest_sessionstart(session: object) -> None:
+    """Publish the C# conformance worker before any test runs (see publish_worker)."""
+    if os.environ.get("PYTEST_XDIST_WORKER"):
+        return  # the controller already published it
+    from test_csharp_conformance import publish_client_driver, publish_worker
+
+    publish_worker()
+    publish_client_driver()

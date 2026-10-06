@@ -395,10 +395,12 @@ public static class PeerAuthenticationPolicies
 }
 
 public sealed class PeerIdentityRejectedException(string message) : UnauthorizedAccessException(message);
-public sealed class PeerIdentityUnavailableException(string message, int retryAfterSeconds = 5) : Exception(message)
-{
-    public int RetryAfterSeconds { get; } = retryAfterSeconds;
-}
+/// <summary>A peer-identity provider or policy could not answer -- the transport-auth
+/// "unavailable" signal for peer identity. A <see cref="Errors.AuthUnavailableException"/>, so an
+/// authenticate delegate that lets it propagate gets a 503 with <c>Retry-After</c>, and an
+/// identity hook that raises it is translated to <c>identity_unavailable</c>.</summary>
+public sealed class PeerIdentityUnavailableException(string message, int retryAfterSeconds = 5)
+    : Errors.AuthUnavailableException(message, retryAfterSeconds);
 
 internal static class JsonSnapshot
 {

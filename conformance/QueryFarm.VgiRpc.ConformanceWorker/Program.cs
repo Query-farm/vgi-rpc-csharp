@@ -55,7 +55,10 @@ var server = new RpcServer(
         "both" => ConformanceIdentity.Build(mint: true),
         "introspect-only" => ConformanceIdentity.Build(mint: false),
         _ => null,
-    })
+    },
+    // conformance.Secondary.v1 rides the public hosting API like any application protocol would
+    // -- not special-cased -- on every transport this worker serves (MULTI_PROTOCOL_HOSTING.md §2).
+    additionalProtocols: [new HostedProtocol(typeof(ISecondary), new SecondaryImpl())])
 {
     ExternalConfig = !options.Http && options.FakeStorageUrl is { } byteStreamStorageUrl
         ? new ServerExternalConfig
@@ -99,7 +102,14 @@ if (options.Tcp is { } tcp)
 
 if (options.Http)
 {
-    var builder = WebApplication.CreateBuilder([]);
+    // Content root at the binary's directory and configuration reload off: the defaults watch the
+    // cwd, and a harness starting this worker from a home directory or a large checkout waited
+    // over a minute for that watch before PORT: was printed.
+    var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+    {
+        ContentRootPath = AppContext.BaseDirectory,
+        Args = ["--hostBuilder:reloadConfigOnChange=false"],
+    });
     // The discovery contract is "print exactly PORT:<port>\n on stdout, then flush" — Kestrel's
     // own startup/request logging defaults to stdout too and would interleave with that line, so
     // silence everything except what the app itself explicitly writes.

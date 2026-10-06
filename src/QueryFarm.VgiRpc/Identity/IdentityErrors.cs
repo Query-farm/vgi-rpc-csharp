@@ -30,8 +30,9 @@ public class IdentityRefusedException : RpcException
     /// <param name="errorType">The wire error type -- the canonical Python class name.</param>
     /// <param name="message">Operator-facing text. Must never contain the credential.</param>
     /// <param name="errorKind">The stable wire token a caller classifies on.</param>
-    protected IdentityRefusedException(string errorType, string message, string errorKind)
-        : base(errorType, message, errorKind: errorKind)
+    /// <param name="errorCode">The canonical code the kind names (WIRE_PROTOCOL.md §16).</param>
+    protected IdentityRefusedException(string errorType, string message, string errorKind, string errorCode)
+        : base(errorType, message, errorKind: errorKind, errorCode: errorCode)
     {
     }
 }
@@ -57,7 +58,7 @@ public sealed class IntrospectionRefusedException : IdentityRefusedException
 
     /// <param name="message">Why the caller was refused. Never names the subject credential.</param>
     public IntrospectionRefusedException(string message)
-        : base("IntrospectionRefusedError", message, ErrorKindConst)
+        : base("IntrospectionRefusedError", message, ErrorKindConst, ErrorCodes.PermissionDenied)
     {
     }
 }
@@ -76,7 +77,7 @@ public sealed class TokenUnresolvedException : RpcException
 
     /// <param name="message">Always the same uniform text; see the class remarks.</param>
     public TokenUnresolvedException(string message)
-        : base("TokenUnresolvedError", message, errorKind: ErrorKindConst)
+        : base("TokenUnresolvedError", message, errorKind: ErrorKindConst, errorCode: ErrorCodes.NotFound)
     {
     }
 }
@@ -94,7 +95,7 @@ public sealed class StaleAuthException : IdentityRefusedException
 
     /// <param name="message">Names the reason -- see the class remarks on why that is safe here.</param>
     public StaleAuthException(string message)
-        : base("StaleAuthError", message, ErrorKindConst)
+        : base("StaleAuthError", message, ErrorKindConst, ErrorCodes.Unauthenticated)
     {
     }
 }
@@ -108,7 +109,7 @@ public sealed class GrantRefusedException : IdentityRefusedException
 
     /// <param name="message">Why the mint was refused.</param>
     public GrantRefusedException(string message)
-        : base("GrantRefusedError", message, ErrorKindConst)
+        : base("GrantRefusedError", message, ErrorKindConst, ErrorCodes.PermissionDenied)
     {
     }
 }
@@ -146,7 +147,12 @@ public sealed class IdentityUnavailableException : RpcException
         : base(
             "IdentityUnavailableError",
             string.IsNullOrEmpty(detail) ? "identity lookup unavailable" : detail,
-            errorKind: ErrorKindConst)
+            errorKind: ErrorKindConst,
+            errorCode: ErrorCodes.Unavailable,
+            // Required on this kind (WIRE_PROTOCOL.md §16). The hint sat on this class in every
+            // port and reached the wire in none, so a caller could tell the answer was transient
+            // but not when to ask again.
+            errorDetails: [new RetryInfo(retryAfterSeconds).ToJson()])
     {
         Detail = detail;
         RetryAfterSeconds = retryAfterSeconds;

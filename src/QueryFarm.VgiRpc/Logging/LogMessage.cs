@@ -32,19 +32,20 @@ public sealed class LogMessage
 
     /// <summary>
     /// Builds a message from an exception: level EXCEPTION, a short "{Type}: {msg}" summary,
-    /// and structured extra data (exception type/message, truncated stack trace, up to
-    /// <see cref="MaxStackFrames"/> frames, and — for <see cref="RpcException"/>-derived
-    /// exceptions carrying a class-level <c>ErrorKind</c> — that stable token). Mirrors
-    /// Python's <c>Message.from_exception</c>.
+    /// and structured extra data -- the exception type and message, the error model's three
+    /// layers (WIRE_PROTOCOL.md §8: <c>error_code</c> always, <c>error_kind</c> when declared,
+    /// <c>error_details</c> when declared and within the 4 KiB cap -- dropped whole otherwise),
+    /// and, when <paramref name="includeTraceback"/>, the truncated stack trace, up to
+    /// <see cref="MaxStackFrames"/> frames and the inner exception. Mirrors Python's
+    /// <c>Message.from_exception</c>.
     /// </summary>
-    public static LogMessage FromException(Exception exception)
+    /// <param name="exception">The exception to report.</param>
+    /// <param name="includeTraceback">Whether to send the traceback, its frames and the chained
+    /// <c>cause</c>. Servers omit them on network transports by default: a stack trace names
+    /// files, functions and sometimes values, and the caller of a network service is not its
+    /// operator. Defaults to <see langword="true"/> for callers outside a server's dispatch.</param>
+    public static LogMessage FromException(Exception exception, bool includeTraceback = true)
     {
-        var formattedTrace = exception.ToString();
-        if (formattedTrace.Length > MaxTracebackChars)
-        {
-            formattedTrace = formattedTrace[..MaxTracebackChars] + "\n… <traceback truncated>";
-        }
-
         // Prefer RpcException.ErrorType over the raw CLR type name when the exception carries
         // one explicitly. Python has no equivalent override — it always uses type(exc).__name__ —
         // because its exception classes are named to already match the cross-language wire
@@ -62,8 +63,34 @@ public sealed class LogMessage
         {
             ["exception_type"] = wireTypeName,
             ["exception_message"] = exception.Message,
-            ["traceback"] = formattedTrace,
+            // Code first: it is required on every EXCEPTION batch, so it is set before anything
+            // that could be skipped.
+            ["error_code"] = ErrorModel.CodeOf(exception),
         };
+
+        if (ErrorModel.KindOf(exception) is { } kind)
+        {
+            extra["error_kind"] = kind;
+        }
+
+        var details = ErrorModel.DetailsOf(exception);
+        if (details.Count > 0 && ErrorModel.Encode(details) is not null)
+        {
+            extra["error_details"] = details;
+        }
+
+        if (!includeTraceback)
+        {
+            return new LogMessage(VgiLogLevel.Exception, summary, extra);
+        }
+
+        var formattedTrace = exception.ToString();
+        if (formattedTrace.Length > MaxTracebackChars)
+        {
+            formattedTrace = formattedTrace[..MaxTracebackChars] + "\n… <traceback truncated>";
+        }
+
+        extra["traceback"] = formattedTrace;
 
         if (exception.InnerException is { } inner)
         {
@@ -99,11 +126,6 @@ public sealed class LogMessage
 
         extra["frames"] = frames;
 
-        if (exception is RpcException { ErrorKind: { } kind })
-        {
-            extra["error_kind"] = kind;
-        }
-
         return new LogMessage(VgiLogLevel.Exception, summary, extra);
     }
 
@@ -124,6 +146,26 @@ public sealed class LogMessage
             if (Extra.TryGetValue("error_kind", out var kind) && kind is string kindString)
             {
                 result[MetadataKeys.ErrorKind] = kindString;
+            }
+
+            // The other two layers of the error model ride the same way -- only on EXCEPTION: a
+            // WARN carrying "error_code" in its extras is an application's free-form log, not a
+            // classification.
+            if (Level == VgiLogLevel.Exception)
+            {
+                if (Extra.TryGetValue("error_code", out var code) && code is string codeString)
+                {
+                    result[MetadataKeys.ErrorCode] = codeString;
+                }
+
+                // Same encoder FromException measured the cap with, so the bytes on the wire are
+                // the bytes that were checked.
+                if (Extra.TryGetValue("error_details", out var details)
+                    && details is IReadOnlyList<JsonElement> detailList
+                    && ErrorModel.Encode(detailList) is { } encoded)
+                {
+                    result[MetadataKeys.ErrorDetails] = encoded;
+                }
             }
         }
 

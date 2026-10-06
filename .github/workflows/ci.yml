@@ -196,7 +196,9 @@ jobs:
       # threshold fails with ModuleNotFoundError, found via a real CI run (the local sibling
       # checkout's own dev venv already had aiohttp installed, which is exactly the trap this
       # comment on M9's identical mTLS/cryptography miss warned about repeating).
-      - run: pip install -e "./_conformance/vgi-rpc[conformance,http,external]" pytest cryptography
+      # pytest-timeout: the shared suite (imported whole by test_csharp_conformance.py) bounds each
+      # test with pytest.mark.timeout; without the plugin a hung transport hangs the job instead.
+      - run: pip install -e "./_conformance/vgi-rpc[conformance,http,external]" pytest pytest-timeout cryptography
       # --- cross-port drift ------------------------------------------------------------------
       # The reference ships two tools that compare *ports to each other* rather than each port to
       # a spec, and until now they only ever ran on a maintainer's laptop. Between them they found,
@@ -242,7 +244,9 @@ jobs:
       - name: Cross-port identity consistency
         working-directory: _conformance/vgi-rpc
         run: python tools/cross-port/identity_consistency.py --only csharp --verbose
-      # test_csharp_conformance.py's worker_binary fixture builds the worker itself.
+      # The whole shared suite (`from vgi_rpc.conformance._pytest_suite import *`): the error-model,
+      # secondary-protocol, identity auth-unavailable and traceback groups included. conftest.py
+      # publishes the worker and client driver at session start.
       - run: python -m pytest test_csharp_conformance.py -v
 
   client-conformance:

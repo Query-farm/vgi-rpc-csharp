@@ -568,7 +568,18 @@ static JsonNode? IsExchange(string streamKind) => streamKind switch
 };
 
 static JsonObject Ok() => new() { ["ok"] = true };
-static JsonObject Error(RpcException exception) => new() { ["error_type"] = exception.ErrorType, ["error_message"] = exception.ErrorMessage, ["traceback"] = exception.RemoteTraceback };
+// error_code / error_kind / error_details come from the client library's own error object, never
+// from re-reading the batch, and are relayed verbatim: "" (the server sent no code) is not
+// defaulted to UNKNOWN, and unknown detail types stay in the array (CLIENT_DRIVER_PROTOCOL.md §2).
+static JsonObject Error(RpcException exception) => new()
+{
+    ["error_type"] = exception.ErrorType,
+    ["error_message"] = exception.ErrorMessage,
+    ["traceback"] = exception.RemoteTraceback,
+    ["error_code"] = exception.ErrorCode,
+    ["error_kind"] = exception.ErrorKind ?? "",
+    ["error_details"] = new JsonArray(exception.ErrorDetails.Select(d => JsonNode.Parse(d.GetRawText())).ToArray()),
+};
 
 static JsonArray DrainLogs(List<LogMessage> logs)
 {

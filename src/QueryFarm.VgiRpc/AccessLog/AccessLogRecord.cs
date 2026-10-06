@@ -35,4 +35,7 @@ public sealed record AccessLogRecord(
     // OriginalRequestBytes so the schema's "unary requires request_data unless truncated"
     // invariant still holds without paying to base64-encode a payload nobody asked to see.
     string? Truncated = null,
-    long? OriginalRequestBytes = null);
+    long? OriginalRequestBytes = null,
+    // The canonical code (WIRE_PROTOCOL.md §8) on status "error" records -- what an operator
+    // alerts on. Null on success, where the schema forbids it.
+    string? ErrorCode = null);
