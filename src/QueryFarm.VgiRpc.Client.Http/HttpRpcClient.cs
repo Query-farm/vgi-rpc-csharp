@@ -743,6 +743,10 @@ public sealed partial class HttpRpcClient : IRpcClient
             // projection an edge can read without an Arrow parser, and the server refuses a
             // request whose two carriers disagree.
             result[MetadataKeys.Protocol] = RequireProtocol(protocol ?? _protocol);
+            if (_options.ProtocolVersion is not null)
+            {
+                result.TryAdd(MetadataKeys.ProtocolVersion, _options.ProtocolVersion);
+            }
         }
 
         result[MetadataKeys.RequestVersion] = MetadataKeys.CurrentRequestVersion;

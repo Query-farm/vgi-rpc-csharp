@@ -55,9 +55,16 @@ public static class AuthReasonExtensions
 /// message — see <c>docs/unauthorized-spec.md</c> §2 on why a rejection must not become an
 /// oracle for whoever is probing it).
 /// </summary>
-public sealed class AuthFailure(AuthReason reason, string detail = "") : Exception(string.IsNullOrEmpty(detail) ? reason.ToWireString() : detail)
+public sealed class AuthFailure(AuthReason reason, string detail = "", bool stopsChain = false) : Exception(string.IsNullOrEmpty(detail) ? reason.ToWireString() : detail)
 {
     public AuthReason Reason { get; } = reason;
+
+    /// <summary>Whether this refusal ends an <see cref="IdentityBearerAuthentication.Chain"/>
+    /// rather than letting the next member try. An ordinary refusal means "not my credential";
+    /// one that stops the chain means "my credential, and it is bad" -- a forged or stale
+    /// <c>vgig1.</c> grant must not get a second chance from a resolver that may answer for
+    /// anything.</summary>
+    public bool StopsChain { get; } = stopsChain;
 
     /// <summary>Human-readable rejection text — may be empty. Subject to the same "never a
     /// verifier's internal diagnosis" rule as <see cref="Reason"/> itself.</summary>

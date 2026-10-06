@@ -424,14 +424,29 @@ public sealed class HttpRpcClientTests
         Assert.Contains("schema mismatch", error.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>HTTP gates the protocol version per binding, so a client of a versioned server must
+    /// declare one -- through <see cref="HttpRpcClientOptions.ProtocolVersion"/>, the twin of the
+    /// byte-stream client's option.</summary>
+    [Fact]
+    public async Task ProtocolVersionIsDeclaredOverHttp()
+    {
+        await using var host = await StartHostAsync(protocolVersion: "2.1.0");
+        await using var bare = new HttpRpcClient(host.Address, new HttpRpcClientOptions { Protocol = TestProtocol });
+        await Assert.ThrowsAsync<ProtocolVersionException>(() => bare.CreateProxy<IClient>().EchoAsync("x"));
+        await using var versioned = new HttpRpcClient(
+            host.Address, new HttpRpcClientOptions { Protocol = TestProtocol, ProtocolVersion = "2.1.3" });
+        Assert.Equal("x", await versioned.CreateProxy<IClient>().EchoAsync("x"));
+    }
+
     private static async Task<TestHost> StartHostAsync(long? maxResponseBytes = null,
         ExternalizationOptions? externalization = null,
-        RpcHttpEndpoints.AuthenticateDelegate? authenticate = null)
+        RpcHttpEndpoints.AuthenticateDelegate? authenticate = null,
+        string? protocolVersion = null)
     {
         var builder = WebApplication.CreateSlimBuilder();
         builder.WebHost.UseUrls("http://127.0.0.1:0");
         var app = builder.Build();
-        app.MapVgiRpc(new RpcServer(typeof(IService), new Service()),
+        app.MapVgiRpc(new RpcServer(typeof(IService), new Service(), expectedProtocolVersion: protocolVersion),
             maxResponseBytes: maxResponseBytes, externalization: externalization,
             authenticate: authenticate);
         await app.StartAsync(TestContext.Current.CancellationToken);

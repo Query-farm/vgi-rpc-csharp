@@ -70,6 +70,10 @@ public sealed class IdentityImpl : IIdentityProtocol
     /// <paramref name="resolveToken"/> is supplied; there is no permissive default.</param>
     /// <param name="maxAuthAge">How recently a caller must have authenticated to mint a grant,
     /// in seconds.</param>
+    /// <param name="grantKeys">Sealed-grant configuration (IDENTITY_V1_SPEC.md §9). When given
+    /// and <paramref name="mintGrant"/> is not, the framework mints sealed grants itself
+    /// (<see cref="SealedGrants.Minter"/>); an HTTP server hosting this identity then also accepts
+    /// them back as bearer credentials. <see langword="null"/> changes nothing.</param>
     /// <exception cref="ArgumentException"><paramref name="resolveToken"/> was supplied without an
     /// allowlist. Validated at construction, not at first call: a worker that would refuse every
     /// introspection should fail to start rather than serve traffic until someone tries.</exception>
@@ -77,15 +81,24 @@ public sealed class IdentityImpl : IIdentityProtocol
         TokenResolver? resolveToken = null,
         GrantMinter? mintGrant = null,
         IEnumerable<string>? introspectPrincipals = null,
-        double maxAuthAge = 900.0)
+        double maxAuthAge = 900.0,
+        GrantKeys? grantKeys = null)
     {
         _resolveToken = resolveToken;
-        _mintGrant = mintGrant;
+        GrantKeys = grantKeys;
+        _mintGrant = mintGrant ?? (grantKeys is null ? null : SealedGrants.Minter(grantKeys));
         _maxAuthAge = maxAuthAge;
         _principals = resolveToken is null
             ? s_noPrincipals
             : IdentityGuards.NormalisePrincipals(introspectPrincipals);
     }
+
+    /// <summary>The sealed-grant configuration, when this deployment has one.</summary>
+    public GrantKeys? GrantKeys { get; }
+
+    /// <summary>The worker's resolver, which an HTTP server also consults for bearer credentials
+    /// (IDENTITY_V1_SPEC.md §9.2).</summary>
+    public TokenResolver? ResolveTokenHook => _resolveToken;
 
     /// <summary>Returns the methods this deployment can actually answer.</summary>
     /// <remarks>

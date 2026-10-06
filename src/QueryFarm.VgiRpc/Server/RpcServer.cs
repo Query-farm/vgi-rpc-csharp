@@ -169,6 +169,14 @@ public sealed class RpcServer
     /// its own wire name, gated against its own <see cref="HostedProtocol.ProtocolVersion"/>, hashed
     /// on its own, and listed by reflection after the primary in this order. The protocol is the
     /// unit of optionality: there is deliberately no way to host a subset of one's methods.</param>
+    /// <param name="grantKeys">Sealed-grant configuration (IDENTITY_V1_SPEC.md §9). With keys, the
+    /// framework mints sealed grants through <c>issue_grant</c> (unless <paramref name="identity"/>
+    /// supplies its own minter) and an HTTP app accepts them back as bearer credentials; with grants
+    /// on and no <paramref name="identity"/>, identity is hosted with <c>issue_grant</c> alone.</param>
+    /// <param name="grantKeysFromEnvironment">When <paramref name="grantKeys"/> is
+    /// <see langword="null"/>, read <c>VGI_RPC_GRANT_KEYS</c> and friends (the default, as the
+    /// reference does) -- unset means grants are off and nothing changes. <see langword="false"/>
+    /// turns grants off regardless of the environment.</param>
     /// <exception cref="ArgumentException">A protocol's name is malformed, claims the reserved
     /// <c>vgi_rpc.</c> prefix (however the name was derived), or repeats another's; an
     /// implementation does not implement its interface; or a declared version is not
@@ -176,7 +184,8 @@ public sealed class RpcServer
     public RpcServer(
         Type serviceInterface, object implementation, string? serverId = null, IAccessLogSink? accessLog = null,
         IReadOnlyList<IRpcDispatchHook>? dispatchHooks = null, string? expectedProtocolVersion = null,
-        IdentityImpl? identity = null, IReadOnlyList<HostedProtocol>? additionalProtocols = null)
+        IdentityImpl? identity = null, IReadOnlyList<HostedProtocol>? additionalProtocols = null,
+        GrantKeys? grantKeys = null, bool grantKeysFromEnvironment = true)
     {
         ArgumentNullException.ThrowIfNull(serviceInterface);
         ArgumentNullException.ThrowIfNull(implementation);
@@ -258,6 +267,26 @@ public sealed class RpcServer
         // The method set narrows to the hooks that exist (see IdentityProtocol.MethodsFor), so
         // the hash narrows with it: a worker offering half the methods is not offering the same
         // surface and must not claim the same fingerprint.
+        // Read at construction, so a malformed key refuses to start the worker rather than failing
+        // the first mint.
+        grantKeys ??= grantKeysFromEnvironment ? GrantKeys.FromEnvironment() : null;
+        if (grantKeys is not null)
+        {
+            if (identity is null)
+            {
+                // Grants on, no other identity hooks: the framework mints and accepts its own, and
+                // hosts issue_grant alone.
+                identity = new IdentityImpl(grantKeys: grantKeys);
+            }
+            else if (identity.GrantKeys is null)
+            {
+                throw new ArgumentException(
+                    "grant keys were configured (grantKeys or VGI_RPC_GRANT_KEYS) and an IdentityImpl was passed "
+                    + "without them. Pass new IdentityImpl(..., grantKeys: ...) so the minter and the verifier use "
+                    + "the same keys.", nameof(identity));
+            }
+        }
+
         var offered = identity?.OfferedMethods();
         _identity = offered is { Count: > 0 } ? identity : null;
         _identityMethods = offered is { Count: > 0 }
@@ -265,6 +294,12 @@ public sealed class RpcServer
             : new Dictionary<string, RpcMethodInfo>(StringComparer.Ordinal);
         _identityMethodNames = new HashSet<string>(_identityMethods.Keys, StringComparer.Ordinal);
     }
+
+    /// <summary>The hosted <c>vgi_rpc.Identity.v1</c> implementation, when there is one.</summary>
+    public IdentityImpl? HostedIdentity => _identity;
+
+    /// <summary>The sealed-grant configuration, when grants are on.</summary>
+    public GrantKeys? GrantKeys => _identity?.GrantKeys;
 
     /// <summary>The protocols this server hosts, in registration order.</summary>
     /// <remarks>

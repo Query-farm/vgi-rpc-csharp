@@ -54,11 +54,14 @@ var server = new RpcServer(
     {
         "both" => ConformanceIdentity.Build(mint: true),
         "introspect-only" => ConformanceIdentity.Build(mint: false),
+        "grants" => ConformanceIdentity.BuildGrants(),
         _ => null,
     },
     // conformance.Secondary.v1 rides the public hosting API like any application protocol would
     // -- not special-cased -- on every transport this worker serves (MULTI_PROTOCOL_HOSTING.md §2).
-    additionalProtocols: [new HostedProtocol(typeof(ISecondary), new SecondaryImpl())])
+    additionalProtocols: options.Identity == "grants"
+        ? [new HostedProtocol(typeof(ISecondary), new SecondaryImpl()), new HostedProtocol(typeof(IWhoami), new WhoamiImpl())]
+        : [new HostedProtocol(typeof(ISecondary), new SecondaryImpl())])
 {
     ExternalConfig = !options.Http && options.FakeStorageUrl is { } byteStreamStorageUrl
         ? new ServerExternalConfig
@@ -535,9 +538,9 @@ internal sealed class CliOptions
                     // "introspect-only" configures the resolver alone so issue_grant is not
                     // hosted and the protocol_hash narrows with it.
                     identity = RequireValue(args, ref i, "--identity");
-                    if (identity is not ("off" or "both" or "introspect-only"))
+                    if (identity is not ("off" or "both" or "introspect-only" or "grants"))
                     {
-                        Console.Error.WriteLine($"--identity must be off|both|introspect-only, got '{identity}'");
+                        Console.Error.WriteLine($"--identity must be off|both|introspect-only|grants, got '{identity}'");
                         return null;
                     }
 

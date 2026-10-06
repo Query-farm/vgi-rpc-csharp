@@ -281,6 +281,32 @@ it is the `vgi_rpc.Identity.v1` protocol (`QueryFarm.VgiRpc.Identity.IdentityImp
 `RpcServer` as `identity:`), reachable over every transport and gated by an introspector
 allowlist rather than a rate limit.
 
+**Accepting identity credentials as bearers** (WIRE_PROTOCOL.md §16, IDENTITY_V1_SPEC.md §9).
+`issue_grant` mints a credential meant to be presented later as an ordinary bearer, and two
+mechanisms close that loop:
+
+- **Sealed grants (opt-in).** Configure `VGI_RPC_GRANT_KEYS` (comma-separated standard base64,
+  exactly 32 bytes each; the first mints, all verify), optionally `VGI_RPC_GRANT_AUDIENCE` and
+  `VGI_RPC_GRANT_MAX_TTL_SECONDS` (default 7 days) -- or pass `RpcServer(..., grantKeys:
+  GrantKeys.Parse([...]))`. The framework then mints `vgig1.` grants through `issue_grant` (unless
+  your `IdentityImpl` supplies a minter) and `MapVgiRpc` accepts them back as bearers. No keys,
+  no change; a malformed key is a startup error. A grant authenticates with domain `grant`, the
+  owner's principal and `{grant_id, scopes, purpose}`, and no `auth_time`, so it cannot mint
+  another grant. Grants are not individually revocable: keep the lifetime short and rotate by
+  adding the new key first.
+- **`resolve_token` bearers.** An `IdentityImpl` resolver is also consulted for bearer tokens the
+  earlier authenticators did not accept (domain `token`). `null` falls through to 401; an
+  `AuthUnavailableException` or `IdentityUnavailableException` is a 503 with `Retry-After`.
+
+The chain is your `authenticate` delegate, then sealed grants, then `resolve_token`. Your delegate
+signals "not my credential" by throwing `AuthFailure`; a bad `vgig1.` token is a 401 that never
+reaches the resolver. A deployment whose authentication depends on proxy-injected evidence
+(`proxyProofRequired`, a `proxyHint`) must compose `IdentityBearerAuthentication` itself and pass
+`identityBearer: false`, or `MapVgiRpc` refuses to start. Sealed grants use XChaCha20-Poly1305
+(the cross-port token envelope), built on .NET's `ChaCha20Poly1305`; where
+`ChaCha20Poly1305.IsSupported` is false (Windows before Server 2022 / Windows 11), configuring grant
+keys fails at startup.
+
 The separate `QueryFarm.VgiRpc.Client.OAuth` package performs OIDC discovery, Authorization Code
 with PKCE (including constant-time state validation), Device Authorization polling, token refresh,
 and bearer injection through `OAuthBearerHandler`.

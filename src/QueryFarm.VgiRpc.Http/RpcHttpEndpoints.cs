@@ -141,9 +141,37 @@ public static class RpcHttpEndpoints
     /// <param name="hostingMaxRequestBytes">Provider-neutral hosting request ceiling; null means unset.</param>
     /// <param name="hostingMaxResponseBytes">Provider-neutral hosting response ceiling; null means unset.</param>
     /// <param name="preferredResponseBytes">Advisory batching target, clamped to the effective hard limit.</param>
-    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null, long? maxResponseBytes = null, AuthenticateDelegate? authenticate = null, string? proxyHint = null, string? corsPolicyName = null, StickySessionRegistry? sticky = null, bool proxyProofRequired = false, ExternalizationOptions? externalization = null, long? hostingMaxRequestBytes = null, long? hostingMaxResponseBytes = null, long? preferredResponseBytes = null)
+    /// <param name="identityBearer">When <paramref name="server"/> hosts <c>vgi_rpc.Identity.v1</c>
+    /// with sealed-grant keys or a <c>resolve_token</c> hook, accept those credentials as bearers
+    /// after <paramref name="authenticate"/> (see <see cref="IdentityBearerAuthentication.Compose"/>).
+    /// On by default; <see langword="false"/> is for a deployment that composes them itself -- required
+    /// when its authentication depends on proxy-injected evidence (<paramref name="proxyProofRequired"/>
+    /// or a <paramref name="proxyHint"/>), which otherwise refuses to start.</param>
+    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null, long? maxResponseBytes = null, AuthenticateDelegate? authenticate = null, string? proxyHint = null, string? corsPolicyName = null, StickySessionRegistry? sticky = null, bool proxyProofRequired = false, ExternalizationOptions? externalization = null, long? hostingMaxRequestBytes = null, long? hostingMaxResponseBytes = null, long? preferredResponseBytes = null, bool identityBearer = true)
     {
         ValidateResponseBudget(maxResponseBytes, nameof(maxResponseBytes));
+        // Close the identity loop (WIRE_PROTOCOL.md §16): a server hosting vgi_rpc.Identity.v1 with
+        // sealed-grant keys or a resolve_token hook accepts those credentials as bearers, after the
+        // deployment's own authenticator. A deployment whose authentication depends on proxy-injected
+        // evidence must not get them OR-ed beside it -- that would let a grant bypass the gate --
+        // so it composes them itself and passes identityBearer: false.
+        if (identityBearer && server.HostedIdentity is { } hostedIdentity
+            && (hostedIdentity.GrantKeys is not null || hostedIdentity.ResolveTokenHook is not null))
+        {
+            if (proxyProofRequired || !string.IsNullOrEmpty(proxyHint))
+            {
+                throw new ArgumentException(
+                    "this server's authentication depends on proxy-injected evidence, and accepting sealed grants or "
+                    + "resolve_token bearers would be an OR beside it that bypasses that requirement. Compose it "
+                    + "yourself -- ProxyProof.RequireAll(gate, IdentityBearerAuthentication.Chain(inner, "
+                    + "IdentityBearerAuthentication.GrantAuthenticate(keys), IdentityBearerAuthentication."
+                    + "ResolveTokenAuthenticate(hook))) -- and pass identityBearer: false.", nameof(identityBearer));
+            }
+
+            authenticate = IdentityBearerAuthentication.Compose(
+                authenticate, hostedIdentity.GrantKeys, hostedIdentity.ResolveTokenHook);
+        }
+
         ValidateResponseBudget(hostingMaxResponseBytes, nameof(hostingMaxResponseBytes));
         ValidateResponseBudget(preferredResponseBytes, nameof(preferredResponseBytes));
         var effectiveMaxResponseBytes = MinLimit(maxResponseBytes, hostingMaxResponseBytes);

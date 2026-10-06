@@ -33,6 +33,12 @@ public sealed class HttpRpcClientOptions
     /// </remarks>
     public string Protocol { get; init; } = "";
 
+    /// <summary>The <c>vgi_rpc.protocol_version</c> every protocol-scoped request declares, or
+    /// <see langword="null"/> to declare none -- the HTTP twin of
+    /// <c>RpcClientOptions.ProtocolVersion</c>. Required against a server whose protocol declares a
+    /// version, which gates every request against it on HTTP as on the byte stream.</summary>
+    public string? ProtocolVersion { get; init; }
+
     public int? CompressionLevel { get; init; } = 1;
 
     public ContentEncoding PreferredEncoding { get; init; } = ContentEncoding.Zstd;

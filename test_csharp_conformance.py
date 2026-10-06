@@ -321,6 +321,13 @@ def conformance_http_identity_port(worker_binary: Path) -> Iterator[int]:
 
 
 @pytest.fixture(scope="session")
+def conformance_http_grant_port(worker_binary: Path) -> Iterator[int]:
+    """The grant worker (IDENTITY_CONFORMANCE_FIXTURE.md §10): the fixture resolver, no mint hook
+    (the framework mints sealed grants with the published fixture keys), conformance.Whoami.v1."""
+    yield from _spawn_http_worker_port(worker_binary, "--identity", "grants")
+
+
+@pytest.fixture(scope="session")
 def conformance_http_identity_introspect_only_port(worker_binary: Path) -> Iterator[int]:
     """The same binary with the mint hook left out.
 

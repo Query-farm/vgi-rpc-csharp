@@ -33,6 +33,8 @@
 
   <ItemGroup>
     <None Update="Fixtures\iroh_transport_vectors.json" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Copied verbatim from vgi-rpc's vgi_rpc/conformance/grant_token_vectors.json; refresh it when the reference changes. -->
+    <None Update="Fixtures\grant_token_vectors.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

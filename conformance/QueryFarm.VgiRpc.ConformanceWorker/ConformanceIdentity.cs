@@ -235,6 +235,24 @@ public static class ConformanceIdentity
         introspectPrincipals: [IntrospectorPrincipal],
         maxAuthAge: MaxAuthAge);
 
+    /// <summary>The grant worker (IDENTITY_CONFORMANCE_FIXTURE.md §10): the fixture resolver, no
+    /// mint hook -- the framework mints sealed grants -- and the published fixture grant keys.</summary>
+    public static IdentityImpl BuildGrants() => new(
+        resolveToken: ResolveToken,
+        mintGrant: null,
+        introspectPrincipals: [IntrospectorPrincipal],
+        maxAuthAge: MaxAuthAge,
+        grantKeys: GrantKeysForFixture());
+
+    /// <summary>Current key <c>0x10..0x2f</c> (mints), previous <c>0x30..0x4f</c> (verifies only),
+    /// audience <c>"conformance"</c>, max TTL 3600. Published on purpose -- the shared suite mints
+    /// with them to test this verifier and decodes this worker's grants to test its minter. A fixture
+    /// key, never a deployment one.</summary>
+    public static GrantKeys GrantKeysForFixture() => new(
+        [Enumerable.Range(0x10, 32).Select(b => (byte)b).ToArray(), Enumerable.Range(0x30, 32).Select(b => (byte)b).ToArray()],
+        audience: "conformance",
+        maxTtlSeconds: 3600);
+
     /// <summary>
     /// Derives the caller's identity from <see cref="PrincipalHeader"/> and
     /// <see cref="AuthTimeHeader"/>. <b>Trivially spoofable; never deploy this.</b>
@@ -263,6 +281,13 @@ public static class ConformanceIdentity
         var principal = context.Request.Headers[PrincipalHeader].ToString();
         if (string.IsNullOrEmpty(principal))
         {
+            // A bearer: not ours. Fall through to the identity bearer authenticators MapVgiRpc
+            // appends (sealed grants, then resolve_token) -- IDENTITY_CONFORMANCE_FIXTURE.md §10.
+            if (!string.IsNullOrEmpty(context.Request.Headers.Authorization.ToString()))
+            {
+                throw new AuthFailure(AuthReason.InvalidCredential, "no conformance principal header");
+            }
+
             return Task.CompletedTask;
         }
 
