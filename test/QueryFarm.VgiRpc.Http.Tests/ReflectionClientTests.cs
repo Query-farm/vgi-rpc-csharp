@@ -519,7 +519,7 @@ public sealed partial class ReflectionClientTests
                     {
                         var path = Path.Combine(Path.GetTempPath(), $"vgi-refl-{Guid.NewGuid():n}.sock");
                         var process = await StartAsync([.. command, "--unix", path], "UNIX:");
-                        var rpc = await RpcClient.ConnectUnixAsync(path, Options(version: ReferenceVersion), Ct);
+                        var rpc = await ConnectUnixWhenListeningAsync(path, Options(version: ReferenceVersion));
                         var conn = new Conn { Client = rpc, Target = rpc };
                         conn._cleanup.Add(() => rpc.DisposeAsync());
                         conn._cleanup.Add(() => Kill(process));
@@ -557,6 +557,37 @@ public sealed partial class ReflectionClientTests
 
                 default:
                     throw new ArgumentOutOfRangeException(nameof(transport), transport, null);
+            }
+        }
+
+        /// <summary>Connects once the reference's Unix socket is accepting.</summary>
+        /// <remarks>
+        /// The reference conformance server prints <c>UNIX:&lt;path&gt;</c> before it binds
+        /// (<c>vgi_rpc/conformance/_cli.py</c> <c>_serve_unix</c>), unlike its TCP discovery line,
+        /// which is printed from <c>on_bound</c>. The line says where, not that it is listening, so
+        /// connecting straight after it races the bind: refused, or no socket file yet. The
+        /// reference's own harness handles this the same way (<c>tests/conftest.py</c>
+        /// <c>_wait_for_unix</c>, after the discovery line): retry the connect until it is
+        /// accepted, bounded by a deadline. The retried connect is the test's own connection, so
+        /// the server sees exactly one.
+        /// </remarks>
+        private static async Task<RpcClient> ConnectUnixWhenListeningAsync(string path, RpcClientOptions options)
+        {
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+            deadline.CancelAfter(TimeSpan.FromSeconds(20));
+            while (true)
+            {
+                try
+                {
+                    return await RpcClient.ConnectUnixAsync(path, options, deadline.Token);
+                }
+                catch (System.Net.Sockets.SocketException exc) when (
+                    exc.SocketErrorCode is System.Net.Sockets.SocketError.ConnectionRefused
+                        or System.Net.Sockets.SocketError.AddressNotAvailable
+                    || !File.Exists(path))
+                {
+                    await Task.Delay(25, deadline.Token);
+                }
             }
         }
 
