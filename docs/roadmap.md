@@ -98,13 +98,18 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       `--access-log PATH`/`--access-log-debug` flags mirror the porting guide's mandatory CLI
       contract. Validated against the real `vgi_rpc.access_log_conformance.validate_access_logs`
       schema validator (not just self-consistently) via `test_csharp_conformance.py`'s
-      `test_access_log_conforms[info|debug]`, both postures: at INFO, unary records carry
-      `truncated: "payload_omitted"` + `original_request_bytes` (a pure function of the request
-      batch's serialized length, computed without base64-encoding it); at DEBUG
-      (`--access-log-debug`), unary records instead carry the full `request_data` — a
-      self-contained Arrow IPC stream re-framed from the already-parsed request batch (mirrors
-      Python's `_request_wire_bytes` fallback path) — round-trip-verified via
-      `--require-request-data`, which decodes it with `pyarrow.ipc.open_stream`. Stream calls
+      `test_access_log_conforms[info|debug]`. **No request value is logged, at any level, and
+      there is no opt-in** (vgi-rpc 0.50.1): `request_data` (the whole request as base64 Arrow
+      IPC, which `--access-log-debug` used to turn on) put a VGI `catalog_attach`'s secret
+      options in the log. Unary and stream-init records describe the request by `request_fields`
+      (`[{name, type}]`, type = the canonical type token) and `request_rows`
+      (`AccessLog/RequestShape.cs`); HTTP stream turns report state tokens by
+      `request_state_bytes` / `response_state_bytes`. `--access-log-debug` is still accepted and
+      changes nothing. Unary records carry `truncated: "payload_omitted"` as a transitional
+      marker, because the released 0.50.0 schema requires `request_data` on a unary record
+      unless truncated; drop it once CI validates against 0.50.1. `NoPayloadInLogsTests` puts a
+      sentinel secret in an argument and in stream state over pipe and HTTP and asserts it (and
+      its base64 alignments) appears in neither the JSONL nor stderr. Stream calls
       carry a per-call `stream_id` (`Guid.NewGuid("N")`, matching Python's `uuid.uuid4().hex`)
       on every exit path, including the pre-dispatch error path. Error records carry
       `error_message` (`exception.Message`, matching Python's `str(exc)`), satisfying the

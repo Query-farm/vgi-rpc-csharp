@@ -824,7 +824,7 @@ def test_full_suite_status(worker_binary: Path) -> None:
 
 
 # A small mixed unary/stream/error subset — enough to exercise every access-log schema branch
-# (request_data on unary, stream_id on stream, error_message on the error path) without paying
+# (request_fields on unary and stream init, stream_id on stream, error_message on the error path) without paying
 # to re-run the whole IMPLEMENTED_FILTER twice per --access-log posture below.
 _ACCESS_LOG_FILTER = "scalar_echo.*,dataclass.echo_point,producer_stream.*,exchange_stream.echo,errors.*"
 
@@ -840,9 +840,10 @@ _CONFORMANCE_PROTOCOL_HASH = "05479410c96f34410a2b10a4f6a49d59dcfd9d6d1d45ce9a98
 # this module and so applies here too; this drives a whole vgi-rpc-test run, not one call.
 @pytest.mark.timeout(1800)
 def test_access_log_conforms(worker_binary: Path, tmp_path: Path, debug: bool) -> None:
-    """The JSONL the worker writes via --access-log (and --access-log-debug, which additionally
-    requires request_data to round-trip as a self-contained Arrow IPC stream — see
-    docs/access-log-spec.md §4.3) must validate against vgi_rpc/access_log.schema.json. See
+    """The JSONL the worker writes via --access-log must validate against
+    vgi_rpc/access_log.schema.json, with and without --access-log-debug (accepted for parity, and
+    inert: no record carries a request value, request_data or stream state at any level -- the
+    framework cannot know which parameters are secret). See docs/access-log-spec.md §4.3 and
     docs/roadmap.md M5."""
     from vgi_rpc.access_log_conformance import _filter_access_logs, _parse_json_log_lines, validate_access_logs
 
@@ -861,8 +862,7 @@ def test_access_log_conforms(worker_binary: Path, tmp_path: Path, debug: bool) -
         "--filter",
         _ACCESS_LOG_FILTER,
     ]
-    if debug:
-        args.append("--require-request-data")
+    # No --require-request-data: request_data is gone, and the reference now rejects the flag.
 
     result = subprocess.run(args, capture_output=True, text=True, cwd=REPO_ROOT)
     assert result.returncode == 0, (
@@ -873,6 +873,8 @@ def test_access_log_conforms(worker_binary: Path, tmp_path: Path, debug: bool) -
 
     entries = _filter_access_logs(_parse_json_log_lines(log_path.read_text().splitlines()))
     assert entries, "no vgi_rpc.access entries were written"
+    payload = [e for e in entries if {"request_data", "request_state", "response_state"} & e.keys()]
+    assert not payload, f"{len(payload)} access records carry a payload field, e.g. {sorted(payload[0])}"
     violations = validate_access_logs(entries)
     assert not violations, "access log violations:\n" + "\n".join(
         f"  entry {v.entry_index} ({v.method}) {v.path}: {v.message}" for v in violations

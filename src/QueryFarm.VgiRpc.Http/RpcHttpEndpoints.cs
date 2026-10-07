@@ -1220,7 +1220,7 @@ public static class RpcHttpEndpoints
         // status=error still answers HTTP 200 — the body carries a real in-band error batch, and
         // RpcErrorHeader is the signal a client checks instead of the status code (mirrors
         // Python's _set_http_status 500→200 translation).
-        EmitAccessLog(server, protocol, info.WireName, "unary", status, errorType, errorMessage, start, StatusCodes.Status200OK, errorCode: errorCode);
+        EmitAccessLog(server, protocol, info.WireName, "unary", status, errorType, errorMessage, start, StatusCodes.Status200OK, errorCode: errorCode, request: requestBatch.Batch);
 
         if (status == "error")
         {
@@ -1370,7 +1370,7 @@ public static class RpcHttpEndpoints
             await errWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(outcome.Schema), errMetadata, cancellationToken).ConfigureAwait(false);
         }
 
-        EmitAccessLog(server, protocol, method, "unary", status, errorType, errorMessage, start, StatusCodes.Status200OK, errorCode: errorCode);
+        EmitAccessLog(server, protocol, method, "unary", status, errorType, errorMessage, start, StatusCodes.Status200OK, errorCode: errorCode, request: requestBatch.Batch);
 
         if (status == "error")
         {
@@ -1625,6 +1625,7 @@ public static class RpcHttpEndpoints
             Convert.FromHexString(callKey),
             tokenKey,
             StickySessions.ComputeCallAad(callIdentity, protocol)));
+        var tokenWritten = false;
 
         var responseBuffer = new MemoryStream();
 
@@ -1780,6 +1781,7 @@ public static class RpcHttpEndpoints
 
             if (!isProducer || !tickFinished)
             {
+                tokenWritten = true;
                 var tokenMetadata = new Dictionary<string, string>
                 {
                     [MetadataKeys.StreamState] = tokenBase64,
@@ -1796,7 +1798,7 @@ public static class RpcHttpEndpoints
             }
         }
 
-        EmitAccessLog(server, protocol, info.WireName, "stream", "ok", "", "", start, StatusCodes.Status200OK, callKey);
+        EmitAccessLog(server, protocol, info.WireName, "stream", "ok", "", "", start, StatusCodes.Status200OK, callKey, request: requestBatch.Batch, responseStateBytes: tokenWritten ? tokenBase64.Length : null);
         if (stickyState is not null)
         {
             FinishSticky(context, sticky!, stickyState);
@@ -1978,7 +1980,7 @@ public static class RpcHttpEndpoints
         {
             stream.State.OnCancel(null);
             registry.Remove(callKey);
-            EmitAccessLog(server, protocol, info.WireName, "stream", "ok", "", "", start, StatusCodes.Status200OK, callKey);
+            EmitAccessLog(server, protocol, info.WireName, "stream", "ok", "", "", start, StatusCodes.Status200OK, callKey, requestStateBytes: tokenB64.Length);
             var cancelBuffer = new MemoryStream();
             await using (var cancelWriter = new WireWriter(cancelBuffer, outputSchema))
             {
@@ -2235,7 +2237,7 @@ public static class RpcHttpEndpoints
             }
 
             context.Response.Headers[RpcErrorHeader] = "true";
-            EmitAccessLog(server, protocol, info.WireName, "stream", "error", "ResponseTooLargeError", overshoot.Message, start, StatusCodes.Status200OK, callKey);
+            EmitAccessLog(server, protocol, info.WireName, "stream", "error", "ResponseTooLargeError", overshoot.Message, start, StatusCodes.Status200OK, callKey, requestStateBytes: tokenB64.Length);
             if (stickyState is not null)
             {
                 FinishSticky(context, sticky!, stickyState);
@@ -2245,7 +2247,7 @@ public static class RpcHttpEndpoints
             return;
         }
 
-        EmitAccessLog(server, protocol, info.WireName, "stream", "ok", "", "", start, StatusCodes.Status200OK, callKey);
+        EmitAccessLog(server, protocol, info.WireName, "stream", "ok", "", "", start, StatusCodes.Status200OK, callKey, requestStateBytes: tokenB64.Length, responseStateBytes: freshTokenB64?.Length);
         if (stickyState is not null)
         {
             FinishSticky(context, sticky!, stickyState);
@@ -2430,7 +2432,7 @@ public static class RpcHttpEndpoints
     /// it now says so at the call site instead of happening silently here.
     /// </para>
     /// </remarks>
-    private static void EmitAccessLog(RpcServer server, string protocol, string method, string methodType, string status, string errorType, string errorMessage, long startTimestamp, int httpStatus, string? streamId = null, string errorCode = "")
+    private static void EmitAccessLog(RpcServer server, string protocol, string method, string methodType, string status, string errorType, string errorMessage, long startTimestamp, int httpStatus, string? streamId = null, string errorCode = "", RecordBatch? request = null, long? requestStateBytes = null, long? responseStateBytes = null)
     {
         if (server.AccessLog is not { } sink)
         {
@@ -2439,6 +2441,15 @@ public static class RpcHttpEndpoints
 
         var resolvedProtocol = LoggableProtocol(server, protocol);
         var durationMs = Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
+        // The request by its shape, never its values; state tokens by size, never content (they
+        // are replayable). See RequestShape.
+        IReadOnlyList<AccessLogRequestField>? requestFields = null;
+        long? requestRows = null;
+        if (request is not null)
+        {
+            (requestFields, requestRows) = RequestShape.Of(request);
+        }
+
         sink.Write(new AccessLogRecord(
             Timestamp: DateTimeOffset.UtcNow,
             ServerId: server.ServerId,
@@ -2459,6 +2470,14 @@ public static class RpcHttpEndpoints
             ErrorMessage: string.IsNullOrEmpty(errorMessage) ? null : errorMessage,
             ServerVersion: server.ServerVersion,
             StreamId: streamId,
+            RequestFields: requestFields,
+            RequestRows: requestRows,
+            // Transitional: the released vgi-rpc 0.50.0 schema requires request_data on a unary
+            // record unless it is marked truncated; the newer schema accepts the marker as legacy.
+            // Remove once CI validates against vgi-rpc >= 0.50.1.
+            Truncated: methodType == "unary" ? "payload_omitted" : null,
+            RequestStateBytes: requestStateBytes,
+            ResponseStateBytes: responseStateBytes,
             ErrorCode: status == "error" ? (string.IsNullOrEmpty(errorCode) ? ErrorCodeFor(errorType) : errorCode) : null));
     }
 

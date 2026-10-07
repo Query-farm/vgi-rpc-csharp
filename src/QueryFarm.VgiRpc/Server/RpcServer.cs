@@ -751,7 +751,7 @@ public sealed class RpcServer
         {
             // ServeStreamAsync owns shm from here on (a stream's whole lifetime, across every
             // turn) — it disposes it, ServeOneAsync must not.
-            return await ServeStreamAsync(transport, binding, info, args, start, shm, tracebacks, cancellationToken).ConfigureAwait(false);
+            return await ServeStreamAsync(transport, binding, info, args, request, start, shm, tracebacks, cancellationToken).ConfigureAwait(false);
         }
 
         using var ownedLargeBytesArguments = new LargeBytesBufferArgumentsOwner(args);
@@ -836,6 +836,8 @@ public sealed class RpcServer
     /// <param name="binding">The application protocol the request resolved to.</param>
     /// <param name="info">Reflection info for the RPC method that constructs this stream.</param>
     /// <param name="args">Already-extracted/resolved constructor arguments.</param>
+    /// <param name="request">The stream-init request, which the access record describes by its shape
+    /// (never its values).</param>
     /// <param name="start">Timestamp (from <see cref="System.Diagnostics.Stopwatch.GetTimestamp"/>)
     /// the whole call began, for access-log duration.</param>
     /// <param name="shm">The SHM segment attached from the stream-init request's own metadata
@@ -849,7 +851,7 @@ public sealed class RpcServer
     /// <param name="tracebacks">Whether error batches carry the traceback (see
     /// <see cref="IncludeTracebacks"/>).</param>
     /// <param name="cancellationToken">Cancellation token.</param>
-    private async Task<bool> ServeStreamAsync(IRpcTransport transport, ProtocolBinding binding, RpcMethodInfo info, object?[] args, long start, ShmSegment? shm, bool tracebacks, CancellationToken cancellationToken)
+    private async Task<bool> ServeStreamAsync(IRpcTransport transport, ProtocolBinding binding, RpcMethodInfo info, object?[] args, AnnotatedBatch request, long start, ShmSegment? shm, bool tracebacks, CancellationToken cancellationToken)
     {
         using var ownedShm = shm;
 
@@ -884,7 +886,7 @@ public sealed class RpcServer
             // error is written and flushed first: a lockstep client sends its input EOS only
             // after it has read the error, so draining before replying would deadlock.
             await DrainAbandonedInputStreamAsync(transport, cancellationToken).ConfigureAwait(false);
-            await EmitAccessLogAsync(info.WireName, "stream", "error", actual.GetType().Name, actual.Message, start, streamId: streamId, protocol: binding.Name, errorCode: ErrorModel.CodeOf(actual), cancellationToken: cancellationToken).ConfigureAwait(false);
+            await EmitAccessLogAsync(info.WireName, "stream", "error", actual.GetType().Name, actual.Message, start, requestForLog: request, streamId: streamId, protocol: binding.Name, errorCode: ErrorModel.CodeOf(actual), cancellationToken: cancellationToken).ConfigureAwait(false);
             return true;
         }
 
@@ -936,7 +938,7 @@ public sealed class RpcServer
         {
             // client never opened the tick/exchange input stream
             _dispatchHook?.OnDispatchEnd(hookToken, hookInfo, null);
-            await EmitAccessLogAsync(info.WireName, "stream", "ok", "", "", start, streamId: streamId, protocol: binding.Name, cancellationToken: cancellationToken).ConfigureAwait(false);
+            await EmitAccessLogAsync(info.WireName, "stream", "ok", "", "", start, requestForLog: request, streamId: streamId, protocol: binding.Name, cancellationToken: cancellationToken).ConfigureAwait(false);
             return true;
         }
 
@@ -1105,18 +1107,17 @@ public sealed class RpcServer
         }
 
         _dispatchHook?.OnDispatchEnd(hookToken, hookInfo, streamHookError);
-        await EmitAccessLogAsync(info.WireName, "stream", streamStatus, streamErrorType, streamErrorMessage, start, streamId: streamId, protocol: binding.Name, errorCode: streamErrorCode, cancellationToken: cancellationToken).ConfigureAwait(false);
+        await EmitAccessLogAsync(info.WireName, "stream", streamStatus, streamErrorType, streamErrorMessage, start, requestForLog: request, streamId: streamId, protocol: binding.Name, errorCode: streamErrorCode, cancellationToken: cancellationToken).ConfigureAwait(false);
         return true;
     }
 
     /// <summary>
     /// Builds and hands an <see cref="AccessLogRecord"/> to <see cref="_accessLog"/>, if one is
-    /// configured. <paramref name="requestForLog"/> (unary calls only) is re-serialized as a
-    /// self-contained Arrow IPC stream to satisfy access_log.schema.json's "unary requires
-    /// request_data unless truncated" rule; <paramref name="streamId"/> (stream calls only)
+    /// configured. <paramref name="requestForLog"/> (unary calls and stream init) is described by
+    /// its shape -- request_fields / request_rows -- and never by its values; <paramref name="streamId"/> (stream calls only)
     /// satisfies its "stream requires stream_id" rule. See docs/access-log-spec.md.
     /// </summary>
-    private async Task EmitAccessLogAsync(
+    private Task EmitAccessLogAsync(
         string method,
         string methodType,
         string status,
@@ -1131,7 +1132,7 @@ public sealed class RpcServer
     {
         if (_accessLog is null)
         {
-            return;
+            return Task.CompletedTask;
         }
 
         // A framework endpoint owned by no protocol (`__transport_options__`) logs the server's
@@ -1139,25 +1140,18 @@ public sealed class RpcServer
         var resolvedProtocol = protocol ?? ProtocolName;
         var durationMs = System.Diagnostics.Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
 
-        string? requestData = null;
-        string? truncated = null;
-        long? originalRequestBytes = null;
+        // The request is described by its shape, never its values (see RequestShape).
+        IReadOnlyList<AccessLogRequestField>? requestFields = null;
+        long? requestRows = null;
         if (requestForLog is not null)
         {
-            var raw = await SerializeForAccessLogAsync(requestForLog, cancellationToken).ConfigureAwait(false);
-            if (_accessLog.IncludeRequestData)
-            {
-                requestData = Convert.ToBase64String(raw);
-            }
-            else
-            {
-                // base64 length is a pure function of the byte count — matches Python's
-                // `4 * ((len(raw) + 2) // 3)` rather than paying to encode a payload nobody
-                // asked to see at this log level.
-                originalRequestBytes = 4L * ((raw.Length + 2) / 3);
-                truncated = "payload_omitted";
-            }
+            (requestFields, requestRows) = RequestShape.Of(requestForLog.Batch);
         }
+
+        // Transitional: the released vgi-rpc 0.50.0 schema requires request_data on a unary
+        // record unless it is marked truncated; the newer schema accepts the marker as legacy.
+        // Remove once CI validates against vgi-rpc >= 0.50.1.
+        var truncated = methodType == "unary" ? "payload_omitted" : null;
 
         _accessLog.Write(new AccessLogRecord(
             Timestamp: DateTimeOffset.UtcNow,
@@ -1184,29 +1178,11 @@ public sealed class RpcServer
             ErrorMessage: string.IsNullOrEmpty(errorMessage) ? null : errorMessage,
             ServerVersion: ServerVersion,
             StreamId: streamId,
-            RequestData: requestData,
+            RequestFields: requestFields,
+            RequestRows: requestRows,
             Truncated: truncated,
-            OriginalRequestBytes: originalRequestBytes,
             ErrorCode: status == "error" ? errorCode : null));
-    }
-
-    /// <summary>
-    /// Re-frames an already-read request <see cref="AnnotatedBatch"/> as a fresh, self-contained
-    /// Arrow IPC stream (schema message, the one batch with its original custom_metadata, EOS) —
-    /// what <c>pyarrow.ipc.open_stream</c> (and the conformance suite's access-log validator)
-    /// requires. Mirrors Python's <c>_request_wire_bytes</c> fallback path (used there whenever
-    /// the raw wire bytes aren't separately available, which for a shared pipe/socket stream is
-    /// always).
-    /// </summary>
-    private static async Task<byte[]> SerializeForAccessLogAsync(AnnotatedBatch batch, CancellationToken cancellationToken)
-    {
-        var ms = new MemoryStream();
-        await using (var writer = new WireWriter(ms, batch.Batch.Schema))
-        {
-            await writer.WriteBatchAsync(batch, cancellationToken).ConfigureAwait(false);
-        }
-
-        return ms.ToArray();
+        return Task.CompletedTask;
     }
 
     private static Exception Unwrap(Exception exc) =>

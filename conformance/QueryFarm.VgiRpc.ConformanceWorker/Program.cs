@@ -24,7 +24,7 @@ if (options is null)
     return 1;
 }
 
-using var accessLog = options.AccessLogPath is { } accessLogPath ? new JsonlAccessLogSink(accessLogPath, debug: options.AccessLogDebug) : null;
+using var accessLog = options.AccessLogPath is { } accessLogPath ? new JsonlAccessLogSink(accessLogPath) : null;
 // Matches the reference's ConformanceService.protocol_version. Declaring it
 // makes this worker enforce the version gate like every other port, and makes
 // the version it reports through reflection agree with theirs.
@@ -379,7 +379,6 @@ internal sealed class CliOptions
     public string HttpHost { get; private init; } = "127.0.0.1";
     public int HttpPort { get; private init; }
     public string? AccessLogPath { get; private init; }
-    public bool AccessLogDebug { get; private init; }
     public bool ConformanceAuthReason { get; private init; }
     public string? ConformanceProxyHint { get; private init; }
     public IReadOnlyList<string> ConformanceCorsOrigins { get; private init; } = [];
@@ -412,7 +411,6 @@ internal sealed class CliOptions
         string? host = null;
         int? port = null;
         string? accessLog = null;
-        var accessLogDebug = false;
         var conformanceAuthReason = false;
         string? conformanceProxyHint = null;
         var conformanceCorsOrigins = new List<string>();
@@ -460,7 +458,8 @@ internal sealed class CliOptions
                     accessLog = RequireValue(args, ref i, "--access-log");
                     break;
                 case "--access-log-debug":
-                    accessLogDebug = true;
+                    // Accepted for parity with the other ports' workers; records are identical at
+                    // every level -- no request value is logged at any of them.
                     break;
                 case "--conformance-auth-reason":
                     conformanceAuthReason = true;
@@ -607,7 +606,6 @@ internal sealed class CliOptions
             HttpHost = host ?? "127.0.0.1",
             HttpPort = port ?? 0,
             AccessLogPath = accessLog,
-            AccessLogDebug = accessLogDebug,
             ConformanceAuthReason = conformanceAuthReason,
             ConformanceProxyHint = conformanceProxyHint,
             ConformanceCorsOrigins = conformanceCorsOrigins,

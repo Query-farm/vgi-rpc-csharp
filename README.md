@@ -35,7 +35,7 @@ interoperate.
 - **Automatic schema inference** — CLR primitives, collections, enums, POCOs, and Arrow record batches map to Arrow types
 - **HTTP security** — bearer authentication, mTLS, JWT/JWKS validation, OAuth 2.0 PKCE, CORS, and proxy proof
 - **Large-payload offload** — transparent externalization to Amazon S3, S3-compatible stores, or Google Cloud Storage
-- **Observability** — access logs, OpenTelemetry-compatible tracing and metrics, and Sentry instrumentation
+- **Observability** — access logs (request shape and sizes only: no argument values or stream state at any level), OpenTelemetry-compatible tracing and metrics, and Sentry instrumentation
 
 ## Installation
 

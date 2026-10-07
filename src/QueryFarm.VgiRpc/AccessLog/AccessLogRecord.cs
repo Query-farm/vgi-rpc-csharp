@@ -26,16 +26,18 @@ public sealed record AccessLogRecord(
     // Required by access_log.schema.json whenever MethodType is "stream" — a per-call
     // correlation id (32 lowercase hex chars), matching Python's uuid.uuid4().hex.
     string? StreamId = null,
-    // Required by access_log.schema.json whenever MethodType is "unary", unless Truncated is
-    // set instead: a base64-encoded, self-contained Arrow IPC stream of the request batch (only
-    // populated when the sink's IAccessLogSink.IncludeRequestData is true — the --access-log-debug
-    // gate, mirroring Python's DEBUG-only capture of the same field).
-    string? RequestData = null,
-    // Set instead of RequestData at INFO (non-debug) level: "payload_omitted", paired with
-    // OriginalRequestBytes so the schema's "unary requires request_data unless truncated"
-    // invariant still holds without paying to base64-encode a payload nobody asked to see.
+    // The request's shape -- parameter names and Arrow types, and the row count -- on unary and
+    // stream-init records. Never a value: see RequestShape.
+    IReadOnlyList<AccessLogRequestField>? RequestFields = null,
+    long? RequestRows = null,
+    // "payload_omitted" on unary records. Transitional: the released vgi-rpc 0.50.0 schema
+    // requires request_data on a unary record unless it is marked truncated, and the newer
+    // schema accepts the marker as legacy. Remove once CI validates against vgi-rpc >= 0.50.1.
     string? Truncated = null,
-    long? OriginalRequestBytes = null,
+    // Sizes of the HTTP stream state tokens received / returned on a turn. The tokens themselves
+    // are never logged: they are replayable.
+    long? RequestStateBytes = null,
+    long? ResponseStateBytes = null,
     // The canonical code (WIRE_PROTOCOL.md §8) on status "error" records -- what an operator
     // alerts on. Null on success, where the schema forbids it.
     string? ErrorCode = null);

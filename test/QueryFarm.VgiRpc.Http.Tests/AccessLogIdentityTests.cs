@@ -54,8 +54,6 @@ public sealed class AccessLogIdentityTests
     {
         public ConcurrentQueue<AccessLogRecord> Records { get; } = new();
 
-        public bool IncludeRequestData => false;
-
         public void Write(AccessLogRecord record) => Records.Enqueue(record);
     }
 

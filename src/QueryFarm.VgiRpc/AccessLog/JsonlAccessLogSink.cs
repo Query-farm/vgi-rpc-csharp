@@ -12,17 +12,11 @@ public sealed class JsonlAccessLogSink : IAccessLogSink, IDisposable
     private readonly StreamWriter _writer;
     private readonly Lock _lock = new();
 
-    public bool IncludeRequestData { get; }
-
     /// <param name="path">File to append JSONL records to.</param>
-    /// <param name="debug">
-    /// The <c>--access-log-debug</c> gate — see <see cref="IAccessLogSink.IncludeRequestData"/>.
-    /// </param>
-    public JsonlAccessLogSink(string path, bool debug = false)
+    public JsonlAccessLogSink(string path)
     {
         var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
         _writer = new StreamWriter(stream) { AutoFlush = true };
-        IncludeRequestData = debug;
     }
 
     public void Write(AccessLogRecord record)
@@ -72,9 +66,10 @@ public sealed class JsonlAccessLogSink : IAccessLogSink, IDisposable
             fields["stream_id"] = record.StreamId;
         }
 
-        if (record.RequestData is not null)
+        if (record.RequestFields is not null)
         {
-            fields["request_data"] = record.RequestData;
+            fields["request_fields"] = record.RequestFields.Select(f => new Dictionary<string, string> { ["name"] = f.Name, ["type"] = f.Type }).ToList();
+            fields["request_rows"] = record.RequestRows ?? 0;
         }
 
         if (record.Truncated is not null)
@@ -82,9 +77,14 @@ public sealed class JsonlAccessLogSink : IAccessLogSink, IDisposable
             fields["truncated"] = record.Truncated;
         }
 
-        if (record.OriginalRequestBytes is not null)
+        if (record.RequestStateBytes is not null)
         {
-            fields["original_request_bytes"] = record.OriginalRequestBytes;
+            fields["request_state_bytes"] = record.RequestStateBytes;
+        }
+
+        if (record.ResponseStateBytes is not null)
+        {
+            fields["response_state_bytes"] = record.ResponseStateBytes;
         }
 
         var json = JsonSerializer.Serialize(fields);
