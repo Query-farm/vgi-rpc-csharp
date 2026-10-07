@@ -7,8 +7,10 @@ namespace QueryFarm.VgiRpc.Client;
 /// Source-compatible typed unary facade for 0.7 callers. The implementation now lives in the
 /// dedicated client package and delegates to the schema-first <see cref="RpcClient"/>.
 /// </summary>
-public sealed class RpcConnection<TContract> : IAsyncDisposable where TContract : class
+public sealed class RpcConnection<TContract> : IAsyncDisposable, IRpcClientHolder where TContract : class
 {
+    IRpcClient IRpcClientHolder.HeldClient => _client;
+
     private readonly RpcClient _client;
 
     /// <param name="transport">The byte-stream transport to speak over.</param>

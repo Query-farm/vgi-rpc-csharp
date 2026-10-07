@@ -284,7 +284,7 @@ jobs:
         run: >-
           dotnet test test/QueryFarm.VgiRpc.Http.Tests/QueryFarm.VgiRpc.Http.Tests.csproj
           -c Release
-          --filter FullyQualifiedName~PythonClientWorkerTests
+          --filter "FullyQualifiedName~PythonClientWorkerTests|FullyQualifiedName~ReflectionClientTests"
       - name: Drive canonical servers with the C# client
         working-directory: _conformance/vgi-rpc-rust
         env:

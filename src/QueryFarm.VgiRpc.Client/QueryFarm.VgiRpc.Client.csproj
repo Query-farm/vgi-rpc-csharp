@@ -8,6 +8,8 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
     <ProjectReference Include="..\QueryFarm.VgiRpc\QueryFarm.VgiRpc.csproj" />
+    <!-- The HTTP client implements the internal reflection hooks (RpcReflection). -->
+    <InternalsVisibleTo Include="QueryFarm.VgiRpc.Client.Http" />
   </ItemGroup>
 
   <!-- Pack RID-specific C ABI libraries when a release assembly stages them here. -->

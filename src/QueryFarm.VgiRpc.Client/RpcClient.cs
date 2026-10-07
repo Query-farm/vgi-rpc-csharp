@@ -48,7 +48,7 @@ internal enum IncomingBatchKind
 /// Async schema-first client over one persistent byte-stream transport. A connection permits one
 /// active call at a time; use a worker pool for concurrent subprocess workloads.
 /// </summary>
-public sealed partial class RpcClient : IRpcClient
+public sealed partial class RpcClient : IRpcClient, IProtocolAddressableClient
 {
     private readonly IRpcTransport _transport;
     private readonly bool _ownsTransport;

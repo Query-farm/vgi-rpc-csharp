@@ -325,8 +325,10 @@ public sealed class WorkerPool : IAsyncDisposable
 
     private sealed record IdleWorker(SubprocessTransport Transport, DateTimeOffset ReturnedAt);
 
-    public sealed class WorkerLease : IAsyncDisposable
+    public sealed class WorkerLease : IAsyncDisposable, IRpcClientHolder
     {
+        IRpcClient IRpcClientHolder.HeldClient => Client;
+
         private readonly WorkerPool _pool;
         private readonly string _key;
         private readonly SubprocessTransport _transport;

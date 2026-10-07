@@ -7,8 +7,10 @@ using QueryFarm.VgiRpc.Server;
 namespace QueryFarm.VgiRpc.Client;
 
 /// <summary>Reflection-generated typed facade over the schema-first <see cref="RpcClient"/>.</summary>
-public class RpcClientProxy<TContract> : DispatchProxy where TContract : class
+public class RpcClientProxy<TContract> : DispatchProxy, IRpcClientHolder where TContract : class
 {
+    IRpcClient IRpcClientHolder.HeldClient => _client;
+
     private IRpcClient _client = null!;
     private IReadOnlyDictionary<MethodInfo, ClientMethod> _methods = null!;
 

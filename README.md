@@ -201,6 +201,34 @@ driven over persistent byte streams or stateless HTTP.
 `WorkerPool` keeps healthy subprocess connections in a command-keyed LIFO pool, bounds idle
 workers, evicts them after an idle timeout, and exposes borrow/spawn/reuse/discard metrics.
 
+### Discovering what a server hosts
+
+`RpcReflection` asks `vgi_rpc.Reflection.v1` over a connection you already hold, on any
+transport. The target can be an `RpcClient` or `HttpRpcClient`, a typed proxy from
+`CreateProxy<T>()` bound to any hosted protocol, an `RpcConnection<T>`, a `WorkerPool` lease, an
+`HttpSessionScope`, or a raw `IRpcTransport`. The connection is reused and never closed:
+
+```csharp
+await using var client = await RpcClient.ConnectTcpAsync("127.0.0.1", 9000,
+    new RpcClientOptions { Protocol = "MyService" });
+
+IReadOnlyList<HostedProtocolInfo> hosted = await client.ListProtocolsAsync();
+// Server order: application protocols (primary first), then vgi_rpc.Reflection.v1, ...
+foreach (var p in hosted) Console.WriteLine($"{p.Name} {p.Version} {p.Hash}");
+
+ServiceDescription description = await RpcReflection.DescribeProtocolAsync(client, hosted[0].Name);
+foreach (var (name, method) in description.Methods) Console.WriteLine($"{name}: {method.MethodType}");
+```
+
+`DescribeProtocolAsync` lists first, then describes. An unhosted name is an ordinary
+`RpcException` with `ErrorKind == "protocol_not_supported"`. A server that does not host
+reflection at all throws `ReflectionNotSupportedException` (an `RpcException` carrying the
+server's error fields), and the connection stays usable. This covers `protocol_not_supported`,
+`method_not_implemented`, `UNIMPLEMENTED`, and a bare HTTP 404. No listing is ever inferred.
+This port's `RpcServer` always hosts reflection. The Python reference hosts it only when built
+with `enable_describe=True` (its conformance server's `--describe`). On a byte-stream
+connection, don't call these while a stream is open on the same connection.
+
 ## Streaming
 
 Streaming service methods return `RpcStream<TState>`, where `TState` derives from
@@ -457,8 +485,12 @@ Run that focused native-client suite against a Python checkout with:
 ```bash
 VGI_PYTHON_BIN=/path/to/vgi-rpc/.venv/bin/python \
   dotnet test test/QueryFarm.VgiRpc.Http.Tests \
-  --filter FullyQualifiedName~PythonClientWorkerTests
+  --filter "FullyQualifiedName~PythonClientWorkerTests|FullyQualifiedName~ReflectionClientTests"
 ```
+
+`ReflectionClientTests` runs `RpcReflection` against this port's server and against the reference
+conformance server (`python -m vgi_rpc.conformance._cli`, with and without `--describe`). Without
+`VGI_PYTHON_BIN`, the reference cases skip.
 
 See
 [`docs/wire-protocol.md`](https://github.com/Query-farm/vgi-rpc-csharp/blob/main/docs/wire-protocol.md)

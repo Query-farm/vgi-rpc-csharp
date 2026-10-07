@@ -18,7 +18,7 @@ using QueryFarm.VgiRpc.Wire;
 namespace QueryFarm.VgiRpc.Client.Http;
 
 /// <summary>Schema-first vgi-rpc client for the stateless HTTP transport.</summary>
-public sealed partial class HttpRpcClient : IRpcClient
+public sealed partial class HttpRpcClient : IRpcClient, IProtocolAddressableClient
 {
     private const string ArrowContentType = "application/vnd.apache.arrow.stream";
     private const long EncodedResponseSafetyFloorBytes =
@@ -948,8 +948,10 @@ public sealed partial class HttpRpcClient : IRpcClient
 }
 
 /// <summary>A nestable sticky-session scope over one <see cref="HttpRpcClient"/>.</summary>
-public sealed class HttpSessionScope : IAsyncDisposable
+public sealed class HttpSessionScope : IAsyncDisposable, IRpcClientHolder
 {
+    IRpcClient IRpcClientHolder.HeldClient => _client;
+
     private readonly HttpRpcClient _client;
     private bool _disposed;
 
