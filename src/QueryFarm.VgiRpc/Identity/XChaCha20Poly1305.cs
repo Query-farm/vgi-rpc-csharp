@@ -21,14 +21,27 @@ namespace QueryFarm.VgiRpc.Identity;
 /// <see cref="ChaCha20Poly1305"/> is unavailable on Windows before Server 2022 / Windows 11, where
 /// sealing throws <see cref="PlatformNotSupportedException"/>.
 /// </para>
+/// <para>
+/// Public so a VGI SDK can seal its own cross-SDK envelopes (attach tickets, opaque data) with the
+/// same cipher instead of carrying a copy of it.
+/// </para>
 /// </remarks>
-internal static class XChaCha20Poly1305
+public static class XChaCha20Poly1305
 {
+    /// <summary>Key length in bytes.</summary>
     public const int KeySize = 32;
+
+    /// <summary>Nonce length in bytes.</summary>
     public const int NonceSize = 24;
+
+    /// <summary>Authentication tag length in bytes.</summary>
     public const int TagSize = 16;
 
     /// <summary>Encrypts and authenticates <paramref name="plaintext"/>.</summary>
+    /// <param name="key">32-byte key.</param>
+    /// <param name="nonce">24-byte nonce; never reuse one under the same key.</param>
+    /// <param name="plaintext">Bytes to seal.</param>
+    /// <param name="aad">Associated data, authenticated but not encrypted.</param>
     /// <returns><c>ciphertext || tag</c>.</returns>
     public static byte[] Seal(ReadOnlySpan<byte> key, ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> plaintext, ReadOnlySpan<byte> aad)
     {
@@ -43,6 +56,11 @@ internal static class XChaCha20Poly1305
     }
 
     /// <summary>Verifies and decrypts <c>ciphertext || tag</c>.</summary>
+    /// <param name="key">32-byte key.</param>
+    /// <param name="nonce">The 24-byte nonce it was sealed under.</param>
+    /// <param name="body"><c>ciphertext || tag</c>.</param>
+    /// <param name="aad">The associated data it was sealed with.</param>
+    /// <returns>The plaintext.</returns>
     /// <exception cref="CryptographicException">The tag does not verify.</exception>
     public static byte[] Open(ReadOnlySpan<byte> key, ReadOnlySpan<byte> nonce, ReadOnlySpan<byte> body, ReadOnlySpan<byte> aad)
     {
