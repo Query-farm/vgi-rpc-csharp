@@ -2472,10 +2472,6 @@ public static class RpcHttpEndpoints
             StreamId: streamId,
             RequestFields: requestFields,
             RequestRows: requestRows,
-            // Transitional: the released vgi-rpc 0.50.0 schema requires request_data on a unary
-            // record unless it is marked truncated; the newer schema accepts the marker as legacy.
-            // Remove once CI validates against vgi-rpc >= 0.50.1.
-            Truncated: methodType == "unary" ? "payload_omitted" : null,
             RequestStateBytes: requestStateBytes,
             ResponseStateBytes: responseStateBytes,
             ErrorCode: status == "error" ? (string.IsNullOrEmpty(errorCode) ? ErrorCodeFor(errorType) : errorCode) : null));

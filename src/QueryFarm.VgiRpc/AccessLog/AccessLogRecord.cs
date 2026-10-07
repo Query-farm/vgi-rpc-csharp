@@ -30,10 +30,6 @@ public sealed record AccessLogRecord(
     // stream-init records. Never a value: see RequestShape.
     IReadOnlyList<AccessLogRequestField>? RequestFields = null,
     long? RequestRows = null,
-    // "payload_omitted" on unary records. Transitional: the released vgi-rpc 0.50.0 schema
-    // requires request_data on a unary record unless it is marked truncated, and the newer
-    // schema accepts the marker as legacy. Remove once CI validates against vgi-rpc >= 0.50.1.
-    string? Truncated = null,
     // Sizes of the HTTP stream state tokens received / returned on a turn. The tokens themselves
     // are never logged: they are replayable.
     long? RequestStateBytes = null,

@@ -1148,11 +1148,6 @@ public sealed class RpcServer
             (requestFields, requestRows) = RequestShape.Of(requestForLog.Batch);
         }
 
-        // Transitional: the released vgi-rpc 0.50.0 schema requires request_data on a unary
-        // record unless it is marked truncated; the newer schema accepts the marker as legacy.
-        // Remove once CI validates against vgi-rpc >= 0.50.1.
-        var truncated = methodType == "unary" ? "payload_omitted" : null;
-
         _accessLog.Write(new AccessLogRecord(
             Timestamp: DateTimeOffset.UtcNow,
             ServerId: _serverId,
@@ -1180,7 +1175,6 @@ public sealed class RpcServer
             StreamId: streamId,
             RequestFields: requestFields,
             RequestRows: requestRows,
-            Truncated: truncated,
             ErrorCode: status == "error" ? errorCode : null));
         return Task.CompletedTask;
     }

@@ -168,6 +168,9 @@ public sealed class NoPayloadInLogsTests
             Assert.False(record.TryGetProperty("request_state", out _));
             Assert.False(record.TryGetProperty("response_state", out _));
             Assert.False(record.TryGetProperty("original_request_bytes", out _));
+            // Nothing is omitted, so no record is marked truncated: the reference stopped
+            // emitting "payload_omitted" in vgi-rpc 0.50.1.
+            Assert.False(record.TryGetProperty("truncated", out _));
         }
 
         foreach (var method in new[] { "attach", "tick" })

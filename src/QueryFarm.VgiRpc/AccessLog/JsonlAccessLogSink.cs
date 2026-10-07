@@ -72,11 +72,6 @@ public sealed class JsonlAccessLogSink : IAccessLogSink, IDisposable
             fields["request_rows"] = record.RequestRows ?? 0;
         }
 
-        if (record.Truncated is not null)
-        {
-            fields["truncated"] = record.Truncated;
-        }
-
         if (record.RequestStateBytes is not null)
         {
             fields["request_state_bytes"] = record.RequestStateBytes;

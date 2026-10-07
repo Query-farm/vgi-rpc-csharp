@@ -105,9 +105,8 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       (`[{name, type}]`, type = the canonical type token) and `request_rows`
       (`AccessLog/RequestShape.cs`); HTTP stream turns report state tokens by
       `request_state_bytes` / `response_state_bytes`. `--access-log-debug` is still accepted and
-      changes nothing. Unary records carry `truncated: "payload_omitted"` as a transitional
-      marker, because the released 0.50.0 schema requires `request_data` on a unary record
-      unless truncated; drop it once CI validates against 0.50.1. `NoPayloadInLogsTests` puts a
+      changes nothing. Records carry no `truncated: "payload_omitted"` marker (nothing is
+      omitted; the reference stopped emitting it in 0.50.1). `NoPayloadInLogsTests` puts a
       sentinel secret in an argument and in stream state over pipe and HTTP and asserts it (and
       its base64 alignments) appears in neither the JSONL nor stderr. Stream calls
       carry a per-call `stream_id` (`Guid.NewGuid("N")`, matching Python's `uuid.uuid4().hex`)
