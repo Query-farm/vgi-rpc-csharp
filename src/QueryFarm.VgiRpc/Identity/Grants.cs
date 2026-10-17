@@ -5,7 +5,7 @@ using System.Text;
 namespace QueryFarm.VgiRpc.Identity;
 
 /// <summary>
-/// A deployment's sealed-grant configuration (IDENTITY_V1_SPEC.md §9.1): the first key mints,
+/// A deployment's sealed-grant configuration (IDENTITY_V2_SPEC.md §9.1): the first key mints,
 /// every key verifies.
 /// </summary>
 /// <remarks>
@@ -89,7 +89,7 @@ public sealed class GrantKeys
 
         if (!ChaCha20Poly1305.IsSupported)
         {
-            // Sealed grants are XChaCha20-Poly1305 by contract (IDENTITY_V1_SPEC.md §9.1); a
+            // Sealed grants are XChaCha20-Poly1305 by contract (IDENTITY_V2_SPEC.md §9.1); a
             // platform without the IETF cipher cannot mint or verify one, and should say so at
             // startup rather than on the first bearer.
             throw new PlatformNotSupportedException(
@@ -231,7 +231,7 @@ public sealed class GrantInvalidException(string detail, bool expired = false) :
     public bool Expired { get; } = expired;
 }
 
-/// <summary>Mints and verifies sealed grants (IDENTITY_V1_SPEC.md §9.1).</summary>
+/// <summary>Mints and verifies sealed grants (IDENTITY_V2_SPEC.md §9.1).</summary>
 /// <remarks>
 /// <code>
 /// token    = "vgig1." base64url_nopad( kid(8) || envelope )
@@ -387,7 +387,7 @@ public static class SealedGrants
             try
             {
                 var (token, claims) = Mint(keys, principal, scopes, purpose, ttlSeconds);
-                return new IssuedGrant(token, claims.ExpiresAt, claims.GrantId);
+                return new IssuedGrant(token, DateTimeOffset.FromUnixTimeSeconds(claims.ExpiresAt), claims.GrantId);
             }
             catch (ArgumentException exc)
             {

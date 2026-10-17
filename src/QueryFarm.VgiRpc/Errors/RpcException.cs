@@ -142,7 +142,7 @@ public sealed class StatusException : RpcException
 /// <para>
 /// "The credential is bad" and "I could not find out whether the credential is bad" are
 /// different answers. Thrown from an HTTP authenticate delegate it becomes <c>503</c> with
-/// <c>Retry-After</c>, never a 401. Thrown from a <c>vgi_rpc.Identity.v1</c> hook
+/// <c>Retry-After</c>, never a 401. Thrown from a <c>vgi_rpc.Identity.v2</c> hook
 /// (<see cref="Identity.IdentityImpl.TokenResolver"/> / <see cref="Identity.IdentityImpl.GrantMinter"/>)
 /// the framework translates it to <c>identity_unavailable</c> carrying the same retry hint
 /// (WIRE_PROTOCOL.md §16), on every transport -- which is why it lives in the core package rather

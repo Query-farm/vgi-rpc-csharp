@@ -66,7 +66,7 @@ public sealed class IssuedGrant
     /// <param name="token">See <see cref="Token"/>.</param>
     /// <param name="expiresAt">See <see cref="ExpiresAt"/>.</param>
     /// <param name="grantId">See <see cref="GrantId"/>.</param>
-    public IssuedGrant(string token, double expiresAt, string grantId = "")
+    public IssuedGrant(string token, DateTimeOffset expiresAt, string grantId = "")
     {
         Token = token;
         ExpiresAt = expiresAt;
@@ -81,12 +81,14 @@ public sealed class IssuedGrant
     public string Token { get; set; } = "";
 
     /// <summary>
-    /// Unix timestamp after which the worker will stop honouring the grant. Required
+    /// The instant after which the worker will stop honouring the grant. On the wire it is
+    /// <c>timestamp[us, tz="UTC"]</c>, non-nullable; sub-microsecond precision is truncated.
+    /// Required
     /// <em>because</em> the framework cannot enforce it: the real lifetime lives inside the
     /// opaque token, so this is a declaration rather than an enforcement. A worker that must
     /// state a lifetime has thought about one.
     /// </summary>
-    public double ExpiresAt { get; set; }
+    public DateTimeOffset ExpiresAt { get; set; }
 
     /// <summary>
     /// Correlation handle for the audit trail. Not a credential and not secret -- it is what ties

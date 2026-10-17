@@ -119,7 +119,7 @@ public class StickySessionsTests
 
         Assert.NotEqual(
             StickySessions.ComputeCallAad(identity, "Svc"),
-            StickySessions.ComputeCallAad(identity, "vgi_rpc.Identity.v1"));
+            StickySessions.ComputeCallAad(identity, "vgi_rpc.Identity.v2"));
 
         // The scope is a suffix on an otherwise unchanged AAD, so it cannot collide with a
         // principal whose name happens to end in the protocol's.

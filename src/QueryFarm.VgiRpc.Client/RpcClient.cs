@@ -100,7 +100,7 @@ public sealed partial class RpcClient : IRpcClient, IProtocolAddressableClient
     /// <param name="cancellationToken">Cancels the call.</param>
     /// <remarks>
     /// For the protocols a server co-hosts beside its application surface —
-    /// <c>vgi_rpc.Reflection.v1</c>, <c>vgi_rpc.Identity.v1</c> — which a client reaches over the
+    /// <c>vgi_rpc.Reflection.v1</c>, <c>vgi_rpc.Identity.v2</c> — which a client reaches over the
     /// same connection without becoming a client of them. The connection's own protocol is
     /// unchanged: this addresses one call, and a client still addresses one protocol.
     /// </remarks>

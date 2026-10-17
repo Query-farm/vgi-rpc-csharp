@@ -1347,5 +1347,16 @@ canonical Python repo) for the language-agnostic porting checklist this plan is 
       test_csharp_conformance.py and the pinned ConformanceService protocol hash moved with the
       reference's regenerated golden (90 methods).
 
+- [x] **M25 — `vgi_rpc.Identity.v2`: `IssuedGrant.expires_at` is a UTC instant.** Port of the
+      reference's 2026-10-17 revision (IDENTITY_V2_SPEC.md). `IssuedGrant.ExpiresAt` changed from
+      `double` unix seconds to `DateTimeOffset`, so its wire column moved from `float64` to
+      `timestamp[us, tz="UTC"]` non-null (the existing `DateTimeOffset` mapping). The protocol has
+      no `protocol_version`, so the name carries the break: `IdentityProtocol.ProtocolName` is now
+      `vgi_rpc.Identity.v2` and v1 is replaced, not hosted alongside. The three binding digests
+      moved with the name (introspect_token, TokenIdentity and the issue_grant params are
+      unchanged); the sealed-grant payload keeps its int64-seconds `expires_at`, so the grant
+      token vectors are byte-identical. `GrantMinter` hooks now return an `IssuedGrant` carrying a
+      `DateTimeOffset`; the conformance fixture pins 2030-01-01T00:00:00Z (1893456000000000 us).
+
 Full rationale for each milestone's sequencing lives in the plan this repo was bootstrapped from;
 see `CLAUDE.md` for where cross-language wire-alignment decisions are recorded as they're made.

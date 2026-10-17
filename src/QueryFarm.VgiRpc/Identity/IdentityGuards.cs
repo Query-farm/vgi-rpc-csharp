@@ -7,7 +7,7 @@ using QueryFarm.VgiRpc.Server;
 namespace QueryFarm.VgiRpc.Identity;
 
 /// <summary>
-/// The guards <c>vgi_rpc.Identity.v1</c> applies before any worker policy runs.
+/// The guards <c>vgi_rpc.Identity.v2</c> applies before any worker policy runs.
 /// </summary>
 /// <remarks>
 /// Separate from <see cref="IdentityImpl"/> and public because each one is a rule a deployment

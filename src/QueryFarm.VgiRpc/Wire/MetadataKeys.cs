@@ -75,7 +75,7 @@ public static class MetadataKeys
         public const string SessionLost = "session_lost";
         public const string ServerDraining = "server_draining";
 
-        // vgi_rpc.Identity.v1. These five are the whole definitive-vs-transient signal a caller
+        // vgi_rpc.Identity.v2. These five are the whole definitive-vs-transient signal a caller
         // gets: as protocol methods (rather than the HTTP JSON route they replace) every handler
         // exception surfaces the same way, so the status code no longer carries the distinction.
         // See QueryFarm.VgiRpc.Identity.IdentityErrors.

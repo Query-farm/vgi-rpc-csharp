@@ -12,7 +12,7 @@ using Xunit;
 namespace QueryFarm.VgiRpc.Tests.Identity;
 
 /// <summary>
-/// <c>vgi_rpc.Identity.v1</c> -- resolving a credential, and minting a grant.
+/// <c>vgi_rpc.Identity.v2</c> -- resolving a credential, and minting a grant.
 /// </summary>
 /// <remarks>
 /// The two methods are guarded very differently and the difference is the point, so most of what
@@ -87,7 +87,7 @@ public static class IdentityTestDoubles
     }
 
     public static IssuedGrant Minter(string principal, string purpose, List<string> scopes, long ttlSeconds) =>
-        new($"grant-for-{principal}", Now() + ttlSeconds, "g1");
+        new($"grant-for-{principal}", DateTimeOffset.UtcNow.AddSeconds(ttlSeconds), "g1");
 
     public static double Now() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
 
@@ -367,7 +367,7 @@ public class IssuanceIsNotAnOracleTests
             IdentityTestDoubles.Ctx(IdentityTestDoubles.Auth("alice", authTime: IdentityTestDoubles.Now())));
 
         Assert.Equal("grant-for-alice", grant.Token);
-        Assert.True(grant.ExpiresAt > IdentityTestDoubles.Now());
+        Assert.True(grant.ExpiresAt > DateTimeOffset.UtcNow);
     }
 
     /// <summary>Cross-subject minting is closed by construction, not by a check.</summary>
@@ -672,7 +672,7 @@ public class GuardsAreNotVacuousTests
             mintGrant: (principal, purpose, scopes, ttl) =>
             {
                 minted.Add(principal);
-                return new IssuedGrant("granted-anyway", IdentityTestDoubles.Now() + ttl);
+                return new IssuedGrant("granted-anyway", DateTimeOffset.UtcNow.AddSeconds(ttl));
             },
             maxAuthAge: 900.0);
 

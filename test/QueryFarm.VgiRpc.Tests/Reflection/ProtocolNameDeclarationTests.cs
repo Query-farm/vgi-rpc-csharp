@@ -98,7 +98,7 @@ public sealed class ProtocolNameDeclarationTests
     {
         var exception = Assert.Throws<ArgumentException>(() => WireNaming.ForProtocol(typeof(IReservedNameService)));
         Assert.Contains(WireNaming.ReservedProtocolPrefix, exception.Message, StringComparison.Ordinal);
-        Assert.True(WireNaming.IsReservedProtocolName("vgi_rpc.Identity.v1"));
+        Assert.True(WireNaming.IsReservedProtocolName("vgi_rpc.Identity.v2"));
         Assert.False(WireNaming.IsReservedProtocolName("vgi.v2"));
     }
 

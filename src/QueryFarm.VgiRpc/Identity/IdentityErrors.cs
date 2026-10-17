@@ -4,7 +4,7 @@ using QueryFarm.VgiRpc.Wire;
 namespace QueryFarm.VgiRpc.Identity;
 
 /// <summary>
-/// The refusals and failures <c>vgi_rpc.Identity.v1</c> can produce.
+/// The refusals and failures <c>vgi_rpc.Identity.v2</c> can produce.
 /// </summary>
 /// <remarks>
 /// <para>

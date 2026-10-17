@@ -77,7 +77,7 @@ public static class WireNaming
     public const int MaxProtocolNameLength = 255;
 
     /// <summary>The prefix reserved for protocols the framework itself defines —
-    /// <c>vgi_rpc.Reflection.v1</c>, <c>vgi_rpc.Identity.v1</c>.</summary>
+    /// <c>vgi_rpc.Reflection.v1</c>, <c>vgi_rpc.Identity.v2</c>.</summary>
     /// <remarks>
     /// An application protocol that claimed it could shadow one of those and make it unroutable on
     /// the server hosting both — reflection in particular, which is the one endpoint a confused

@@ -29,7 +29,7 @@ using var accessLog = options.AccessLogPath is { } accessLogPath ? new JsonlAcce
 // makes this worker enforce the version gate like every other port, and makes
 // the version it reports through reflection agree with theirs.
 //
-// --identity wires vgi_rpc.Identity.v1 with the fixed policy IDENTITY_CONFORMANCE_FIXTURE.md
+// --identity wires vgi_rpc.Identity.v2 with the fixed policy IDENTITY_CONFORMANCE_FIXTURE.md
 // pins (see ConformanceIdentity). Deliberately NOT unconditional: the shared group asserts
 // against the *plain* worker that a deployment configuring no hook hosts no identity protocol
 // at all, which is the property that keeps a dependency upgrade from growing a

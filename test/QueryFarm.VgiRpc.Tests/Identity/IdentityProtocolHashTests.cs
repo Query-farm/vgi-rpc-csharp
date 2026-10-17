@@ -1,4 +1,6 @@
+using System;
 using System.Collections.Generic;
+using System.Linq;
 using QueryFarm.VgiRpc.Hash;
 using QueryFarm.VgiRpc.Identity;
 using QueryFarm.VgiRpc.Reflection;
@@ -7,7 +9,7 @@ using Xunit;
 namespace QueryFarm.VgiRpc.Tests.Identity;
 
 /// <summary>
-/// The cross-port contract for <c>vgi_rpc.Identity.v1</c>.
+/// The cross-port contract for <c>vgi_rpc.Identity.v2</c>.
 /// </summary>
 /// <remarks>
 /// These digests are produced by the canonical Python reference and are not negotiable: a
@@ -32,7 +34,7 @@ public class IdentityProtocolHashTests
     [Fact]
     public void BothMethodsMatchTheReferenceDigest() =>
         Assert.Equal(
-            "8317f2ad8e2476bb99e8b94800ab79b19a8cf0c6bdd6d66c2d82bd62ffbe69d5",
+            "145267755ff90d5c3313d79c7ff771306f2530626380d01cb0e57a951d0f9ec3",
             HashOf("introspect_token", "issue_grant"));
 
     /// <summary>
@@ -42,14 +44,14 @@ public class IdentityProtocolHashTests
     [Fact]
     public void IntrospectOnlyMatchesTheReferenceDigest() =>
         Assert.Equal(
-            "27b75bef22e4c70baab92a5188a473506b89055d2cb2b58cc187f6fe7a436385",
+            "4039fbf6db3e64ae234e0be605b977477150ace892f10b6c691920eaf925e7ac",
             HashOf("introspect_token"));
 
     /// <summary>The other half of the narrowing proof -- see <see cref="IntrospectOnlyMatchesTheReferenceDigest"/>.</summary>
     [Fact]
     public void IssueGrantOnlyMatchesTheReferenceDigest() =>
         Assert.Equal(
-            "c71b12f453310139b6b6a445378064661c52711d03ae1e4fba29b8f7976ef4d8",
+            "4199df7403c9ca1a02c4c524b405a999eb1489614a1480873ffc23a0e5b0d312",
             HashOf("issue_grant"));
 
     /// <summary>A server offering half the methods is not offering the same surface.</summary>
@@ -95,8 +97,37 @@ public class IdentityProtocolHashTests
                 + "{\"name\":\"scopes\",\"nullable\":false,\"type\":\"list<item?:utf8>\"},"
                 + "{\"name\":\"ttl_seconds\",\"nullable\":false,\"type\":\"int64\"}],"
                 + "\"result\":[{\"name\":\"result\",\"nullable\":false,\"type\":\"binary\"}],\"type\":\"unary\"}],"
-                + "\"protocol\":\"vgi_rpc.Identity.v1\"}",
+                + "\"protocol\":\"vgi_rpc.Identity.v2\"}",
             ProtocolHash.CanonicalDescription(IdentityProtocol.ProtocolName, entries));
+    }
+
+    /// <summary>
+    /// <c>IssuedGrant.expires_at</c> is a UTC instant, <c>timestamp[us, tz="UTC"]</c>, non-null --
+    /// not the float64 unix seconds of <c>vgi_rpc.Identity.v1</c>. The result rides as embedded
+    /// IPC (<c>binary</c>), so the protocol hash cannot see this schema; this pins it instead.
+    /// </summary>
+    [Fact]
+    public void IssuedGrantSchemaMatchesTheReference()
+    {
+        var schema = SchemaDerivation.InnerSchemaFor(typeof(IssuedGrant));
+        Assert.Equal(["token", "expires_at", "grant_id"], schema.FieldsList.Select(f => f.Name));
+        var expiresAt = schema.GetFieldByName("expires_at");
+        var timestamp = Assert.IsType<Apache.Arrow.Types.TimestampType>(expiresAt.DataType);
+        Assert.Equal(Apache.Arrow.Types.TimeUnit.Microsecond, timestamp.Unit);
+        Assert.Equal("UTC", timestamp.Timezone);
+        Assert.False(expiresAt.IsNullable);
+    }
+
+    /// <summary>The fixed conformance instant survives the wire at microsecond precision.</summary>
+    [Fact]
+    public void IssuedGrantExpiresAtRoundTrips()
+    {
+        var expires = DateTimeOffset.FromUnixTimeSeconds(1893456000);
+        var info = ServiceRegistry.GetMethods(typeof(IIdentityProtocol))[IdentityProtocol.IssueGrantMethod];
+        using var batch = ValueCodec.BuildRow(info.ResultSchema, [new IssuedGrant("t", expires, "g")]);
+        var back = (IssuedGrant)ValueCodec.ExtractRow(batch, [typeof(IssuedGrant)])[0]!;
+        Assert.Equal(expires, back.ExpiresAt);
+        Assert.Equal(1893456000000000L, (back.ExpiresAt - DateTimeOffset.UnixEpoch).Ticks / 10);
     }
 
     /// <summary>Both methods are unary, return a value, and carry no stream header.</summary>

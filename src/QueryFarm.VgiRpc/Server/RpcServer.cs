@@ -158,7 +158,7 @@ public sealed class RpcServer
     /// default) disables the check entirely — this transport layer is protocol-agnostic and most
     /// callers (including this repo's own test suite, whose <c>RpcConnection</c> client never
     /// sends this key) have no such application-level version to enforce.</param>
-    /// <param name="identity">An <see cref="IdentityImpl"/> to host <c>vgi_rpc.Identity.v1</c>
+    /// <param name="identity">An <see cref="IdentityImpl"/> to host <c>vgi_rpc.Identity.v2</c>
     /// alongside the application protocol. <see langword="null"/> (the default) means the
     /// protocol is not hosted at all — absent rather than routed-and-refusing, which is what
     /// keeps a dependency upgrade from growing a credential-to-identity oracle on every existing
@@ -169,7 +169,7 @@ public sealed class RpcServer
     /// its own wire name, gated against its own <see cref="HostedProtocol.ProtocolVersion"/>, hashed
     /// on its own, and listed by reflection after the primary in this order. The protocol is the
     /// unit of optionality: there is deliberately no way to host a subset of one's methods.</param>
-    /// <param name="grantKeys">Sealed-grant configuration (IDENTITY_V1_SPEC.md §9). With keys, the
+    /// <param name="grantKeys">Sealed-grant configuration (IDENTITY_V2_SPEC.md §9). With keys, the
     /// framework mints sealed grants through <c>issue_grant</c> (unless <paramref name="identity"/>
     /// supplies its own minter) and an HTTP app accepts them back as bearer credentials; with grants
     /// on and no <paramref name="identity"/>, identity is hosted with <c>issue_grant</c> alone.</param>
@@ -295,7 +295,7 @@ public sealed class RpcServer
         _identityMethodNames = new HashSet<string>(_identityMethods.Keys, StringComparer.Ordinal);
     }
 
-    /// <summary>The hosted <c>vgi_rpc.Identity.v1</c> implementation, when there is one.</summary>
+    /// <summary>The hosted <c>vgi_rpc.Identity.v2</c> implementation, when there is one.</summary>
     public IdentityImpl? HostedIdentity => _identity;
 
     /// <summary>The sealed-grant configuration, when grants are on.</summary>
@@ -305,7 +305,7 @@ public sealed class RpcServer
     /// <remarks>
     /// The application protocols first, in registration order with the primary leading (it is
     /// what <see cref="ProtocolName"/> reports and what framework endpoints with no owning
-    /// protocol log against), then <c>vgi_rpc.Reflection.v1</c>, then <c>vgi_rpc.Identity.v1</c>
+    /// protocol log against), then <c>vgi_rpc.Reflection.v1</c>, then <c>vgi_rpc.Identity.v2</c>
     /// when a deployment configured it. Mirrors the canonical Python implementation's
     /// <c>RpcServer.bindings</c> ordering, and is the same order reflection reports them in.
     /// </remarks>
@@ -601,7 +601,7 @@ public sealed class RpcServer
         // Identity, like reflection, is a co-hosted framework protocol routed by the same key.
         // Handled before the version gate for the same structural reason it is in the canonical
         // Python implementation: the gate compares against the *application* protocol's declared
-        // version, and `vgi_rpc.Identity.v1` declares none of its own. Gating a framework
+        // version, and `vgi_rpc.Identity.v2` declares none of its own. Gating a framework
         // protocol on an unrelated contract would make a proxy's ability to resolve a credential
         // depend on whether it had been upgraded in lockstep with the application.
         if (_identity is not null && request.GetMetadata(MetadataKeys.Protocol) == IdentityProtocol.ProtocolName)
@@ -1340,7 +1340,7 @@ public sealed class RpcServer
         return FrameworkDispatch.Ok(schema);
     }
 
-    /// <summary>Serve one call to <c>vgi_rpc.Identity.v1</c>.</summary>
+    /// <summary>Serve one call to <c>vgi_rpc.Identity.v2</c>.</summary>
     /// <remarks>
     /// Self-contained rather than routed through the application dispatch path, exactly as
     /// <see cref="ServeReflectionAsync"/> is: a framework protocol is served by the framework, so

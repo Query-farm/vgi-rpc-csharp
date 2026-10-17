@@ -83,7 +83,7 @@ public sealed class AccessLogIdentityTests
     {
         await using var host = await StartHostAsync(identity: new IdentityImpl(
             mintGrant: (principal, _, _, ttl) => new IssuedGrant(
-                $"grant-for-{principal}", DateTimeOffset.UtcNow.ToUnixTimeSeconds() + ttl, "g1")));
+                $"grant-for-{principal}", DateTimeOffset.UtcNow.AddSeconds(ttl), "g1")));
         using var http = new System.Net.Http.HttpClient { BaseAddress = host.Address };
 
         // Refused -- the request carries no authenticated principal, so the freshness guard

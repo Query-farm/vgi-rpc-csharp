@@ -16,7 +16,7 @@ namespace QueryFarm.VgiRpc.Identity;
 /// sealed-grant vectors pin.
 /// </para>
 /// <para>
-/// Sealed grants need exactly this cipher (IDENTITY_V1_SPEC.md §9.1: "the stream-state envelope").
+/// Sealed grants need exactly this cipher (IDENTITY_V2_SPEC.md §9.1: "the stream-state envelope").
 /// This port's own HTTP state tokens use AES-GCM -- they never cross a port boundary, grants do.
 /// <see cref="ChaCha20Poly1305"/> is unavailable on Windows before Server 2022 / Windows 11, where
 /// sealing throws <see cref="PlatformNotSupportedException"/>.

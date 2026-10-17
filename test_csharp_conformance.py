@@ -292,7 +292,7 @@ def proof_worker_factory(worker_binary: Path):
     yield spawn
 
 
-# The two fixtures the canonical vgi_rpc.Identity.v1 group is gated on. Same binary, different
+# The two fixtures the canonical vgi_rpc.Identity.v2 group is gated on. Same binary, different
 # --identity value; both HTTP, because Identity's guards all read an authenticated caller and HTTP
 # is the transport that carries one. See IDENTITY_CONFORMANCE_FIXTURE.md for the pinned policy --
 # every value is one six ports must configure identically, or no cross-port assertion exists.
@@ -312,7 +312,7 @@ def proof_worker_factory(worker_binary: Path):
 # answers identically on the first call and the thousandth. The one piece of per-worker state
 # that could once have leaked across cases was the introspection rate limiter, which the fixture
 # used to pin at 100000 for exactly this reason; introspection is no longer rate limited at all
-# (IDENTITY_V1_SPEC §4, and TestIntrospectionIsNotThrottled pins it), so there is nothing left
+# (IDENTITY_V2_SPEC §4, and TestIntrospectionIsNotThrottled pins it), so there is nothing left
 # to leak. Nothing in the group drains, restarts or otherwise mutates the worker.
 @pytest.fixture(scope="session")
 def conformance_http_identity_port(worker_binary: Path) -> Iterator[int]:
@@ -1351,7 +1351,7 @@ from vgi_rpc.conformance._external_pytest import (  # noqa: E402,F401
 from vgi_rpc.conformance._external_bytestream_pytest import TestExternalByteStream  # noqa: E402,F401
 
 
-# The canonical vgi_rpc.Identity.v1 group (vgi_rpc.conformance._identity_pytest, re-exported
+# The canonical vgi_rpc.Identity.v2 group (vgi_rpc.conformance._identity_pytest, re-exported
 # through _pytest_suite), collected against conformance_http_identity_port /
 # conformance_http_identity_introspect_only_port above -- plus TestIdentityAbsentByDefault, which
 # takes conformance_http_port and so needs no identity fixture at all.

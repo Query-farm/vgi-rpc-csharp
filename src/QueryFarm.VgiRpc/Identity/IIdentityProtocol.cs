@@ -4,7 +4,7 @@ using QueryFarm.VgiRpc.Server;
 namespace QueryFarm.VgiRpc.Identity;
 
 /// <summary>
-/// <c>vgi_rpc.Identity.v1</c> -- resolving a credential, and minting a grant.
+/// <c>vgi_rpc.Identity.v2</c> -- resolving a credential, and minting a grant.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -13,7 +13,7 @@ namespace QueryFarm.VgiRpc.Identity;
 /// peer-identity chain) are already here, and implementing it once is the whole point. It was
 /// previously an HTTP JSON route, <c>POST {prefix}/__introspect_token__</c>, which meant it
 /// existed only on one transport and had to be hand-written in every port. That route is retired
-/// (IDENTITY_V1_SPEC §8) and this port no longer serves it: this protocol is the only
+/// (IDENTITY_V2_SPEC §8) and this port no longer serves it: this protocol is the only
 /// introspection surface, and a client learns whether a worker introspects from reflection.
 /// </para>
 /// <para>
@@ -100,7 +100,7 @@ public static class IdentityProtocol
     /// Under the reserved <c>vgi_rpc.</c> prefix, like <see cref="ReflectionProtocol.ProtocolName"/>:
     /// framework-owned, so an application cannot register a protocol that impersonates it.
     /// </remarks>
-    public const string ProtocolName = "vgi_rpc.Identity.v1";
+    public const string ProtocolName = "vgi_rpc.Identity.v2";
 
     /// <summary>Wire name of <see cref="IIdentityProtocol.IntrospectToken"/>.</summary>
     public const string IntrospectTokenMethod = "introspect_token";

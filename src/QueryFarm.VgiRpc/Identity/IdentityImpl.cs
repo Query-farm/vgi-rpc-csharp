@@ -70,7 +70,7 @@ public sealed class IdentityImpl : IIdentityProtocol
     /// <paramref name="resolveToken"/> is supplied; there is no permissive default.</param>
     /// <param name="maxAuthAge">How recently a caller must have authenticated to mint a grant,
     /// in seconds.</param>
-    /// <param name="grantKeys">Sealed-grant configuration (IDENTITY_V1_SPEC.md §9). When given
+    /// <param name="grantKeys">Sealed-grant configuration (IDENTITY_V2_SPEC.md §9). When given
     /// and <paramref name="mintGrant"/> is not, the framework mints sealed grants itself
     /// (<see cref="SealedGrants.Minter"/>); an HTTP server hosting this identity then also accepts
     /// them back as bearer credentials. <see langword="null"/> changes nothing.</param>
@@ -97,7 +97,7 @@ public sealed class IdentityImpl : IIdentityProtocol
     public GrantKeys? GrantKeys { get; }
 
     /// <summary>The worker's resolver, which an HTTP server also consults for bearer credentials
-    /// (IDENTITY_V1_SPEC.md §9.2).</summary>
+    /// (IDENTITY_V2_SPEC.md §9.2).</summary>
     public TokenResolver? ResolveTokenHook => _resolveToken;
 
     /// <summary>Returns the methods this deployment can actually answer.</summary>

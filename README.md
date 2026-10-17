@@ -305,11 +305,11 @@ requirements.
 
 The HTTP package also includes CORS handling, request and response size limits, zstd content
 encoding, sticky sessions, and proxy-proof validation. Token introspection is not an HTTP route:
-it is the `vgi_rpc.Identity.v1` protocol (`QueryFarm.VgiRpc.Identity.IdentityImpl`, passed to
+it is the `vgi_rpc.Identity.v2` protocol (`QueryFarm.VgiRpc.Identity.IdentityImpl`, passed to
 `RpcServer` as `identity:`), reachable over every transport and gated by an introspector
 allowlist rather than a rate limit.
 
-**Accepting identity credentials as bearers** (WIRE_PROTOCOL.md §16, IDENTITY_V1_SPEC.md §9).
+**Accepting identity credentials as bearers** (WIRE_PROTOCOL.md §16, IDENTITY_V2_SPEC.md §9).
 `issue_grant` mints a credential meant to be presented later as an ordinary bearer, and two
 mechanisms close that loop:
 

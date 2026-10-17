@@ -31,7 +31,7 @@ namespace QueryFarm.VgiRpc.Http;
 /// belong to the server rather than to any one protocol, so they stay flat. Neither reflection
 /// nor token introspection is a special path — they are
 /// <c>{prefix}/vgi_rpc.Reflection.v1/list_protocols</c> and
-/// <c>{prefix}/vgi_rpc.Identity.v1/introspect_token</c>, reached the same way as anything else.
+/// <c>{prefix}/vgi_rpc.Identity.v2/introspect_token</c>, reached the same way as anything else.
 /// The pre-0.46 <c>{prefix}/__introspect_token__</c> JSON route is retired and not served.
 /// </para>
 ///
@@ -141,7 +141,7 @@ public static class RpcHttpEndpoints
     /// <param name="hostingMaxRequestBytes">Provider-neutral hosting request ceiling; null means unset.</param>
     /// <param name="hostingMaxResponseBytes">Provider-neutral hosting response ceiling; null means unset.</param>
     /// <param name="preferredResponseBytes">Advisory batching target, clamped to the effective hard limit.</param>
-    /// <param name="identityBearer">When <paramref name="server"/> hosts <c>vgi_rpc.Identity.v1</c>
+    /// <param name="identityBearer">When <paramref name="server"/> hosts <c>vgi_rpc.Identity.v2</c>
     /// with sealed-grant keys or a <c>resolve_token</c> hook, accept those credentials as bearers
     /// after <paramref name="authenticate"/> (see <see cref="IdentityBearerAuthentication.Compose"/>).
     /// On by default; <see langword="false"/> is for a deployment that composes them itself -- required
@@ -150,7 +150,7 @@ public static class RpcHttpEndpoints
     public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null, long? maxResponseBytes = null, AuthenticateDelegate? authenticate = null, string? proxyHint = null, string? corsPolicyName = null, StickySessionRegistry? sticky = null, bool proxyProofRequired = false, ExternalizationOptions? externalization = null, long? hostingMaxRequestBytes = null, long? hostingMaxResponseBytes = null, long? preferredResponseBytes = null, bool identityBearer = true)
     {
         ValidateResponseBudget(maxResponseBytes, nameof(maxResponseBytes));
-        // Close the identity loop (WIRE_PROTOCOL.md §16): a server hosting vgi_rpc.Identity.v1 with
+        // Close the identity loop (WIRE_PROTOCOL.md §16): a server hosting vgi_rpc.Identity.v2 with
         // sealed-grant keys or a resolve_token hook accepts those credentials as bearers, after the
         // deployment's own authenticator. A deployment whose authentication depends on proxy-injected
         // evidence must not get them OR-ed beside it -- that would let a grant bypass the gate --
@@ -199,7 +199,7 @@ public static class RpcHttpEndpoints
         // being swallowed as a {protocol} named "__upload_url__".
         //
         // There is deliberately no `/__introspect_token__`: that pre-0.46 JSON route is retired
-        // (IDENTITY_V1_SPEC §8). Introspection is the vgi_rpc.Identity.v1 protocol, hosted by the
+        // (IDENTITY_V2_SPEC §8). Introspection is the vgi_rpc.Identity.v2 protocol, hosted by the
         // RpcServer like any other and reached through the routes below.
         var prefixSegments = PathSegmentCount(prefix);
         var unary = endpoints.MapPost($"{prefix}/{{protocol}}/{{method}}", (string protocol, string method, HttpContext context) => { Stamp(context); return HandleUnaryAsync(server, protocol, method, prefixSegments, context, compressionLevel, effectiveMaxResponseBytes, authenticate, proxyHint, sticky, tokenKey, externalization, effectiveMaxRequestBytes, preferredResponseBytes); });
@@ -1263,7 +1263,7 @@ public static class RpcHttpEndpoints
 
     /// <summary>
     /// <c>POST {prefix}/{protocol}/{method}</c> where <c>{protocol}</c> is a framework-owned one
-    /// (<c>vgi_rpc.Reflection.v1</c>, <c>vgi_rpc.Identity.v1</c>).
+    /// (<c>vgi_rpc.Reflection.v1</c>, <c>vgi_rpc.Identity.v2</c>).
     /// </summary>
     /// <remarks>
     /// <para>
@@ -1275,7 +1275,7 @@ public static class RpcHttpEndpoints
     /// encoding, the response budget, and the caller's <see cref="AuthContext"/>.
     /// </para>
     /// <para>
-    /// That last one is the point of the exercise. <c>vgi_rpc.Identity.v1</c>'s freshness guard
+    /// That last one is the point of the exercise. <c>vgi_rpc.Identity.v2</c>'s freshness guard
     /// requires an <c>auth_time</c> claim, which arrives only on an OIDC/JWT credential — i.e.
     /// over HTTP. Peer identity on TCP/unix authenticates a principal but carries no
     /// <c>auth_time</c>, so before this route existed <c>issue_grant</c> was reachable only on

@@ -207,7 +207,7 @@ public static class PeerIdentityAuthentication
     /// claims included — rather than only a domain/principal pair.
     /// </summary>
     /// <remarks>
-    /// Claims are what makes this worth a public entry point. <c>vgi_rpc.Identity.v1</c>'s
+    /// Claims are what makes this worth a public entry point. <c>vgi_rpc.Identity.v2</c>'s
     /// freshness guard reads <c>auth_time</c>, which exists only on an OIDC/JWT credential; a
     /// delegate that could publish nothing but a principal could never let <c>issue_grant</c>
     /// succeed. Mirrors what the peer-identity authenticator already does internally, including

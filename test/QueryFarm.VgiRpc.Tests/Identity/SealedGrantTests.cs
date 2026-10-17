@@ -5,7 +5,7 @@ using Xunit;
 
 namespace QueryFarm.VgiRpc.Tests.Identity;
 
-/// <summary>Sealed grants (IDENTITY_V1_SPEC.md §9.1), pinned by the reference's
+/// <summary>Sealed grants (IDENTITY_V2_SPEC.md §9.1), pinned by the reference's
 /// <c>grant_token_vectors.json</c>: exact mint output, every accept case, every reject case.</summary>
 public class SealedGrantTests
 {

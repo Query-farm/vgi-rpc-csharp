@@ -6,7 +6,7 @@ using QueryFarm.VgiRpc.Server;
 namespace QueryFarm.VgiRpc.ConformanceWorker;
 
 /// <summary>
-/// The fixed deployment policy the shared <c>vgi_rpc.Identity.v1</c> conformance group requires,
+/// The fixed deployment policy the shared <c>vgi_rpc.Identity.v2</c> conformance group requires,
 /// as specified normatively by <c>IDENTITY_CONFORMANCE_FIXTURE.md</c> (reference implementation:
 /// <c>vgi_rpc.conformance.identity_fixture</c>).
 /// </summary>
@@ -14,7 +14,7 @@ namespace QueryFarm.VgiRpc.ConformanceWorker;
 /// <para>
 /// <b>This is a test fixture and must never be deployed.</b> The authentication it relies on is
 /// two request headers (see <see cref="Authenticate"/>) and is therefore trivially spoofable by
-/// anyone who can reach the port. It exists because <c>vgi_rpc.Identity.v1</c> is almost entirely
+/// anyone who can reach the port. It exists because <c>vgi_rpc.Identity.v2</c> is almost entirely
 /// guards, every guard reads deployment policy, and six language ports cannot each stand up an
 /// identity provider to produce a deterministic authenticated caller with an <c>auth_time</c>
 /// claim.
@@ -157,11 +157,12 @@ public static class ConformanceIdentity
 
     /// <summary>2030-01-01T00:00:00Z -- fixed rather than <c>now + ttl</c>.</summary>
     /// <remarks>
-    /// A constant can be asserted exactly, which also pins the float64 round trip. Nothing is lost:
+    /// A constant can be asserted exactly, which also pins the <c>timestamp[us, tz="UTC"]</c> round
+    /// trip (1893456000000000 microseconds). Nothing is lost:
     /// <c>expires_at</c> is a declaration rather than an enforcement, since the real lifetime lives
     /// inside the opaque token.
     /// </remarks>
-    public const double GrantExpiresAt = 1893456000.0;
+    public static readonly DateTimeOffset GrantExpiresAt = DateTimeOffset.FromUnixTimeSeconds(1893456000);
 
     /// <summary>Correlation handle a full grant carries.</summary>
     public const string GrantId = "conformance-grant-id";

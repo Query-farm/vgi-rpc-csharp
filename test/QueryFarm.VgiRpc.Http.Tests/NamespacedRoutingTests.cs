@@ -25,7 +25,7 @@ namespace QueryFarm.VgiRpc.Http.Tests;
 /// <para>
 /// Before these routes existed the HTTP dispatcher routed on <c>{method}</c> alone against the
 /// application protocol's method table, so the two co-hosted framework protocols were reachable
-/// on every transport except the one where they matter most. <c>vgi_rpc.Identity.v1</c> makes
+/// on every transport except the one where they matter most. <c>vgi_rpc.Identity.v2</c> makes
 /// that concrete: its freshness guard requires an <c>auth_time</c> claim, which arrives only on
 /// an OIDC/JWT credential — i.e. over HTTP — so <c>issue_grant</c> was reachable only on the
 /// transports where it must refuse by design. <see cref="IssueGrant_SucceedsOverHttp"/> is the
@@ -194,7 +194,7 @@ public sealed class NamespacedRoutingTests
         await using var host = await StartHostAsync();
         using var http = new System.Net.Http.HttpClient { BaseAddress = host.Address };
 
-        using var response = await PostAsync(http, "/vgi_rpc.Identity.v1/issue_grant", "issue_grant", "vgi_rpc.Identity.v1");
+        using var response = await PostAsync(http, "/vgi_rpc.Identity.v2/issue_grant", "issue_grant", "vgi_rpc.Identity.v2");
 
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
         Assert.Equal(MetadataKeys.ErrorKinds.ProtocolNotSupported, await ErrorKindAsync(response));
@@ -371,7 +371,7 @@ public sealed class NamespacedRoutingTests
 
     /// <summary>
     /// The pre-0.46 <c>POST {prefix}/__introspect_token__</c> JSON route is retired
-    /// (IDENTITY_V1_SPEC §8), even on a worker that does introspect.
+    /// (IDENTITY_V2_SPEC §8), even on a worker that does introspect.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -420,7 +420,7 @@ public sealed class NamespacedRoutingTests
     private static IdentityImpl FullIdentity() => new(
         resolveToken: token => token == "good" ? new TokenIdentity("bob", "ci-key") : null,
         mintGrant: (principal, purpose, scopes, ttl) => new IssuedGrant(
-            $"grant-for-{principal}", DateTimeOffset.UtcNow.ToUnixTimeSeconds() + ttl, "g1"),
+            $"grant-for-{principal}", DateTimeOffset.UtcNow.AddSeconds(ttl), "g1"),
         introspectPrincipals: ["proxy"]);
 
     /// <summary>

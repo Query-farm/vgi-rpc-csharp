@@ -15,7 +15,7 @@ namespace QueryFarm.VgiRpc.Client;
 /// A client-side view of the wire <c>ProtocolSummary</c>, returned by
 /// <see cref="RpcReflection.ListProtocolsAsync(object, CancellationToken)"/> in the server's
 /// order: application protocols in registration order (the primary first), then the framework's
-/// own (<c>vgi_rpc.Reflection.v1</c>, and <c>vgi_rpc.Identity.v1</c> on a server that hosts it).
+/// own (<c>vgi_rpc.Reflection.v1</c>, and <c>vgi_rpc.Identity.v2</c> on a server that hosts it).
 /// </para>
 /// <para>
 /// The reference calls this <c>HostedProtocol</c>. This port already has a public

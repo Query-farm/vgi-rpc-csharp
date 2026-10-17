@@ -12,7 +12,7 @@ using Xunit;
 
 namespace QueryFarm.VgiRpc.Tests.Identity;
 
-/// <summary>Hosting <c>vgi_rpc.Identity.v1</c> -- absent beats routed-and-refusing.</summary>
+/// <summary>Hosting <c>vgi_rpc.Identity.v2</c> -- absent beats routed-and-refusing.</summary>
 public class IdentityServerWiringTests
 {
     private static RpcServer Server(IdentityImpl? identity = null) =>
@@ -70,7 +70,7 @@ public class IdentityServerWiringTests
         Assert.NotNull(methods);
         Assert.Equal(new[] { "issue_grant" }, methods!.Keys.Order().ToArray());
         Assert.Equal(
-            "c71b12f453310139b6b6a445378064661c52711d03ae1e4fba29b8f7976ef4d8",
+            "4199df7403c9ca1a02c4c524b405a999eb1489614a1480873ffc23a0e5b0d312",
             ReflectionProtocol.BindingHash(IdentityProtocol.ProtocolName, methods));
     }
 
@@ -136,7 +136,7 @@ public class IdentityServerWiringTests
 }
 
 /// <summary>
-/// <c>vgi_rpc.Identity.v1</c> driven end to end over a raw transport, with a real connection
+/// <c>vgi_rpc.Identity.v2</c> driven end to end over a raw transport, with a real connection
 /// identity in front of its guards.
 /// </summary>
 /// <remarks>

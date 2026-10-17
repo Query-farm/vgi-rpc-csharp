@@ -6,7 +6,7 @@ using Xunit;
 
 namespace QueryFarm.VgiRpc.Http.Tests;
 
-/// <summary>The identity bearer authenticators and their chain (IDENTITY_V1_SPEC.md §9.2–9.3).</summary>
+/// <summary>The identity bearer authenticators and their chain (IDENTITY_V2_SPEC.md §9.2–9.3).</summary>
 public class IdentityBearerAuthenticationTests
 {
     private static readonly GrantKeys s_keys = new([Enumerable.Range(0, 32).Select(i => (byte)i).ToArray()], audience: "a", maxTtlSeconds: 3600);

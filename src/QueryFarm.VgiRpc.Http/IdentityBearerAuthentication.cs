@@ -6,8 +6,8 @@ using QueryFarm.VgiRpc.Server;
 namespace QueryFarm.VgiRpc.Http;
 
 /// <summary>
-/// Bearer authenticators that close the <c>vgi_rpc.Identity.v1</c> loop (WIRE_PROTOCOL.md §16,
-/// "Accepting identity credentials"; IDENTITY_V1_SPEC.md §9).
+/// Bearer authenticators that close the <c>vgi_rpc.Identity.v2</c> loop (WIRE_PROTOCOL.md §16,
+/// "Accepting identity credentials"; IDENTITY_V2_SPEC.md §9).
 /// </summary>
 /// <remarks>
 /// <para>
@@ -166,7 +166,7 @@ public static class IdentityBearerAuthentication
 
     /// <summary>Appends the identity bearer authenticators after the deployment's own, in the
     /// normative order: <paramref name="authenticate"/>, then sealed grants, then
-    /// <c>resolve_token</c> (IDENTITY_V1_SPEC.md §9.3).</summary>
+    /// <c>resolve_token</c> (IDENTITY_V2_SPEC.md §9.3).</summary>
     /// <param name="authenticate">The deployment's authenticator, or <see langword="null"/>. It must
     /// throw <see cref="AuthFailure"/> for a credential it does not recognise -- one that answers
     /// anonymous for everything ends the chain first.</param>
