@@ -470,7 +470,8 @@ dotnet format --verify-no-changes --exclude third_party
 Run the cross-language conformance suite with:
 
 ```bash
-./run_tests.sh
+./run_tests.sh                        # parallel (pytest-xdist, -n auto)
+CONFORMANCE_WORKERS=8 ./run_tests.sh  # pick the worker count; 0 runs serially
 ```
 
 The suite uses the canonical Python implementation and covers all supported transports and wire

@@ -86,6 +86,14 @@ The acceptance gate for this port is the same one every other port uses: install
 - Run via `./run_tests.sh [transport-or-keyword-filter]`, or directly:
   `python -m pytest test_csharp_conformance.py -v`. Re-run a single failing case with
   `./inspect.sh <test_id>`.
+- `run_tests.sh` runs the suite **in parallel** under pytest-xdist (`-n auto`, one xdist worker
+  per CPU); `CONFORMANCE_WORKERS=N` sets the count and `CONFORMANCE_WORKERS=0` runs serially
+  without xdist. Parallel and serial runs give identical pass/fail/skip counts. It is safe because
+  the worker and client driver are published once by the xdist *controller*
+  (`conftest.py`'s `pytest_sessionstart`, which xdist workers skip) before any worker starts, and
+  every fixture binds an OS-assigned port or a `mktemp` socket path. Session-scoped fixtures are
+  per xdist worker, so each worker gets its own C# processes. Keep it that way: no fixed ports,
+  no shared output paths, nothing written under `artifacts/` from inside a test.
 - The matrix covers every transport (pipe, Unix domain socket, TCP, HTTP, SHM-over-pipe) and the
   full implemented feature surface, streaming included on every transport — a real bug briefly
   excluded producer/exchange streaming from unix/tcp's CI coverage (`UNIX_TCP_FILTER`); it's been
