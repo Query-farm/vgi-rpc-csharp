@@ -301,30 +301,25 @@ public static class RpcHttpEndpoints
             return;
         }
 
-        long count = 1;
+        // Read with the standard request framing, like every other endpoint: a body that is not
+        // an Arrow IPC request, or one addressed to another method, is a 400 — not a silent
+        // count=1 (the reference's _UploadUrlResource does the same).
+        AnnotatedBatch? requestBatch;
         try
         {
             using var reader = new WireReader(requestBody);
             _ = await reader.ReadSchemaAsync(cancellationToken).ConfigureAwait(false);
-            var requestBatch = await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false);
-            using var requestBatchOwner = requestBatch is null ? null : new RecordBatchOwner(requestBatch.Batch);
-            if (requestBatch is not null && requestBatch.Batch.Length > 0 && requestBatch.Batch.Schema.GetFieldIndex("count") >= 0)
-            {
-                var args = ValueCodec.ExtractRow(requestBatch.Batch, [typeof(long)]);
-                if (args is [long requestedCount])
-                {
-                    count = requestedCount;
-                }
-            }
+            requestBatch = await reader.ReadNextAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (RequestTooLargeException exc)
         {
             await Write413Async(context, exc, cancellationToken).ConfigureAwait(false);
             return;
         }
-        catch (Exception)
+        catch (Exception exc) when (!cancellationToken.IsCancellationRequested)
         {
-            // Malformed/absent count defaults to 1, matching Python's tolerant kwargs.get("count", 1).
+            await ErrorResultAsync(server, server.ProtocolName, "__upload_url__", exc, StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, null, false, null).ConfigureAwait(false);
+            return;
         }
         finally
         {
@@ -332,6 +327,37 @@ public static class RpcHttpEndpoints
             {
                 await requestBody.DisposeAsync().ConfigureAwait(false);
             }
+        }
+
+        if (requestBatch is null)
+        {
+            await ErrorResultAsync(server, server.ProtocolName, "__upload_url__", new RpcException("RpcException", "Request body carried no batch."), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, null, false, null).ConfigureAwait(false);
+            return;
+        }
+
+        using var requestBatchOwner = new RecordBatchOwner(requestBatch.Batch);
+
+        var ipcMethod = requestBatch.GetMetadata(MetadataKeys.Method);
+        if (ipcMethod != "__upload_url__")
+        {
+            await ErrorResultAsync(server, server.ProtocolName, "__upload_url__", new RpcException("TypeError", $"Method mismatch: expected '__upload_url__', got '{ipcMethod}'"), StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, null, false, null).ConfigureAwait(false);
+            return;
+        }
+
+        if (RequestVersionFailure(requestBatch) is { } uploadVersionFailure)
+        {
+            await ErrorResultAsync(server, server.ProtocolName, "__upload_url__", uploadVersionFailure, StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, null, false, null).ConfigureAwait(false);
+            return;
+        }
+
+        // An absent or null count is 1, as in the reference's kwargs.get("count", 1).
+        long count = 1;
+        var countIndex = requestBatch.Batch.Schema.GetFieldIndex("count");
+        if (countIndex >= 0 && requestBatch.Batch.Length > 0
+            && requestBatch.Batch.Column(countIndex) is Apache.Arrow.Int64Array countArray
+            && countArray.GetValue(0) is { } requestedCount)
+        {
+            count = requestedCount;
         }
 
         count = Math.Clamp(count, 1, MaxUploadUrlCount);
@@ -2126,6 +2152,20 @@ public static class RpcHttpEndpoints
         var emittedBatchMetadata = collector.EmittedMetadata;
         if (externalization?.External is { } externalConfig && emittedBatch is not null)
         {
+            // An exchange's token rides on its data batch (see below), so it must be in that
+            // batch's metadata BEFORE it is externalized: the uploaded object is what a resolving
+            // client reads it from — the DuckDB client reads stream_state off the RESOLVED batch
+            // only — and a token left on the pointer alone made an externalized turn look like
+            // end-of-stream. Framing key last, for the same reason as the inline path below.
+            if (!isProducer && freshTokenB64 is not null)
+            {
+                var withToken = emittedBatchMetadata is null
+                    ? new Dictionary<string, string>(StringComparer.Ordinal)
+                    : new Dictionary<string, string>(emittedBatchMetadata, StringComparer.Ordinal);
+                withToken[MetadataKeys.StreamState] = freshTokenB64;
+                emittedBatchMetadata = withToken;
+            }
+
             var predicted = ExternalLocation.PredictExternalizeBytes(emittedBatch, externalConfig);
             if (externalization.MaxExternalizedResponseBytes is { } externalCap && predicted > externalCap)
             {

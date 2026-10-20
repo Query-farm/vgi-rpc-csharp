@@ -48,6 +48,8 @@ public sealed class StreamExternalizationSchemaTests
         Task<RpcStream<EchoInputExchange>> EchoInputAsync();
 
         Task<RpcStream<LooselyTypedProducer>> ProduceLooselyAsync(long count);
+
+        Task<RpcStream<TaggedExchange>> EchoTaggedAsync();
     }
 
     private sealed class EchoService : IEchoService
@@ -57,6 +59,25 @@ public sealed class StreamExternalizationSchemaTests
 
         public Task<RpcStream<LooselyTypedProducer>> ProduceLooselyAsync(long count) =>
             Task.FromResult(new RpcStream<LooselyTypedProducer>(s_declared, new LooselyTypedProducer(count)));
+
+        public Task<RpcStream<TaggedExchange>> EchoTaggedAsync() =>
+            Task.FromResult(new RpcStream<TaggedExchange>(s_declared, new TaggedExchange(), s_declared));
+    }
+
+    /// <summary>Echoes its input with per-batch metadata of its own -- including a forged
+    /// <c>vgi_rpc.stream_state</c> key, which the framing token must still overwrite.</summary>
+    public sealed class TaggedExchange : ExchangeState
+    {
+        public override Task ExchangeAsync(AnnotatedBatch input, OutputCollector output, ICallContext? ctx, CancellationToken cancellationToken)
+        {
+            var value = ((Int64Array)input.Batch.Column(0)).GetValue(0)!.Value;
+            output.Emit(Values(s_declared, value), new Dictionary<string, string>
+            {
+                ["app.turn"] = value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                [MetadataKeys.StreamState] = "forged",
+            });
+            return Task.CompletedTask;
+        }
     }
 
     /// <summary>Answers each turn with a batch built on the client's (undeclared-nullability)
@@ -106,6 +127,55 @@ public sealed class StreamExternalizationSchemaTests
         var pointer = await exchange.ExchangeAsync(input, cancellationToken: TestContext.Current.CancellationToken);
 
         await AssertObjectMatchesPointerAsync(pointer, storage.Uploads.Single());
+    }
+
+    /// <summary>
+    /// An exchange's continuation token rides on its data batch, so an externalized turn must
+    /// carry it INSIDE the uploaded object. It used to be added only after externalization, i.e.
+    /// to the zero-row pointer alone; the DuckDB client reads <c>stream_state</c> from the
+    /// resolved batch, so against this server every externalized exchange turn looked like
+    /// end-of-stream. Every other port puts it in the object. The pointer keeps it too, which is
+    /// what lets the session here continue across turns.
+    /// </summary>
+    [Fact]
+    public async Task ExchangeTurns_ExternalizedObjectsCarryTheContinuationToken()
+    {
+        var storage = new CapturingStorage();
+        await using var host = await StartHostAsync(storage);
+        await using var client = new HttpRpcClient(host.Address, new HttpRpcClientOptions { Protocol = Protocol });
+        using var parameters = new RecordBatch(new Schema([], null), [], 1);
+
+        await using var exchange = await client.OpenExchangeAsync(
+            "echo_tagged", parameters, cancellationToken: TestContext.Current.CancellationToken);
+        const int turns = 3;
+        for (var turn = 0; turn < turns; turn++)
+        {
+            using var input = Values(s_declared, turn);
+            var pointer = await exchange.ExchangeAsync(input, cancellationToken: TestContext.Current.CancellationToken);
+            Assert.NotNull(pointer);
+            using (pointer.Batch)
+            {
+                Assert.True(ExternalLocation.IsExternalLocationBatch(pointer.Batch, pointer.Metadata), "the turn was not externalized");
+            }
+        }
+
+        var uploads = storage.Uploads;
+        Assert.Equal(turns, uploads.Count);
+        for (var turn = 0; turn < turns; turn++)
+        {
+            using var reader = new WireReader(new MemoryStream(uploads[turn]));
+            await reader.ReadSchemaAsync(TestContext.Current.CancellationToken);
+            var item = await reader.ReadNextAsync(TestContext.Current.CancellationToken);
+            Assert.NotNull(item);
+            using (item.Batch)
+            {
+                Assert.Equal(1, item.Batch.Length);
+                Assert.Equal(turn.ToString(System.Globalization.CultureInfo.InvariantCulture), item.GetMetadata("app.turn"));
+                var token = item.GetMetadata(MetadataKeys.StreamState);
+                Assert.False(string.IsNullOrEmpty(token), $"turn {turn}: the uploaded object carries no continuation token");
+                Assert.NotEqual("forged", token);
+            }
+        }
     }
 
     [Fact]

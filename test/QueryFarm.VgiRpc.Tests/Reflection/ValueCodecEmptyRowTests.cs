@@ -150,4 +150,102 @@ public sealed class ValueCodecEmptyRowTests
         Assert.Equal(schema.FieldsList.Count, readBatch.ColumnCount);
         Assert.All(readBatch.Arrays, array => Assert.Equal(0, array.Length));
     }
+
+    /// <summary>
+    /// Types outside the enumerated arms used to throw out of <see cref="ValueCodec.EmptyRow"/>:
+    /// every extension type (arrow.uuid, and so any list/map/struct holding one), LargeList, and
+    /// the view types. The empty row is what an externalized pointer batch, a log/error batch, a
+    /// continuation sentinel and a void result are made of, so a worker declaring any of these in
+    /// an output schema could not externalize, log, error or stream at all. The zero-row form is
+    /// now derived from the type's layout, and an extension column still reports its extension
+    /// type rather than the bare storage type.
+    /// </summary>
+    [Fact]
+    public async Task EmptyRow_CoversExtensionLargeListAndViewTypes()
+    {
+        var unionFields = new[]
+        {
+            new Field("as_uuid", GuidType.Default, true),
+            new Field("as_text", StringType.Default, true),
+        };
+        var schema = new Schema(
+            [
+                new Field("uuid", GuidType.Default, true),
+                new Field("uuids", new ListType(new Field("item", GuidType.Default, true)), true),
+                new Field("by_name", new MapType(
+                    new Field("key", StringType.Default, false),
+                    new Field("value", GuidType.Default, true)), true),
+                new Field("record", new StructType([new Field("id", GuidType.Default, true)]), true),
+                new Field("large_ints", new LargeListType(new Field("item", Int64Type.Default, true)), true),
+                new Field("large_uuids", new LargeListType(new Field("item", GuidType.Default, true)), true),
+                new Field("sparse_union", new UnionType(unionFields, [0, 1], UnionMode.Sparse), true),
+                new Field("dense_union", new UnionType(unionFields, [0, 1], UnionMode.Dense), true),
+                new Field("text_view", StringViewType.Default, true),
+                new Field("bytes_view", BinaryViewType.Default, true),
+                new Field("int_list_view", new ListViewType(new Field("item", Int32Type.Default, true)), true),
+                new Field("text_large_list_view", new LargeListViewType(new Field("item", StringType.Default, true)), true),
+            ],
+            null);
+
+        using var batch = ValueCodec.EmptyRow(schema);
+
+        Assert.Equal(0, batch.Length);
+        Assert.Same(schema, batch.Schema);
+        for (var i = 0; i < schema.FieldsList.Count; i++)
+        {
+            var column = batch.Column(i);
+            Assert.Equal(0, column.Length);
+            Assert.Same(schema.FieldsList[i].DataType, column.Data.DataType);
+        }
+
+        Assert.IsType<GuidArray>(batch.Column(0));
+        Assert.IsType<GuidArray>(Assert.IsType<ListArray>(batch.Column(1)).Values);
+        Assert.IsType<GuidArray>(Assert.IsType<StructArray>(batch.Column(3)).Fields[0]);
+        Assert.IsType<GuidArray>(Assert.IsType<LargeListArray>(batch.Column(5)).Values);
+        Assert.IsType<StringViewArray>(batch.Column(8));
+        Assert.IsType<BinaryViewArray>(batch.Column(9));
+        Assert.IsType<ListViewArray>(batch.Column(10));
+        Assert.IsType<LargeListViewArray>(batch.Column(11));
+
+        using var stream = new MemoryStream();
+        await using (var writer = new WireWriter(stream, schema))
+        {
+            await writer.WriteBatchAsync(new AnnotatedBatch(batch, null), TestContext.Current.CancellationToken);
+        }
+
+        stream.Position = 0;
+        using var reader = new WireReader(stream);
+        var readSchema = await reader.ReadSchemaAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(
+            schema.FieldsList.Select(f => $"{f.Name}: {Describe(f.DataType)}"),
+            readSchema.FieldsList.Select(f => $"{f.Name}: {Describe(f.DataType)}"));
+        // The extension survives on the wire as field metadata (or as the resolved type, should a
+        // registry ever know arrow.uuid), both at top level and nested.
+        Assert.True(IsUuid(readSchema.FieldsList[0]));
+        Assert.True(IsUuid(((ListType)readSchema.FieldsList[1].DataType).ValueField));
+
+        var read = await reader.ReadNextAsync(TestContext.Current.CancellationToken);
+        Assert.NotNull(read);
+        using var readBatch = read.Batch;
+        Assert.Equal(0, readBatch.Length);
+        Assert.Equal(schema.FieldsList.Count, readBatch.ColumnCount);
+        Assert.All(readBatch.Arrays, array => Assert.Equal(0, array.Length));
+    }
+
+    private static bool IsUuid(Field field) =>
+        field.DataType is GuidType
+        || (field.Metadata is { } metadata
+            && metadata.TryGetValue("ARROW:extension:name", out var name)
+            && name == "arrow.uuid");
+
+    /// <summary>A type's physical shape, recursively -- extension types by their storage, since
+    /// that is all a reader without the extension registered can reconstruct.</summary>
+    private static string Describe(IArrowType type) => type switch
+    {
+        ExtensionType extension => Describe(extension.StorageType),
+        UnionType union => $"union[{union.Mode}]<{string.Join(", ", union.Fields.Select(f => $"{f.Name}: {Describe(f.DataType)}"))}>",
+        NestedType nested => $"{nested.Name}<{string.Join(", ", nested.Fields.Select(f => $"{f.Name}: {Describe(f.DataType)}"))}>",
+        FixedSizeBinaryType fixedSize => $"{fixedSize.Name}[{fixedSize.ByteWidth}]",
+        _ => type.Name,
+    };
 }

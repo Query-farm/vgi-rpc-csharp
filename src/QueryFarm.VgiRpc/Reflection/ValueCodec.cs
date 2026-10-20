@@ -215,6 +215,10 @@ public static class ValueCodec
     private static IArrowArray BuildEmptyArrayOrNull(IArrowType type, bool nullRow) =>
         type switch
         {
+            // First: an extension type's layout is its storage type's, so both forms are the
+            // storage array re-wrapped — the wrapper is what makes the column (and the schema the
+            // IPC writer derives from it) report arrow.uuid etc. rather than the bare storage type.
+            ExtensionType extensionType => extensionType.CreateArray(BuildEmptyArrayOrNull(extensionType.StorageType, nullRow)),
             StringType => nullRow ? new StringArray.Builder().AppendNull().Build() : new StringArray.Builder().Build(),
             // Whether this BinaryType represents a byte[] or an embedded record is
             // indistinguishable (and irrelevant) for an empty/null array — both encode identically.
@@ -275,8 +279,52 @@ public static class ValueCodec
             // fixed-width type's zero-row and one-null-row layouts are fully determined by its
             // BitWidth, so there is nothing per-type left to get wrong.
             FixedWidthType fixedWidth => BuildFixedWidthArray(fixedWidth, nullRow),
+            // Every remaining type's zero-row form — LargeList, the view types, run-end encoded,
+            // and anything a later Arrow adds — comes from its layout via BuildZeroRowData, so
+            // there is no per-type arm left to forget. Only the one-null-row form stays
+            // enumerated: nothing needs it for these types.
+            _ when !nullRow => ArrowArrayFactory.BuildArray(BuildZeroRowData(type)),
             var other => throw NotSupportedYet(other),
         };
+
+    /// <summary>Zero rows of any Arrow type, built from its physical layout: empty validity/value
+    /// buffers, a single zero offset where the layout has offsets (so readers that index
+    /// <c>offsets[length]</c> stay in bounds), and each child or dictionary itself zero-row.</summary>
+    private static ArrayData BuildZeroRowData(IArrowType type)
+    {
+        var empty = ArrowBuffer.Empty;
+        switch (type)
+        {
+            case ExtensionType extensionType:
+                var storage = BuildZeroRowData(extensionType.StorageType);
+                return new ArrayData(extensionType, length: 0, nullCount: 0, offset: 0, storage.Buffers, storage.Children, storage.Dictionary);
+            case DictionaryType dictType:
+                var indices = BuildZeroRowData(dictType.IndexType);
+                return new ArrayData(dictType, length: 0, nullCount: 0, offset: 0, indices.Buffers, indices.Children, BuildZeroRowData(dictType.ValueType));
+        }
+
+        var int32Offsets = new ArrowBuffer.Builder<int>().Append(0).Build();
+        var int64Offsets = new ArrowBuffer.Builder<long>().Append(0L).Build();
+        ArrowBuffer[] buffers = type.TypeId switch
+        {
+            ArrowTypeId.Null or ArrowTypeId.RunEndEncoded => [],
+            ArrowTypeId.String or ArrowTypeId.Binary => [empty, int32Offsets, empty],
+            ArrowTypeId.LargeString or ArrowTypeId.LargeBinary => [empty, int64Offsets, empty],
+            // Views: validity + views, and zero variadic data buffers.
+            ArrowTypeId.StringView or ArrowTypeId.BinaryView => [empty, empty],
+            ArrowTypeId.List or ArrowTypeId.Map => [empty, int32Offsets],
+            ArrowTypeId.LargeList => [empty, int64Offsets],
+            ArrowTypeId.ListView or ArrowTypeId.LargeListView => [empty, empty, empty],
+            ArrowTypeId.Struct or ArrowTypeId.FixedSizeList => [empty],
+            ArrowTypeId.Union => ((UnionType)type).Mode == UnionMode.Dense ? [empty, empty] : [empty],
+            _ when type is FixedWidthType => [empty, empty],
+            _ => throw NotSupportedYet(type),
+        };
+        var children = type is NestedType nested
+            ? nested.Fields.Select(f => BuildZeroRowData(f.DataType)).ToArray()
+            : null;
+        return new ArrayData(type, length: 0, nullCount: 0, offset: 0, buffers, children);
+    }
 
     /// <summary>Zero rows, or one null row, of any fixed-width column. The layout is always
     /// [validity, values]; a null row still occupies its full width in the values buffer.</summary>
