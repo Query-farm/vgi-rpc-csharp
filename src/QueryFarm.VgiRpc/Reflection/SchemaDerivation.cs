@@ -140,6 +140,7 @@ public static class SchemaDerivation
         // the enum wire shape with open-ended values -- see DictionaryEncodedAttribute.
         if (dictionaryEncoded)
         {
+            if (type == typeof(byte[])) return new DictionaryType(Int32Type.Default, BinaryType.Default, ordered: false);
             if (type == typeof(string))
             {
                 return new DictionaryType(Int16Type.Default, StringType.Default, ordered: false);
@@ -151,7 +152,7 @@ public static class SchemaDerivation
             }
 
             throw new InvalidOperationException(
-                $"[DictionaryEncoded] applies to string or a collection of string, not '{type}'.");
+                $"[DictionaryEncoded] applies to byte[], string or a collection of string, not '{type}'.");
         }
 
         // A declared fixed width wins over the variable-width type a byte[]

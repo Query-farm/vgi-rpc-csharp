@@ -3,7 +3,8 @@ namespace QueryFarm.VgiRpc.Reflection;
 /// <summary>
 /// Declares that a <c>string</c> -- or each <c>string</c> element of a collection -- is carried as
 /// Arrow's <c>dictionary&lt;int16, utf8&gt;</c> rather than the plain <c>utf8</c> a CLR string
-/// would otherwise infer. The C# counterpart of Python's
+/// would otherwise infer. A <c>byte[]</c> property is carried as
+/// <c>dictionary&lt;int32, binary&gt;</c>, preserving arbitrary bytes and nulls. The C# counterpart of Python's
 /// <c>Annotated[str, ArrowType(pa.dictionary(pa.int16(), pa.string()))]</c>.
 /// </summary>
 /// <remarks>

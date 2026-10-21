@@ -205,6 +205,7 @@ public static class ValueCodec
             FixedSizeBinaryType fixedSizeBinaryType => BuildFixedSizeBinaryArray(fixedSizeBinaryType, (byte[])value),
             ListType listType => BuildListArray(listType, (System.Collections.IEnumerable)value),
             StructType structType => BuildStructArray(structType, value, isEmpty: false),
+            DictionaryType dictType when value is byte[] bytes => new DictionaryArray(dictType, new Int32Array.Builder().Append(0).Build(), new BinaryArray.Builder().Append(bytes).Build()),
             DictionaryType dictType when value is string text => BuildDictionaryStringArray(dictType, [text]),
             DictionaryType dictType => BuildEnumArray(dictType, value),
             MapType mapType => BuildMapArray(mapType, (System.Collections.IDictionary)value),
@@ -1061,7 +1062,24 @@ public static class ValueCodec
     /// carries it -- a peer is free to choose any integer index type.</summary>
     private static string ExtractDictionaryString(DictionaryArray array, int index)
     {
-        long position = array.Indices switch
+        long position = DictionaryIndex(array, index);
+
+        return array.Dictionary switch
+        {
+            StringArray values => values.GetString(checked((int)position)),
+            LargeStringArray values => values.GetString(checked((int)position)),
+            var other => throw new NotSupportedException($"Dictionary value type {other.Data.DataType} is not a string type."),
+        };
+    }
+
+    private static byte[]? ExtractDictionaryBinary(DictionaryArray array, int index)
+    {
+        int position = checked((int)DictionaryIndex(array, index));
+        if (position < 0 || position >= array.Dictionary.Length) throw new InvalidOperationException("Invalid binary dictionary index.");
+        return array.Dictionary.IsNull(position) ? null : ((BinaryArray)array.Dictionary).GetBytes(position).ToArray();
+    }
+
+    private static long DictionaryIndex(DictionaryArray array, int index) => array.Indices switch
         {
             Int8Array a => a.Values[index],
             UInt8Array a => a.Values[index],
@@ -1072,14 +1090,6 @@ public static class ValueCodec
             Int64Array a => a.Values[index],
             var other => throw new NotSupportedException($"Dictionary index type {other.Data.DataType} is not supported."),
         };
-
-        return array.Dictionary switch
-        {
-            StringArray values => values.GetString(checked((int)position)),
-            LargeStringArray values => values.GetString(checked((int)position)),
-            var other => throw new NotSupportedException($"Dictionary value type {other.Data.DataType} is not a string type."),
-        };
-    }
 
     private static void AppendScalarToBuilder(IArrowArrayBuilder<IArrowArray, IArrowArrayBuilder<IArrowArray>> builder, IArrowType elementType, object? value)
     {
@@ -1194,6 +1204,7 @@ public static class ValueCodec
             MapArray a => ExtractMap(a, index, effectiveType),
             ListArray a => ExtractList(a, index, effectiveType),
             StructArray a => ExtractStruct(a, index, effectiveType),
+            DictionaryArray a when effectiveType == typeof(byte[]) => ExtractDictionaryBinary(a, index),
             DictionaryArray a when effectiveType == typeof(string) => ExtractDictionaryString(a, index),
             DictionaryArray a => ExtractEnum(a, index, effectiveType),
             _ => throw NotSupportedYet(array.Data.DataType),
