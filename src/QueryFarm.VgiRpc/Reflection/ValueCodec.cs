@@ -1080,16 +1080,16 @@ public static class ValueCodec
     }
 
     private static long DictionaryIndex(DictionaryArray array, int index) => array.Indices switch
-        {
-            Int8Array a => a.Values[index],
-            UInt8Array a => a.Values[index],
-            Int16Array a => a.Values[index],
-            UInt16Array a => a.Values[index],
-            Int32Array a => a.Values[index],
-            UInt32Array a => a.Values[index],
-            Int64Array a => a.Values[index],
-            var other => throw new NotSupportedException($"Dictionary index type {other.Data.DataType} is not supported."),
-        };
+    {
+        Int8Array a => a.Values[index],
+        UInt8Array a => a.Values[index],
+        Int16Array a => a.Values[index],
+        UInt16Array a => a.Values[index],
+        Int32Array a => a.Values[index],
+        UInt32Array a => a.Values[index],
+        Int64Array a => a.Values[index],
+        var other => throw new NotSupportedException($"Dictionary index type {other.Data.DataType} is not supported."),
+    };
 
     private static void AppendScalarToBuilder(IArrowArrayBuilder<IArrowArray, IArrowArrayBuilder<IArrowArray>> builder, IArrowType elementType, object? value)
     {
