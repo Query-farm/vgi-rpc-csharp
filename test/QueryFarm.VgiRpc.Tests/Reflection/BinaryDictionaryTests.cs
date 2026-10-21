@@ -3,6 +3,7 @@ using Apache.Arrow.Types;
 using QueryFarm.VgiRpc.Reflection;
 using Xunit;
 namespace QueryFarm.VgiRpc.Tests.Reflection;
+
 public sealed class BinaryDictionaryTests
 {
     public sealed class Record { [DictionaryEncoded] public byte[] Value { get; set; } = []; [DictionaryEncoded] public byte[]? Optional { get; set; } }
