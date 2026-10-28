@@ -105,6 +105,13 @@ builds (so this was silently invisible there, masking the bug in exactly the con
 happens in). Fixed by treating a `null` `childFields` as `Array.Empty<Field>()` for both cases,
 matching how every other case in the switch already treats it.
 
+DuckDB 2.0's `test_all_types()` exposed a second guard in `NestedType`: it also
+rejected an empty (non-null) field list. `StructType` now opts into accepting an
+empty list through a protected overload; null lists and other nested types keep
+their original validation. `EmptyStructRoundTripTests` covers direct and nested
+empty structs, including their row count and null bitmap.
+
+
 If/when this vendoring is removed (see below), this fix would need to move to whatever reader the
 real `Apache.Arrow` package ships — worth reporting upstream to `apache/arrow-dotnet` independently
 of this port, since a genuinely empty `struct<>`/`union<>` is a legal Arrow type regardless of the

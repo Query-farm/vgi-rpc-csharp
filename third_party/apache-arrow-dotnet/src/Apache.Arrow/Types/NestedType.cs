@@ -26,8 +26,13 @@ namespace Apache.Arrow.Types
         public IReadOnlyList<Field> Fields { get; }
 
         protected NestedType(IReadOnlyList<Field> fields)
+            : this(fields, allowEmpty: false)
         {
-            if (fields == null || fields.Count == 0)
+        }
+
+        protected NestedType(IReadOnlyList<Field> fields, bool allowEmpty)
+        {
+            if (fields == null || (!allowEmpty && fields.Count == 0))
             {
                 throw new ArgumentNullException(nameof(fields));
             }

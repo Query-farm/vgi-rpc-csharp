@@ -24,7 +24,7 @@ namespace Apache.Arrow.Types
         public override ArrowTypeId TypeId => ArrowTypeId.Struct;
         public override string Name => "struct";
 
-        public StructType(IReadOnlyList<Field> fields) : base(fields)
+        public StructType(IReadOnlyList<Field> fields) : base(fields, allowEmpty: true)
         { }
 
         public Field GetFieldByIndex(int index) => Fields[index];
