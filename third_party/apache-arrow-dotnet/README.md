@@ -258,7 +258,7 @@ This mirrors `vgi-go`'s equivalent fork (`github.com/Query-farm/arrow-go`, subst
 so the split here is: NuGet resolves the correct, unique package identity, while the assembly
 inside keeps its original name for source compatibility.
 
-`QueryFarm.Arrow` is version `23.0.0-queryfarm.3` — the upstream tag this fork is based on
+`QueryFarm.Arrow` is version `23.0.0-queryfarm.4` — the upstream tag this fork is based on
 (`v23.0.0`), with a prerelease suffix that can never collide with any official Apache.Arrow
 release. `QueryFarm.Arrow.Scalars` remains `23.0.0-queryfarm.1` because its source is unchanged;
 the fork package depends on that existing scalar package. Both are versioned independently of

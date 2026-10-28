@@ -241,3 +241,9 @@ key). Proven end-to-end: `<Version>` 0.2.0 was tagged, released, and all 7 packa
 NuGet.org under the `rustyconover` account. The tag-push/publish step is still a deliberately
 manual, human-triggered action (hard to reverse once packages land on NuGet.org), not something to
 do autonomously even under a broad "finish everything" instruction.
+
+
+The vendored Arrow package can be released independently without republishing RPC packages:
+bump its project version, tag `arrow-v<Version>`, and publish a GitHub Release. The Arrow-only
+job in the same `release.yml` runs the build/tests and packs/publishes only `QueryFarm.Arrow`.
+`QueryFarm.Arrow.Scalars` retains its existing version when its source is unchanged.

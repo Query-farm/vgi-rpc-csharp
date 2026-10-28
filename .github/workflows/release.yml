@@ -9,6 +9,7 @@ on:
 
 jobs:
   publish:
+    if: startsWith(github.ref_name, 'v')
     runs-on: ubuntu-latest
     environment: nuget
     permissions:
@@ -103,3 +104,39 @@ jobs:
           --api-key ${{ steps.login.outputs.NUGET_API_KEY }}
           --source https://api.nuget.org/v3/index.json
           --skip-duplicate
+
+  publish-arrow:
+    if: startsWith(github.ref_name, 'arrow-v')
+    runs-on: ubuntu-latest
+    environment: nuget
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Verify Arrow tag matches package version
+        run: |
+          TAG="${GITHUB_REF_NAME#arrow-v}"
+          PROJECT="third_party/apache-arrow-dotnet/src/Apache.Arrow/Apache.Arrow.csproj"
+          VERSION="$(grep -oPm1 '(?<=<Version>)[^<]+' "$PROJECT")"
+          test "$TAG" = "$VERSION"
+      - run: dotnet restore
+      - run: dotnet build -c Release --no-restore
+      - run: dotnet test -c Release --no-build
+      - name: Pack only QueryFarm.Arrow
+        run: >-
+          dotnet pack third_party/apache-arrow-dotnet/src/Apache.Arrow/Apache.Arrow.csproj
+          -c Release --no-build -o ./artifacts/nupkg
+      - name: NuGet login (OIDC → temp API key)
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: ${{ secrets.NUGET_USER }}
+      - name: Publish only QueryFarm.Arrow
+        run: >-
+          dotnet nuget push "./artifacts/nupkg/QueryFarm.Arrow.${GITHUB_REF_NAME#arrow-v}.nupkg"
+          --api-key ${{ steps.login.outputs.NUGET_API_KEY }}
+          --source https://api.nuget.org/v3/index.json
