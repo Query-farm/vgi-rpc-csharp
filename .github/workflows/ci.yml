@@ -8,6 +8,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+  # Python reference changes do not trigger this repo, so test against them daily.
+  schedule:
+    - cron: "17 9 * * *"
 
 jobs:
   build-test:
