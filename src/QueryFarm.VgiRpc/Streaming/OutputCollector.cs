@@ -70,6 +70,14 @@ public sealed class OutputCollector(Schema outputSchema, long? responseLimitByte
         EmittedMetadata = metadata;
     }
 
+    /// <summary>Transfers ownership of this turn's emitted batch to the caller and clears it from
+    /// the collector, so a later <see cref="Dispose"/> does not dispose it. Returns
+    /// <see langword="null"/> when nothing was emitted. Intended for unit tests (or any host that
+    /// drives a <see cref="StreamState"/> by hand) that need to keep the batch beyond the
+    /// collector's lifetime; the caller then owns the batch and must dispose it.
+    /// <see cref="EmittedMetadata"/> is left in place.</summary>
+    public RecordBatch? TakeEmittedBatch() => DetachEmittedBatch();
+
     /// <summary>Transfers ownership of the emitted batch to the framework's wire layer.</summary>
     internal RecordBatch? DetachEmittedBatch()
     {

@@ -49,4 +49,32 @@ public sealed class OutputCollectorTests
 
         Assert.Throws<InvalidOperationException>(() => collector.Emit(EmptyBatch(), new Dictionary<string, string>()));
     }
+
+    [Fact]
+    public void TakeEmittedBatch_TransfersOwnership_DisposeLeavesBatchAlive()
+    {
+        var schema = new Schema([new Field("v", Apache.Arrow.Types.Int64Type.Default, nullable: true)], metadata: null);
+        var batch = new RecordBatch(schema, [new Int64Array.Builder().Append(42).Build()], 1);
+        RecordBatch? taken;
+        using (var collector = new OutputCollector(schema))
+        {
+            collector.Emit(batch);
+            taken = collector.TakeEmittedBatch();
+            Assert.Null(collector.EmittedBatch);
+            Assert.Null(collector.TakeEmittedBatch());
+        }
+
+        Assert.Same(batch, taken);
+        // The collector's Dispose must not have released the taken batch's buffers.
+        Assert.Equal(42, ((Int64Array)taken!.Column(0)).GetValue(0));
+        taken.Dispose();
+    }
+
+    [Fact]
+    public void TakeEmittedBatch_NothingEmitted_ReturnsNull()
+    {
+        using var collector = new OutputCollector(s_emptySchema);
+
+        Assert.Null(collector.TakeEmittedBatch());
+    }
 }
