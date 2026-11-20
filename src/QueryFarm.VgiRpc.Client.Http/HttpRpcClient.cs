@@ -31,6 +31,29 @@ public sealed partial class HttpRpcClient : IRpcClient, IProtocolAddressableClie
     /// <c>upload_headers</c> name none — octet-stream, as in the reference client, because a backend
     /// that signs the content type (GCS) signs exactly that.</summary>
     private const string UploadContentType = "application/octet-stream";
+
+    /// <summary>
+    /// The client for PUTs to server-vended upload URLs — never the RPC client.
+    /// </summary>
+    /// <remarks>
+    /// A pre-signed URL is its own credential. The RPC <see cref="System.Net.Http.HttpClient"/>,
+    /// especially a caller-supplied one, may carry default headers (<c>Authorization</c>, custom
+    /// headers), an auth handler or cookies, which would hand the caller's RPC credentials to the
+    /// storage host (and R2/S3 refuse a second auth mechanism anyway). This one has no default
+    /// headers, no cookies, no credentials and follows no redirects, so a PUT carries only the
+    /// vended <c>upload_headers</c>, the body and what HTTP itself needs — as the reference's
+    /// <c>storage_put</c> does.
+    /// </remarks>
+    private static readonly System.Net.Http.HttpClient s_storageHttp = new(new SocketsHttpHandler
+    {
+        AllowAutoRedirect = false,
+        UseCookies = false,
+        Credentials = null,
+        PreAuthenticate = false,
+    })
+    {
+        Timeout = TimeSpan.FromSeconds(300),
+    };
     private const long EncodedResponseSafetyFloorBytes =
         HttpRpcClientOptions.DefaultAcceptedMaxResponseBytes;
     private readonly System.Net.Http.HttpClient _http;
@@ -536,7 +559,7 @@ public sealed partial class HttpRpcClient : IRpcClient, IProtocolAddressableClie
             }
         }
 
-        using var uploadResponse = await _http.SendAsync(put, cancellationToken).ConfigureAwait(false);
+        using var uploadResponse = await s_storageHttp.SendAsync(put, cancellationToken).ConfigureAwait(false);
         if (!uploadResponse.IsSuccessStatusCode)
         {
             throw new RpcException("ExternalUploadFailed",

@@ -922,8 +922,8 @@ public static class RpcHttpEndpoints
     /// <c>OPTIONS {prefix}/health</c> — capability discovery, matching
     /// <c>vgi_rpc.http._client.http_capabilities</c>'s contract exactly: <c>VGI-Max-Response-Bytes</c>
     /// when a cap is configured, <c>VGI-Externalization-Enabled</c>,
-    /// <c>VGI-Upload-URL-Support</c> (<c>2</c>, the upload-URL protocol version, when an upload-URL
-    /// provider is configured; <c>false</c> otherwise), and <c>VGI-Supported-Encodings</c> naming the codecs this server can actually produce for
+    /// <c>VGI-Upload-URL-Support</c> (<c>2</c>, the upload-URL protocol version, only when an
+    /// upload-URL provider is configured; absent otherwise), and <c>VGI-Supported-Encodings</c> naming the codecs this server can actually produce for
     /// responses.
     /// </summary>
     private static async Task HandleCapabilitiesAsync(RpcServer server, HttpContext context,
@@ -953,7 +953,11 @@ public static class RpcHttpEndpoints
         }
 
         headers["VGI-Externalization-Enabled"] = externalization?.External?.Storage is not null ? "true" : "false";
-        headers["VGI-Upload-URL-Support"] = externalization?.UploadUrlProvider is not null ? UploadUrlProtocolVersion : "false";
+        // Absent, not "false", without a provider — as in the reference.
+        if (externalization?.UploadUrlProvider is not null)
+        {
+            headers["VGI-Upload-URL-Support"] = UploadUrlProtocolVersion;
+        }
         headers["VGI-Supported-Encodings"] = "zstd, gzip";
         if (maxRequestBytes is { } requestCap)
         {

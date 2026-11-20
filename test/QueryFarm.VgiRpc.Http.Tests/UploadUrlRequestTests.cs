@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using Apache.Arrow;
 using Apache.Arrow.Types;
@@ -201,6 +202,49 @@ public sealed class UploadUrlRequestTests
         Assert.Equal("application/octet-stream", put.ContentType);
         Assert.Equal(UploadDigest.HexToBase64(Sha(put.Body)), put.Checksum);
         Assert.Equal([(put.Body.LongLength, Sha(put.Body))], host.Provider.Requests);
+    }
+
+    /// <summary>The presigned PUT goes through a bare client: a caller-supplied RPC
+    /// <see cref="System.Net.Http.HttpClient"/>'s default <c>Authorization</c> (and any other
+    /// default header) reaches the RPC server but never the storage host.</summary>
+    [Fact]
+    public async Task StoragePut_NeverCarriesTheRpcClientsDefaultHeaders()
+    {
+        await using var host = await StartHostAsync(storageBacked: true);
+        using var rpcHttp = new System.Net.Http.HttpClient { BaseAddress = host.Address };
+        rpcHttp.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", "rpc-secret-token");
+        rpcHttp.DefaultRequestHeaders.TryAddWithoutValidation("X-Caller-Secret", "do-not-forward");
+        await using var client = new HttpRpcClient(rpcHttp, new HttpRpcClientOptions
+        {
+            Protocol = "PingService",
+            ExternalLocation = new ClientExternalConfig { UrlValidator = null },
+        });
+        var value = new string('z', 32 * 1024);
+
+        Assert.Equal(value, await PingAsync(client, value));
+
+        var put = Assert.Single(host.Storage.Puts);
+        Assert.Null(put.Authorization);
+        Assert.DoesNotContain(put.HeaderNames, h => h.Equals("X-Caller-Secret", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(put.HeaderNames, h => h.Equals("Cookie", StringComparison.OrdinalIgnoreCase));
+        Assert.True(host.RpcSawAuthorization, "the RPC requests themselves should still carry the caller's Authorization");
+    }
+
+    [Fact]
+    public async Task Capabilities_OmitTheUploadHeaderWithoutAProvider()
+    {
+        var builder = WebApplication.CreateSlimBuilder();
+        builder.WebHost.UseUrls("http://127.0.0.1:0");
+        await using var app = builder.Build();
+        app.MapVgiRpc(new RpcServer(typeof(IPingService), new PingService()));
+        await app.StartAsync(TestContext.Current.CancellationToken);
+        var address = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
+        using var http = new System.Net.Http.HttpClient { BaseAddress = new Uri(address) };
+        using var request = new HttpRequestMessage(HttpMethod.Options, "/health");
+        using var response = await http.SendAsync(request, TestContext.Current.CancellationToken);
+
+        Assert.False(response.Headers.Contains("VGI-Upload-URL-Support"));
+        await app.StopAsync(TestContext.Current.CancellationToken);
     }
 
     [Fact]
@@ -405,6 +449,16 @@ public sealed class UploadUrlRequestTests
         var app = builder.Build();
         var storage = new VerifyingStorage();
         var provider = new RecordingUploadUrlProvider(storageBacked ? storage : null);
+        var rpcSawAuthorization = new StrongBox<bool>();
+        app.Use(async (context, next) =>
+        {
+            if (!context.Request.Path.StartsWithSegments("/store") && context.Request.Headers.Authorization.Count > 0)
+            {
+                rpcSawAuthorization.Value = true;
+            }
+
+            await next(context);
+        });
         if (storageBacked)
         {
             storage.Map(app);
@@ -422,7 +476,7 @@ public sealed class UploadUrlRequestTests
         await app.StartAsync(TestContext.Current.CancellationToken);
         var address = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
         storage.BaseAddress = address.TrimEnd('/');
-        return new TestHost(app, new Uri(address), provider, storage);
+        return new TestHost(app, new Uri(address), provider, storage, rpcSawAuthorization);
     }
 
     /// <summary>Records each (size, sha256) it is asked for. Without storage it vends
@@ -508,7 +562,9 @@ public sealed class UploadUrlRequestTests
                     return Results.BadRequest("BadDigest");
                 }
 
-                _puts.Enqueue(new StoredPut(body, context.Request.ContentLength, context.Request.ContentType, checksum));
+                _puts.Enqueue(new StoredPut(body, context.Request.ContentLength, context.Request.ContentType, checksum,
+                    context.Request.Headers.Authorization.Count > 0 ? context.Request.Headers.Authorization.ToString() : null,
+                    [.. context.Request.Headers.Keys]));
                 if (CorruptStoredObjects)
                 {
                     body = [.. body];
@@ -528,10 +584,13 @@ public sealed class UploadUrlRequestTests
         }
     }
 
-    private sealed record StoredPut(byte[] Body, long? ContentLength, string? ContentType, string Checksum);
+    private sealed record StoredPut(byte[] Body, long? ContentLength, string? ContentType, string Checksum,
+        string? Authorization, IReadOnlyList<string> HeaderNames);
 
-    private sealed class TestHost(WebApplication app, Uri address, RecordingUploadUrlProvider provider, VerifyingStorage storage) : IAsyncDisposable
+    private sealed class TestHost(WebApplication app, Uri address, RecordingUploadUrlProvider provider, VerifyingStorage storage, StrongBox<bool> rpcSawAuthorization) : IAsyncDisposable
     {
+        public bool RpcSawAuthorization => rpcSawAuthorization.Value;
+
         public Uri Address { get; } = address;
 
         public RecordingUploadUrlProvider Provider { get; } = provider;
