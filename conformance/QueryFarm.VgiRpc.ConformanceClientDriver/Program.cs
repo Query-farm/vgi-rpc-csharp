@@ -78,7 +78,12 @@ while (await Console.In.ReadLineAsync() is { } line)
                 await CapabilitiesAsync();
                 break;
             case "request_upload_urls":
-                var urls = await RequireHttp().RequestUploadUrlsAsync(request["count"]?.GetValue<int>() ?? 1);
+                // Upload-URL v2: {"uploads": [{"size": N, "sha256": "<hex>"}, ...]}.
+                var uploads = (request["uploads"] as JsonArray ?? [])
+                    .Select(entry => new UploadRequest(
+                        entry!["size"]!.GetValue<long>(), entry["sha256"]!.GetValue<string>()))
+                    .ToList();
+                var urls = await RequireHttp().RequestUploadUrlsAsync(uploads);
                 await ReplyAsync(new JsonObject
                 {
                     ["ok"] = true,
@@ -87,6 +92,8 @@ while (await Console.In.ReadLineAsync() is { } line)
                         ["upload_url"] = url.Upload,
                         ["download_url"] = url.Download,
                         ["expires_at"] = url.ExpiresAt.ToUnixTimeSeconds(),
+                        ["upload_headers"] = new JsonObject(url.Headers.Select(
+                            h => KeyValuePair.Create(h.Key, (JsonNode?)JsonValue.Create(h.Value)))),
                     }).ToArray()),
                 });
                 break;
@@ -405,6 +412,7 @@ async Task CapabilitiesAsync()
             ["sticky_default_ttl"] = caps.StickyDefaultTtl,
             ["sticky_echo_headers"] = new JsonArray(caps.StickyEchoHeaders.Select(value => JsonValue.Create(value)).ToArray()),
             ["upload_url_support"] = caps.UploadUrlSupport,
+            ["upload_url_version"] = caps.UploadUrlVersion > 0 ? caps.UploadUrlVersion : null,
             ["max_request_bytes"] = caps.MaxRequestBytes,
             ["max_response_bytes"] = caps.MaxResponseBytes,
             ["max_externalized_response_bytes"] = caps.MaxExternalizedResponseBytes,

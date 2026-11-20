@@ -75,17 +75,39 @@ public sealed class GcsStorage : IExternalStorage, IUploadUrlProvider, IDisposab
 
     /// <summary>Vends a signed PUT/GET URL pair for the same new object — GCS signed URLs are
     /// method-bound (see <see cref="UploadUrl"/>'s doc comment), so a caller must PUT to
-    /// <see cref="UploadUrl.UploadUrlValue"/> and later GET from <see cref="UploadUrl.DownloadUrl"/>.</summary>
-    public async Task<UploadUrl> GenerateUploadUrlAsync(Schema schema, CancellationToken cancellationToken)
+    /// <see cref="UploadUrl.UploadUrlValue"/> and later GET from <see cref="UploadUrl.DownloadUrl"/>.
+    /// GCS cannot verify a SHA-256 at storage, so the PUT signs the exact length
+    /// (<c>x-goog-content-length-range: N,N</c>) and an <c>application/octet-stream</c>
+    /// Content-Type, both returned in <see cref="UploadUrl.Headers"/>; the server's
+    /// <c>vgi_rpc.location.sha256</c> check on the request pointer catches a wrong body.</summary>
+    public async Task<UploadUrl> GenerateUploadUrlAsync(long size, string sha256Hex, CancellationToken cancellationToken)
     {
+        ArgumentOutOfRangeException.ThrowIfLessThan(size, 1);
+        if (!UploadDigest.IsLowerHexSha256(sha256Hex))
+        {
+            throw new ArgumentException("sha256 must be 64 lowercase hex characters", nameof(sha256Hex));
+        }
+
         var key = _keyPrefix + Guid.NewGuid().ToString("D") + ".arrow";
         var expiresAt = DateTimeOffset.UtcNow.Add(_signDuration);
+        var headers = new Dictionary<string, string>
+        {
+            ["Content-Type"] = UploadContentType,
+            ["x-goog-content-length-range"] = $"{size},{size}",
+        };
 
-        var uploadUrl = await _signer.SignAsync(_bucket, key, _signDuration, HttpMethod.Put, signingVersion: SigningVersion.V4, cancellationToken: cancellationToken).ConfigureAwait(false);
+        var putTemplate = UrlSigner.RequestTemplate.FromBucket(_bucket).WithObjectName(key)
+            .WithHttpMethod(HttpMethod.Put)
+            .WithContentHeaders(new Dictionary<string, IEnumerable<string>> { ["Content-Type"] = [UploadContentType] })
+            .WithRequestHeaders(new Dictionary<string, IEnumerable<string>> { ["x-goog-content-length-range"] = [headers["x-goog-content-length-range"]] });
+        var options = UrlSigner.Options.FromDuration(_signDuration).WithSigningVersion(SigningVersion.V4);
+        var uploadUrl = await _signer.SignAsync(putTemplate, options, cancellationToken).ConfigureAwait(false);
         var downloadUrl = await _signer.SignAsync(_bucket, key, _signDuration, HttpMethod.Get, signingVersion: SigningVersion.V4, cancellationToken: cancellationToken).ConfigureAwait(false);
 
-        return new UploadUrl(uploadUrl, downloadUrl, expiresAt);
+        return new UploadUrl(uploadUrl, downloadUrl, expiresAt, headers);
     }
+
+    private const string UploadContentType = "application/octet-stream";
 
     /// <summary>Disposes the underlying <see cref="StorageClient"/>, but only when it was created
     /// internally — a caller-supplied client (via <see cref="Builder.WithClient"/>) is left open.

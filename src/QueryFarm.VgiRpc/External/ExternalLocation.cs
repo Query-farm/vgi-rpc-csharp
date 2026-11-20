@@ -255,7 +255,10 @@ public static class ExternalLocation
     /// <param name="onLog">Optional callback for log or error batches embedded in the fetched
     /// IPC stream. The callback must not retain the batch; its lifetime ends when the callback
     /// returns.</param>
-    /// <exception cref="Errors.RpcException">On fetch failure, checksum mismatch, redirect loop, a
+    /// <param name="requireSha256">When <see langword="true"/> (servers resolving a request
+    /// pointer) a pointer without <see cref="MetadataKeys.LocationSha256"/> is refused before any
+    /// fetch.</param>
+    /// <exception cref="Errors.RpcException">On a missing required digest, fetch failure, checksum mismatch, redirect loop, a
     /// fetched stream with no data batch (or more than one), or a schema mismatch — mirrors
     /// Python's <c>resolve_external_location</c> raising <c>RuntimeError</c>/<c>ValueError</c>,
     /// translated to this port's uniform wire-exception type.</exception>
@@ -264,7 +267,8 @@ public static class ExternalLocation
         IReadOnlyDictionary<string, string>? metadata,
         ClientExternalConfig? config,
         CancellationToken cancellationToken = default,
-        Action<AnnotatedBatch>? onLog = null)
+        Action<AnnotatedBatch>? onLog = null,
+        bool requireSha256 = false)
     {
         if (config is null || !IsExternalLocationBatch(batch, metadata))
         {
@@ -273,6 +277,21 @@ public static class ExternalLocation
 
         var url = metadata![MetadataKeys.Location];
         var expectedSha256 = metadata.GetValueOrDefault(MetadataKeys.LocationSha256);
+        if (requireSha256)
+        {
+            // Upload-URL protocol v2: a request pointer must name the digest of the bytes the
+            // client uploaded, so a body corrupted or swapped in storage is caught before decoding.
+            // Refused before any fetch; texts match the reference's resolve_external_location.
+            if (expectedSha256 is null)
+            {
+                throw new Errors.RpcException("ValueError", $"Request pointer is missing vgi_rpc.location.sha256 (required on request pointers since vgi-rpc upload-URL protocol v2): {ExternalFetch.RedactUrl(url)}");
+            }
+
+            if (!UploadDigest.IsLowerHexSha256(expectedSha256))
+            {
+                throw new Errors.RpcException("ValueError", $"Request pointer vgi_rpc.location.sha256 is not 64 lowercase hex characters: {ExternalFetch.RedactUrl(url)}");
+            }
+        }
 
         var fetchStarted = System.Diagnostics.Stopwatch.GetTimestamp();
         var data = await ExternalFetch.FetchUrlAsync(url, config.FetchConfig, config.UrlValidator, cancellationToken).ConfigureAwait(false);
@@ -283,7 +302,7 @@ public static class ExternalLocation
             var actualSha256 = Convert.ToHexStringLower(SHA256.HashData(data));
             if (!string.Equals(actualSha256, expectedSha256, StringComparison.OrdinalIgnoreCase))
             {
-                throw new Errors.RpcException("RuntimeError", $"SHA-256 checksum mismatch for {ExternalFetch.RedactUrl(url)}: expected {expectedSha256}, got {actualSha256}");
+                throw new Errors.RpcException("RuntimeError", $"ExternalLocation sha256 mismatch (SHA-256 checksum mismatch) for {ExternalFetch.RedactUrl(url)}: expected {expectedSha256}, got {actualSha256}");
             }
         }
 
@@ -401,19 +420,74 @@ public interface IExternalStorage
     Task<string> UploadAsync(byte[] data, Schema schema, string? contentEncoding, CancellationToken cancellationToken);
 }
 
-/// <summary>Pre-signed URL pair for client-side data upload. S3/GCS pre-signed URLs are signed
-/// per HTTP method, so a PUT URL cannot be used for GET — hence two URLs for the same object.</summary>
-public sealed record UploadUrl(string UploadUrlValue, string DownloadUrl, DateTimeOffset ExpiresAt);
+/// <summary>Pre-signed URL pair for client-side data upload (upload-URL protocol v2). S3/GCS
+/// pre-signed URLs are signed per HTTP method, so a PUT URL cannot be used for GET — hence two URLs
+/// for the same object.</summary>
+/// <param name="UploadUrlValue">Pre-signed PUT, signed for the requested size and SHA-256 where the
+/// backend can.</param>
+/// <param name="DownloadUrl">Pre-signed GET the server fetches the object from.</param>
+/// <param name="ExpiresAt">Expiry of both URLs.</param>
+/// <param name="Headers">Headers the client MUST send on the PUT, verbatim (wire column
+/// <c>upload_headers</c>). Never contains <c>Content-Length</c>: the client sends exactly the
+/// requested number of bytes with a plain Content-Length, which the signature covers.
+/// <see langword="null"/> means none.</param>
+public sealed record UploadUrl(
+    string UploadUrlValue,
+    string DownloadUrl,
+    DateTimeOffset ExpiresAt,
+    IReadOnlyDictionary<string, string>? Headers = null)
+{
+    /// <summary>Headers the client must send on the PUT; empty when there are none.</summary>
+    public IReadOnlyDictionary<string, string> Headers { get; init; } =
+        Headers ?? new Dictionary<string, string>();
+}
 
 /// <summary>Generates pre-signed upload URL pairs. Implementations must be thread-safe.</summary>
 public interface IUploadUrlProvider
 {
-    /// <summary>Generates a pre-signed upload/download URL pair for a new storage object. The
-    /// caller receives time-limited PUT and GET URLs — the object is not automatically deleted.</summary>
-    /// <param name="schema">The Arrow schema of the data to be uploaded — backends may use this
-    /// for content-type or metadata hints.</param>
+    /// <summary>Generates a pre-signed upload/download URL pair for a new storage object that
+    /// will hold exactly <paramref name="size"/> bytes whose SHA-256 is
+    /// <paramref name="sha256Hex"/>. Backends that can sign the length and checksum (S3/R2, the
+    /// blob vendor) must, so storage itself rejects a mismatched body; the headers that signature
+    /// requires go in <see cref="UploadUrl.Headers"/>. The caller receives time-limited PUT and GET
+    /// URLs — the object is not automatically deleted.</summary>
+    /// <param name="size">Exact byte length of the body the client will PUT; at least 1.</param>
+    /// <param name="sha256Hex">SHA-256 of exactly those bytes, 64 lowercase hex characters.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
-    Task<UploadUrl> GenerateUploadUrlAsync(Schema schema, CancellationToken cancellationToken);
+    Task<UploadUrl> GenerateUploadUrlAsync(long size, string sha256Hex, CancellationToken cancellationToken);
+}
+
+/// <summary>Helpers shared by upload-URL providers.</summary>
+public static class UploadDigest
+{
+    /// <summary>Whether <paramref name="value"/> is 64 lowercase hex characters — the encoding of
+    /// <c>vgi_rpc.location.sha256</c> and of an <c>__upload_url__</c> entry's <c>sha256</c>.</summary>
+    public static bool IsLowerHexSha256(string? value)
+    {
+        if (value is null || value.Length != 64)
+        {
+            return false;
+        }
+
+        foreach (var c in value)
+        {
+            if (c is not ((>= '0' and <= '9') or (>= 'a' and <= 'f')))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>Base64 of the 32 raw digest bytes <paramref name="sha256Hex"/> encodes — the value
+    /// of S3's <c>x-amz-checksum-sha256</c>.</summary>
+    /// <exception cref="ArgumentException"><paramref name="sha256Hex"/> is not 64 lowercase hex
+    /// characters.</exception>
+    public static string HexToBase64(string sha256Hex) =>
+        IsLowerHexSha256(sha256Hex)
+            ? Convert.ToBase64String(Convert.FromHexString(sha256Hex))
+            : throw new ArgumentException("sha256 must be 64 lowercase hex characters", nameof(sha256Hex));
 }
 
 /// <summary>Compression settings for externalized data.</summary>

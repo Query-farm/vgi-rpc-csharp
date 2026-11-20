@@ -21,6 +21,16 @@ namespace QueryFarm.VgiRpc.Client.Http;
 public sealed partial class HttpRpcClient : IRpcClient, IProtocolAddressableClient
 {
     private const string ArrowContentType = "application/vnd.apache.arrow.stream";
+
+    /// <summary>The upload-URL protocol version this client speaks: it uploads only to a server
+    /// advertising <c>VGI-Upload-URL-Support: 2</c>, and never falls back to the retired
+    /// <c>count</c> request shape.</summary>
+    public const int UploadUrlProtocolVersion = 2;
+
+    /// <summary>Content-Type of a PUT to a vended upload URL when the server's
+    /// <c>upload_headers</c> name none — octet-stream, as in the reference client, because a backend
+    /// that signs the content type (GCS) signs exactly that.</summary>
+    private const string UploadContentType = "application/octet-stream";
     private const long EncodedResponseSafetyFloorBytes =
         HttpRpcClientOptions.DefaultAcceptedMaxResponseBytes;
     private readonly System.Net.Http.HttpClient _http;
@@ -319,7 +329,7 @@ public sealed partial class HttpRpcClient : IRpcClient, IProtocolAddressableClie
             LongHeader(response, "VGI-Max-Externalized-Response-Bytes"),
             true,
             BoolHeader(response, "VGI-Externalization-Enabled"),
-            BoolHeader(response, "VGI-Upload-URL-Support"),
+            UploadUrlVersionHeader(Header(response, "VGI-Upload-URL-Support")),
             BoolHeader(response, StickySessions.StickyEnabledHeader),
             LongHeader(response, StickySessions.StickyDefaultTtlHeader),
             (Header(response, StickySessions.StickyEchoHeadersHeader) ?? "")
@@ -330,20 +340,35 @@ public sealed partial class HttpRpcClient : IRpcClient, IProtocolAddressableClie
         return capabilities;
     }
 
+    /// <summary>Requests one pre-signed upload URL pair per entry of <paramref name="uploads"/>
+    /// (upload-URL protocol v2): the server signs each URL for that entry's exact size and
+    /// SHA-256 where its backend can, and returns the headers the PUT must carry.</summary>
+    /// <remarks>The entries are sent as given; the server is the one that validates them (1–100
+    /// entries, size at least 1, 64 lowercase hex SHA-256, within <c>VGI-Max-Upload-Bytes</c>) and
+    /// its refusal arrives as an <see cref="RpcException"/>.</remarks>
     public async Task<IReadOnlyList<UploadUrl>> RequestUploadUrlsAsync(
-        int count = 1,
+        IReadOnlyList<UploadRequest> uploads,
         CancellationToken cancellationToken = default)
     {
-        if (count < 1)
+        ArgumentNullException.ThrowIfNull(uploads);
+        var sizes = new Int64Array.Builder();
+        var hashes = new StringArray.Builder();
+        foreach (var upload in uploads)
         {
-            throw new ArgumentOutOfRangeException(nameof(count));
+            sizes.Append(upload.Size);
+            hashes.Append(upload.Sha256);
         }
 
-        // The public __upload_url__ contract defines count as nullable.  The value we send is
-        // always present, but nullability is part of Arrow schema equality and Rust validates
-        // this request strictly (as does the canonical Python schema).
-        var schema = new Schema([new Field("count", Int64Type.Default, true)], null);
-        using var request = new RecordBatch(schema, [new Int64Array.Builder().Append(count).Build()], 1);
+        var entryType = new StructType([
+            new Field("size", Int64Type.Default, false),
+            new Field("sha256", StringType.Default, false),
+        ]);
+        var listType = new ListType(new Field("item", entryType, true));
+        var entries = new StructArray(entryType, uploads.Count, [sizes.Build(), hashes.Build()], ArrowBuffer.Empty, 0);
+        var offsets = new ArrowBuffer.Builder<int>().Append(0).Append(uploads.Count).Build();
+        var list = new ListArray(listType, 1, offsets, entries, ArrowBuffer.Empty, 0);
+        var schema = new Schema([new Field("uploads", listType, false)], null);
+        using var request = new RecordBatch(schema, [list], 1);
         var body = await PostBatchAsync(
             $"{_prefix}/__upload_url__/init",
             request,
@@ -372,13 +397,21 @@ public sealed partial class HttpRpcClient : IRpcClient, IProtocolAddressableClie
                 var uploadIndex = batch.Batch.Schema.GetFieldIndex("upload_url");
                 var downloadIndex = batch.Batch.Schema.GetFieldIndex("download_url");
                 var expirationIndex = batch.Batch.Schema.GetFieldIndex("expires_at");
-                if (uploadIndex < 0 || downloadIndex < 0 || expirationIndex < 0)
+                var headersIndex = batch.Batch.Schema.GetFieldIndex("upload_headers");
+                if (uploadIndex < 0 || downloadIndex < 0 || expirationIndex < 0 || headersIndex < 0)
                 {
                     throw new InvalidDataException(
-                        "Upload URL response must contain upload_url, download_url, and expires_at columns.");
+                        "Upload URL response must contain upload_url, download_url, expires_at, and upload_headers columns.");
                 }
 
-                var uploads = batch.Batch.Column(uploadIndex) as StringArray
+                var headerMaps = batch.Batch.Column(headersIndex) as MapArray
+                    ?? throw new InvalidDataException("Upload URL response column 'upload_headers' must be map<utf8, utf8>.");
+                var headerKeys = headerMaps.Keys as StringArray
+                    ?? throw new InvalidDataException("Upload URL response column 'upload_headers' must be map<utf8, utf8>.");
+                var headerValues = headerMaps.Values as StringArray
+                    ?? throw new InvalidDataException("Upload URL response column 'upload_headers' must be map<utf8, utf8>.");
+
+                var uploadColumn = batch.Batch.Column(uploadIndex) as StringArray
                     ?? throw new InvalidDataException("Upload URL response column 'upload_url' must be utf8.");
                 var downloads = batch.Batch.Column(downloadIndex) as StringArray
                     ?? throw new InvalidDataException("Upload URL response column 'download_url' must be utf8.");
@@ -387,19 +420,130 @@ public sealed partial class HttpRpcClient : IRpcClient, IProtocolAddressableClie
                 for (var index = 0; index < batch.Batch.Length; index++)
                 {
                     result.Add(new UploadUrl(
-                        uploads.GetString(index)
+                        uploadColumn.GetString(index)
                             ?? throw new InvalidDataException("Upload URL response contained a null upload_url."),
                         downloads.GetString(index)
                             ?? throw new InvalidDataException("Upload URL response contained a null download_url."),
                         expirations.GetTimestamp(index)
-                            ?? throw new InvalidDataException("Upload URL response contained a null expires_at.")));
+                            ?? throw new InvalidDataException("Upload URL response contained a null expires_at."),
+                        ReadUploadHeaders(headerMaps, headerKeys, headerValues, index)));
                 }
             }
         }
 
-        return result.Count == 0
-            ? throw new InvalidDataException("Upload URL response contained no URL pairs.")
+        return result.Count != uploads.Count
+            ? throw new InvalidDataException($"Upload URL response contained {result.Count} URL pairs for {uploads.Count} requested uploads.")
             : result;
+    }
+
+    private static Dictionary<string, string> ReadUploadHeaders(MapArray maps, StringArray keys, StringArray values, int index)
+    {
+        if (maps.IsNull(index))
+        {
+            throw new InvalidDataException("Upload URL response contained a null upload_headers.");
+        }
+
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var start = maps.ValueOffsets[index];
+        var end = start + maps.GetValueLength(index);
+        for (var i = start; i < end; i++)
+        {
+            var name = keys.GetString(i) ?? throw new InvalidDataException("Upload URL response contained a null upload_headers key.");
+            if (string.Equals(name, "Content-Length", StringComparison.OrdinalIgnoreCase))
+            {
+                // The client sends exactly the declared size; a server-chosen length is a protocol error.
+                throw new InvalidDataException("Upload URL response upload_headers must not contain Content-Length.");
+            }
+
+            headers[name] = values.GetString(i) ?? "";
+        }
+
+        return headers;
+    }
+
+    /// <summary>Parses <c>VGI-Upload-URL-Support</c> as the reference does: the retired
+    /// <c>true</c> is 1, a positive decimal without a leading zero is that version, and anything
+    /// else (absent, <c>false</c>, garbage) is 0 — unsupported.</summary>
+    public static int UploadUrlVersionHeader(string? value)
+    {
+        var token = value?.Trim();
+        if (string.IsNullOrEmpty(token))
+        {
+            return 0;
+        }
+
+        if (string.Equals(token, "true", StringComparison.OrdinalIgnoreCase))
+        {
+            return 1;
+        }
+
+        return token[0] != '0' && token.All(char.IsAsciiDigit)
+            && int.TryParse(token, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var version)
+            ? version
+            : 0;
+    }
+
+    /// <summary>Uploads <paramref name="serializedBody"/> through a vended URL and returns the
+    /// pointer batch that replaces it: checks the server speaks upload-URL v2, hashes the body,
+    /// requests one URL for that (size, sha256), PUTs exactly those bytes with every
+    /// <c>upload_headers</c> entry, and stamps <c>vgi_rpc.location.sha256</c> on the pointer.</summary>
+    private async Task<(RecordBatch Batch, Dictionary<string, string> Metadata)> UploadRequestBodyAsync(
+        byte[] serializedBody, Schema schema, CancellationToken cancellationToken)
+    {
+        var capabilities = await GetCapabilitiesAsync(cancellationToken).ConfigureAwait(false);
+        var version = capabilities.UploadUrlVersion;
+        if (version == 0)
+        {
+            throw new RpcException("RequestTooLarge",
+                "Request exceeds max_request_bytes and the server does not advertise upload_url_support");
+        }
+
+        if (version < UploadUrlProtocolVersion)
+        {
+            throw new RpcException("ProtocolError",
+                $"Server upload protocol is too old: it advertises VGI-Upload-URL-Support v{version} "
+                + $"and this client needs {UploadUrlProtocolVersion}");
+        }
+
+        if (version > UploadUrlProtocolVersion)
+        {
+            throw new RpcException("ProtocolError",
+                $"Server upload protocol is newer than this client: it advertises VGI-Upload-URL-Support: {version} "
+                + $"and this client speaks {UploadUrlProtocolVersion}");
+        }
+
+        var sha256 = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(serializedBody));
+        var urls = await RequestUploadUrlsAsync([new UploadRequest(serializedBody.Length, sha256)], cancellationToken).ConfigureAwait(false);
+        var target = urls[0];
+        _options.ExternalLocation?.UrlValidator?.Invoke(target.Upload);
+        _options.ExternalLocation?.UrlValidator?.Invoke(target.Download);
+
+        // ByteArrayContent states its length, so the PUT goes out with a plain Content-Length of
+        // exactly the declared size (never chunked) — what the backend's signature covers.
+        using var uploadContent = new ByteArrayContent(serializedBody);
+        using var put = new HttpRequestMessage(HttpMethod.Put, target.Upload) { Content = uploadContent };
+        if (!target.Headers.Keys.Any(k => string.Equals(k, "Content-Type", StringComparison.OrdinalIgnoreCase)))
+        {
+            uploadContent.Headers.ContentType = MediaTypeHeaderValue.Parse(UploadContentType);
+        }
+
+        foreach (var (name, value) in target.Headers)
+        {
+            if (!put.Headers.TryAddWithoutValidation(name, value))
+            {
+                uploadContent.Headers.Remove(name);
+                uploadContent.Headers.TryAddWithoutValidation(name, value);
+            }
+        }
+
+        using var uploadResponse = await _http.SendAsync(put, cancellationToken).ConfigureAwait(false);
+        if (!uploadResponse.IsSuccessStatusCode)
+        {
+            throw new RpcException("ExternalUploadFailed",
+                $"PUT to upload URL failed: HTTP {(int)uploadResponse.StatusCode}");
+        }
+
+        return ExternalLocation.MakePointerBatch(schema, target.Download, sha256);
     }
 
     internal async Task<byte[]> PostTurnAsync(
@@ -459,15 +603,7 @@ public sealed partial class HttpRpcClient : IRpcClient, IProtocolAddressableClie
 
         if (response.StatusCode == HttpStatusCode.RequestEntityTooLarge && allowExternalize && _options.ExternalLocation is not null)
         {
-            var urls = await RequestUploadUrlsAsync(1, cancellationToken).ConfigureAwait(false);
-            var target = urls[0];
-            _options.ExternalLocation.UrlValidator?.Invoke(target.Upload);
-            _options.ExternalLocation.UrlValidator?.Invoke(target.Download);
-            using var uploadContent = new ByteArrayContent(serializedBody);
-            uploadContent.Headers.ContentType = MediaTypeHeaderValue.Parse(ArrowContentType);
-            using var uploadResponse = await _http.PutAsync(target.Upload, uploadContent, cancellationToken).ConfigureAwait(false);
-            await EnsureSuccessAsync(uploadResponse, cancellationToken).ConfigureAwait(false);
-            var pointer = ExternalLocation.MakePointerBatch(batch.Schema, target.Download);
+            var pointer = await UploadRequestBodyAsync(serializedBody, batch.Schema, cancellationToken).ConfigureAwait(false);
             using (pointer.Batch)
             {
                 foreach (var (key, value) in metadata)

@@ -61,9 +61,20 @@ public sealed class FakeStorageBackend(string baseUrl) : IExternalStorage, IUplo
         return allocation.DownloadUrl ?? allocation.ObjectUrl ?? throw new InvalidOperationException("fake-storage /alloc returned no download_url/object_url");
     }
 
-    public async Task<UploadUrl> GenerateUploadUrlAsync(Schema schema, CancellationToken cancellationToken)
+    /// <summary>A <i>sized</i> allocation (upload-URL protocol v2): <c>/alloc</c> gets
+    /// <c>size</c> and <c>sha256_b64</c>, and its <c>upload_url</c> then verifies the PUT like S3/R2
+    /// (400 IncompleteBody / 403 SignatureDoesNotMatch / 400 BadDigest). The
+    /// <c>upload_headers</c> it returns (<c>x-amz-checksum-sha256</c>) pass through to the client.</summary>
+    public async Task<UploadUrl> GenerateUploadUrlAsync(long size, string sha256Hex, CancellationToken cancellationToken)
     {
-        using var allocResponse = await AllocAsync([], cancellationToken).ConfigureAwait(false);
+        var body = new Dictionary<string, object>
+        {
+            ["size"] = size,
+            ["sha256_b64"] = UploadDigest.HexToBase64(sha256Hex),
+        };
+        var content = new ByteArrayContent(System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(body));
+        content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+        using var allocResponse = await s_client.PostAsync($"{_baseUrl}/alloc", content, cancellationToken).ConfigureAwait(false);
         allocResponse.EnsureSuccessStatusCode();
         var allocation = await allocResponse.Content.ReadFromJsonAsync<Allocation>(cancellationToken).ConfigureAwait(false)
             ?? throw new InvalidOperationException("fake-storage /alloc returned no body");
@@ -71,7 +82,8 @@ public sealed class FakeStorageBackend(string baseUrl) : IExternalStorage, IUplo
         return new UploadUrl(
             UploadUrlValue: allocation.UploadUrl ?? objectUrl,
             DownloadUrl: allocation.DownloadUrl ?? objectUrl,
-            ExpiresAt: DateTimeOffset.UtcNow.AddHours(1));
+            ExpiresAt: DateTimeOffset.UtcNow.AddHours(1),
+            Headers: allocation.UploadHeaders);
     }
 
     /// <summary>
@@ -101,5 +113,8 @@ public sealed class FakeStorageBackend(string baseUrl) : IExternalStorage, IUplo
 
         [JsonPropertyName("download_url")]
         public string? DownloadUrl { get; set; }
+
+        [JsonPropertyName("upload_headers")]
+        public Dictionary<string, string>? UploadHeaders { get; set; }
     }
 }

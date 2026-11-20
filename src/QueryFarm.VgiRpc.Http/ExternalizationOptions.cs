@@ -25,10 +25,9 @@ public sealed class ExternalizationOptions
     /// <see cref="RequestCap"/>. Advertised via <c>VGI-Max-Request-Bytes</c>.</summary>
     public long? MaxRequestBytes { get; init; }
 
-    /// <summary>Advertised via <c>VGI-Max-Upload-Bytes</c> — informational only in this port (the
-    /// upload-URL provider itself is responsible for enforcing it against what actually lands in
-    /// storage; this server never sees the uploaded bytes, since the client PUTs directly to the
-    /// vended pre-signed URL).</summary>
+    /// <summary>Advertised via <c>VGI-Max-Upload-Bytes</c>. <c>__upload_url__/init</c> refuses
+    /// any entry whose declared <c>size</c> exceeds it, before minting a URL; the vended URL is
+    /// signed for that exact size where the backend can, so storage rejects a longer body.</summary>
     public long? MaxUploadBytes { get; init; }
 
     /// <summary>Hard cap on the raw (pre-compression) byte count of any single externalized

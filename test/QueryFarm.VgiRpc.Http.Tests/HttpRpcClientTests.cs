@@ -398,7 +398,8 @@ public sealed class HttpRpcClientTests
             new HttpRpcClientOptions { Protocol = TestProtocol, AcceptedMaxResponseBytes = 64L << 10 });
 
         var error = await Assert.ThrowsAsync<RpcException>(() => client.RequestUploadUrlsAsync(
-            64, TestContext.Current.CancellationToken));
+            Enumerable.Repeat(new UploadRequest(1, new string('a', 64)), 64).ToList(),
+            TestContext.Current.CancellationToken));
         Assert.Equal("ResponseTooLargeError", error.ErrorType);
         Assert.Contains("__upload_url__", error.ErrorMessage, StringComparison.Ordinal);
         Assert.Contains("max_response_bytes", error.ErrorMessage, StringComparison.Ordinal);
@@ -613,7 +614,7 @@ public sealed class HttpRpcClientTests
         private readonly string _suffix = new('x', 700);
 
         public Task<QueryFarm.VgiRpc.External.UploadUrl> GenerateUploadUrlAsync(
-            Schema schema, CancellationToken cancellationToken) => Task.FromResult(new QueryFarm.VgiRpc.External.UploadUrl(
+            long size, string sha256Hex, CancellationToken cancellationToken) => Task.FromResult(new QueryFarm.VgiRpc.External.UploadUrl(
                 "https://upload.invalid/" + _suffix,
                 "https://download.invalid/" + _suffix,
                 DateTimeOffset.UtcNow.AddHours(1)));

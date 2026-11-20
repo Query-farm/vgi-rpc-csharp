@@ -187,8 +187,20 @@ public static class RpcHttpEndpoints
 
         tokenKey ??= RandomNumberGenerator.GetBytes(32);
         var registry = new StreamCallRegistry();
-        void Stamp(HttpContext context) => ApplyResponseBudgetCapabilities(
-            context.Response, effectiveMaxRequestBytes, effectiveMaxResponseBytes);
+        void Stamp(HttpContext context)
+        {
+            ApplyResponseBudgetCapabilities(context.Response, effectiveMaxRequestBytes, effectiveMaxResponseBytes);
+            // Like the reference's capability headers: every response advertises the upload-URL
+            // protocol, so a client holding any response (a 413 included) can tell v2 from v1.
+            if (externalization?.UploadUrlProvider is not null)
+            {
+                context.Response.Headers["VGI-Upload-URL-Support"] = UploadUrlProtocolVersion;
+                if (externalization.MaxUploadBytes is { } maxUploadBytes)
+                {
+                    context.Response.Headers["VGI-Max-Upload-Bytes"] = maxUploadBytes.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                }
+            }
+        }
         var health = endpoints.MapMethods($"{prefix}/health", ["GET", "HEAD"], (HttpContext context) => { Stamp(context); return HandleHealthAsync(server, context, proxyProofRequired); });
         var capabilities = endpoints.MapMethods($"{prefix}/health", ["OPTIONS"], (HttpContext context) => { Stamp(context); return HandleCapabilitiesAsync(server, context, effectiveMaxResponseBytes, sticky, proxyProofRequired, externalization, effectiveMaxRequestBytes, authenticate, proxyHint); });
         // RPC paths are namespaced by protocol: {prefix}/{protocol}/{method}[/init|/exchange].
@@ -245,19 +257,29 @@ public static class RpcHttpEndpoints
             response.Headers["VGI-Max-Response-Bytes"] = responseCap.ToString();
     }
 
-    private static readonly Schema s_uploadUrlParamsSchema = new([new Field("count", Apache.Arrow.Types.Int64Type.Default, nullable: true)], metadata: null);
+    private static readonly Apache.Arrow.Types.MapType s_uploadHeadersType =
+        new(Apache.Arrow.Types.StringType.Default, Apache.Arrow.Types.StringType.Default);
+
     private static readonly Schema s_uploadUrlResultSchema = new(
         [
             new Field("upload_url", Apache.Arrow.Types.StringType.Default, nullable: false),
             new Field("download_url", Apache.Arrow.Types.StringType.Default, nullable: false),
             new Field("expires_at", new Apache.Arrow.Types.TimestampType(Apache.Arrow.Types.TimeUnit.Microsecond, "UTC"), nullable: false),
+            new Field("upload_headers", s_uploadHeadersType, nullable: false),
         ],
         metadata: null);
 
-    private const int MaxUploadUrlCount = 64;
+    /// <summary>The value of <c>VGI-Upload-URL-Support</c> when an upload-URL provider is
+    /// configured: upload-URL protocol v2, whose <c>__upload_url__/init</c> takes
+    /// <c>uploads: list&lt;struct&lt;size, sha256&gt;&gt;</c>. v1 advertised <c>true</c>.</summary>
+    internal const string UploadUrlProtocolVersion = "2";
 
-    /// <summary><c>POST {prefix}/__upload_url__/init</c> — vends <c>count</c> pre-signed
-    /// upload/download URL pairs so a client can externalize an oversized <i>request</i> out of
+    /// <summary>At most this many entries per <c>__upload_url__/init</c> request.</summary>
+    internal const int MaxUploadUrlEntries = 100;
+
+    /// <summary><c>POST {prefix}/__upload_url__/init</c> (upload-URL protocol v2) — vends one
+    /// pre-signed upload/download URL pair per requested <c>(size, sha256)</c> entry, each signed
+    /// for that size and hash where the backend can, so a client can externalize an oversized <i>request</i> out of
     /// band. Follows the same dispatch shape as unary calls (auth gate, request-cap enforcement,
     /// standard wire request/response framing) despite the <c>/init</c> suffix — unlike a real
     /// stream method, this is always answered in one shot; there is no matching <c>/exchange</c>.</summary>
@@ -350,22 +372,29 @@ public static class RpcHttpEndpoints
             return;
         }
 
-        // An absent or null count is 1, as in the reference's kwargs.get("count", 1).
-        long count = 1;
-        var countIndex = requestBatch.Batch.Schema.GetFieldIndex("count");
-        if (countIndex >= 0 && requestBatch.Batch.Length > 0
-            && requestBatch.Batch.Column(countIndex) is Apache.Arrow.Int64Array countArray
-            && countArray.GetValue(0) is { } requestedCount)
+        IReadOnlyList<(long Size, string Sha256)> entries;
+        try
         {
-            count = requestedCount;
+            entries = ParseUploadUrlEntries(requestBatch.Batch, externalization.MaxUploadBytes);
+        }
+        catch (RpcException exc)
+        {
+            await ErrorResultAsync(server, server.ProtocolName, "__upload_url__", exc, StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, null, false, null).ConfigureAwait(false);
+            return;
         }
 
-        count = Math.Clamp(count, 1, MaxUploadUrlCount);
-
-        var uploadUrls = new UploadUrl[count];
-        for (var i = 0; i < count; i++)
+        var uploadUrls = new UploadUrl[entries.Count];
+        try
         {
-            uploadUrls[i] = await externalization.UploadUrlProvider!.GenerateUploadUrlAsync(new Schema([], metadata: null), cancellationToken).ConfigureAwait(false);
+            for (var i = 0; i < entries.Count; i++)
+            {
+                uploadUrls[i] = await externalization.UploadUrlProvider!.GenerateUploadUrlAsync(entries[i].Size, entries[i].Sha256, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (Exception exc) when (!cancellationToken.IsCancellationRequested)
+        {
+            await ErrorResultAsync(server, server.ProtocolName, "__upload_url__", exc, StatusCodes.Status500InternalServerError, s_uploadUrlResultSchema, StatusCodes.Status500InternalServerError, context, null, false, null).ConfigureAwait(false);
+            return;
         }
 
         var responseBuffer = new MemoryStream();
@@ -378,14 +407,30 @@ public static class RpcHttpEndpoints
             // which corrupts every value by 1000x on read-back (found via manual verification:
             // an expires_at of "now + 1h" came back as 1970-01-21).
             var expiresArray = new Apache.Arrow.TimestampArray.Builder(Apache.Arrow.Types.TimeUnit.Microsecond, "UTC");
+            var headersArray = new Apache.Arrow.MapArray.Builder(s_uploadHeadersType);
+            var headerKeys = (Apache.Arrow.StringArray.Builder)headersArray.KeyBuilder;
+            var headerValues = (Apache.Arrow.StringArray.Builder)headersArray.ValueBuilder;
             foreach (var u in uploadUrls)
             {
                 uploadArray.Append(u.UploadUrlValue);
                 downloadArray.Append(u.DownloadUrl);
                 expiresArray.Append(u.ExpiresAt);
+                headersArray.Append();
+                foreach (var (name, value) in u.Headers)
+                {
+                    // The client sends exactly the declared size with a plain Content-Length;
+                    // a provider's own (the blob vendor's required_headers has one) is dropped.
+                    if (string.Equals(name, "Content-Length", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    headerKeys.Append(name);
+                    headerValues.Append(value);
+                }
             }
 
-            var resultBatch = new RecordBatch(s_uploadUrlResultSchema, [uploadArray.Build(), downloadArray.Build(), expiresArray.Build()], (int)count);
+            var resultBatch = new RecordBatch(s_uploadUrlResultSchema, [uploadArray.Build(), downloadArray.Build(), expiresArray.Build(), headersArray.Build()], uploadUrls.Length);
             await writer.WriteOwnedBatchAsync(resultBatch, null, cancellationToken).ConfigureAwait(false);
         }
 
@@ -402,6 +447,80 @@ public static class RpcHttpEndpoints
 
         EmitAccessLog(server, server.ProtocolName, "__upload_url__", "unary", "ok", "", "", Stopwatch.GetTimestamp(), StatusCodes.Status200OK);
         await WriteBytesAsync(context, StatusCodes.Status200OK, WrittenMemory(responseBuffer), null, false, null, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Reads and validates an upload-URL v2 request: one <c>uploads</c> parameter of
+    /// type <c>list&lt;struct&lt;size: int64, sha256: utf8&gt;&gt;</c>, 1–100 entries, each
+    /// <c>size</c> at least 1 (and within <paramref name="maxUploadBytes"/> when configured) and
+    /// each <c>sha256</c> 64 lowercase hex characters. Every refusal is a <c>ValueError</c>, raised
+    /// before any URL is minted.</summary>
+    internal static IReadOnlyList<(long Size, string Sha256)> ParseUploadUrlEntries(RecordBatch batch, long? maxUploadBytes)
+    {
+        // Texts and check order match the reference (vgi-rpc-python, UPLOAD_URL_V2.md decision 2):
+        // per entry, size, then sha256, then VGI-Max-Upload-Bytes.
+        var uploadsIndex = batch.Schema.GetFieldIndex("uploads");
+        if (batch.Schema.GetFieldIndex("count") >= 0 || uploadsIndex < 0)
+        {
+            throw new RpcException("ValueError",
+                "__upload_url__ request uses the retired count shape: this server requires "
+                + $"VGI-Upload-URL-Support: {UploadUrlProtocolVersion} and an 'uploads' parameter "
+                + "(list<struct<size: int64, sha256: utf8>>, one entry per upload)");
+        }
+
+        var list = batch.Length == 1 ? batch.Column(uploadsIndex) as Apache.Arrow.ListArray : null;
+        var structs = list?.Values as Apache.Arrow.StructArray;
+        var structType = structs?.Data.DataType as Apache.Arrow.Types.StructType;
+        var sizeIndex = structType?.GetFieldIndex("size") ?? -1;
+        var shaIndex = structType?.GetFieldIndex("sha256") ?? -1;
+        var sizes = sizeIndex >= 0 ? structs!.Fields[sizeIndex] as Apache.Arrow.Int64Array : null;
+        var hashes = shaIndex >= 0 ? structs!.Fields[shaIndex] as Apache.Arrow.StringArray : null;
+        if (list is null || structs is null || sizes is null || hashes is null)
+        {
+            throw new RpcException("ValueError",
+                "__upload_url__ parameter 'uploads' must be one list<struct<size: int64, sha256: utf8>> value");
+        }
+
+        if (list.IsNull(0))
+        {
+            throw new RpcException("ValueError",
+                $"__upload_url__ 'uploads' must have 1-{MaxUploadUrlEntries} entries, got null");
+        }
+
+        var start = list.ValueOffsets[0];
+        var count = list.GetValueLength(0);
+        if (count < 1 || count > MaxUploadUrlEntries)
+        {
+            throw new RpcException("ValueError",
+                $"__upload_url__ 'uploads' must have 1-{MaxUploadUrlEntries} entries, got {count}");
+        }
+
+        var entries = new (long Size, string Sha256)[count];
+        for (var i = 0; i < count; i++)
+        {
+            var row = start + i;
+            var size = structs.IsNull(row) ? null : sizes.GetValue(row);
+            if (size is not { } validSize || validSize < 1)
+            {
+                throw new RpcException("ValueError",
+                    $"__upload_url__ uploads[{i}].size must be an integer >= 1, got {(size is { } v ? v.ToString(System.Globalization.CultureInfo.InvariantCulture) : "None")}");
+            }
+
+            var sha256 = structs.IsNull(row) ? null : hashes.GetString(row);
+            if (!UploadDigest.IsLowerHexSha256(sha256))
+            {
+                throw new RpcException("ValueError", $"__upload_url__ uploads[{i}].sha256 must be 64 lowercase hex characters");
+            }
+
+            if (maxUploadBytes is { } max && validSize > max)
+            {
+                throw new RpcException("ValueError",
+                    $"__upload_url__ uploads[{i}].size {validSize} exceeds VGI-Max-Upload-Bytes ({max})");
+            }
+
+            entries[i] = (validSize, sha256!);
+        }
+
+        return entries;
     }
 
     /// <summary>Writes a genuine HTTP 413 — a real transport-level rejection, distinct from
@@ -802,9 +921,9 @@ public static class RpcHttpEndpoints
     /// <summary>
     /// <c>OPTIONS {prefix}/health</c> — capability discovery, matching
     /// <c>vgi_rpc.http._client.http_capabilities</c>'s contract exactly: <c>VGI-Max-Response-Bytes</c>
-    /// when a cap is configured, <c>VGI-Externalization-Enabled: false</c> and
-    /// <c>VGI-Upload-URL-Support: false</c> (neither is implemented yet — see docs/roadmap.md M13),
-    /// and <c>VGI-Supported-Encodings</c> naming the codecs this server can actually produce for
+    /// when a cap is configured, <c>VGI-Externalization-Enabled</c>,
+    /// <c>VGI-Upload-URL-Support</c> (<c>2</c>, the upload-URL protocol version, when an upload-URL
+    /// provider is configured; <c>false</c> otherwise), and <c>VGI-Supported-Encodings</c> naming the codecs this server can actually produce for
     /// responses.
     /// </summary>
     private static async Task HandleCapabilitiesAsync(RpcServer server, HttpContext context,
@@ -834,7 +953,7 @@ public static class RpcHttpEndpoints
         }
 
         headers["VGI-Externalization-Enabled"] = externalization?.External?.Storage is not null ? "true" : "false";
-        headers["VGI-Upload-URL-Support"] = externalization?.UploadUrlProvider is not null ? "true" : "false";
+        headers["VGI-Upload-URL-Support"] = externalization?.UploadUrlProvider is not null ? UploadUrlProtocolVersion : "false";
         headers["VGI-Supported-Encodings"] = "zstd, gzip";
         if (maxRequestBytes is { } requestCap)
         {
@@ -1108,7 +1227,7 @@ public static class RpcHttpEndpoints
                 var (resolvedBatch, resolvedMetadata) = await ExternalLocation.ResolveAsync(
                     requestBatch.Batch, requestBatch.Metadata,
                     new ClientExternalConfig { FetchConfig = externalization.External.FetchConfig, UrlValidator = externalization.External.UrlValidator },
-                    cancellationToken).ConfigureAwait(false);
+                    cancellationToken, requireSha256: true).ConfigureAwait(false);
                 requestBatchOwner.Replace(resolvedBatch);
                 requestBatch = requestBatch with { Batch = resolvedBatch, Metadata = resolvedMetadata };
             }
@@ -1579,7 +1698,7 @@ public static class RpcHttpEndpoints
                 var (resolvedBatch, resolvedMetadata) = await ExternalLocation.ResolveAsync(
                     requestBatch.Batch, requestBatch.Metadata,
                     new ClientExternalConfig { FetchConfig = externalization.External.FetchConfig, UrlValidator = externalization.External.UrlValidator },
-                    cancellationToken).ConfigureAwait(false);
+                    cancellationToken, requireSha256: true).ConfigureAwait(false);
                 requestBatchOwner.Replace(resolvedBatch);
                 requestBatch = requestBatch with { Batch = resolvedBatch, Metadata = resolvedMetadata };
             }
@@ -2028,7 +2147,7 @@ public static class RpcHttpEndpoints
                 var (resolvedBatch, resolvedMetadata) = await ExternalLocation.ResolveAsync(
                     turnBatch.Batch, turnBatch.Metadata,
                     new ClientExternalConfig { FetchConfig = externalization.External.FetchConfig, UrlValidator = externalization.External.UrlValidator },
-                    cancellationToken).ConfigureAwait(false);
+                    cancellationToken, requireSha256: true).ConfigureAwait(false);
                 requestBatchOwner.Replace(resolvedBatch);
                 turnBatch = turnBatch with { Batch = resolvedBatch, Metadata = resolvedMetadata };
             }

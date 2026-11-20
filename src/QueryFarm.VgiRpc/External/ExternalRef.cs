@@ -50,7 +50,7 @@ public sealed record ExternalRef
             throw new ArgumentException("ExternalRef.Url must be non-empty", nameof(url));
         }
 
-        if (sha256 is not null && !IsLowerHexSha256(sha256))
+        if (sha256 is not null && !UploadDigest.IsLowerHexSha256(sha256))
         {
             throw new ArgumentException("ExternalRef.Sha256 must be 64 lowercase hex characters (or null)", nameof(sha256));
         }
@@ -70,22 +70,4 @@ public sealed record ExternalRef
     /// <param name="schema">The method's result schema.</param>
     public (RecordBatch Batch, Dictionary<string, string> Metadata) PointerBatch(Schema schema) =>
         ExternalLocation.MakePointerBatch(schema, Url, Sha256);
-
-    private static bool IsLowerHexSha256(string value)
-    {
-        if (value.Length != 64)
-        {
-            return false;
-        }
-
-        foreach (var c in value)
-        {
-            if (c is not ((>= '0' and <= '9') or (>= 'a' and <= 'f')))
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
 }

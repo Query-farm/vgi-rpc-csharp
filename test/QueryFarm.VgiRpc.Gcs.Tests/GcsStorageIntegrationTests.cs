@@ -143,6 +143,35 @@ public sealed class GcsStorageIntegrationTests(GcsFixture fixture) : IClassFixtu
         Assert.Equal(expected, await mutatedResponse.Content.ReadAsByteArrayAsync());
     }
 
+    /// <summary>Upload-URL v2 on GCS: storage cannot check a SHA-256, so the PUT signs the exact
+    /// length (<c>x-goog-content-length-range: N,N</c>) and the octet-stream Content-Type, and
+    /// returns both as the headers the client must send. fake-gcs-server does not validate
+    /// signatures (see above), so this checks what was signed and that the PUT lands.</summary>
+    [Fact]
+    public async Task GenerateUploadUrlSignsTheExactLength()
+    {
+        var payload = Encoding.UTF8.GetBytes("client-vended upload");
+        using var storage = NewStorage();
+
+        var uploadUrl = await storage.GenerateUploadUrlAsync(
+            payload.Length, Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(payload)), CancellationToken.None);
+
+        Assert.Equal($"{payload.Length},{payload.Length}", uploadUrl.Headers["x-goog-content-length-range"]);
+        Assert.Equal("application/octet-stream", uploadUrl.Headers["Content-Type"]);
+        var signedHeaders = Uri.UnescapeDataString(
+            Regex.Match(uploadUrl.UploadUrlValue, "(?i)X-Goog-SignedHeaders=([^&]+)").Groups[1].Value);
+        Assert.Equal("content-type;host;x-goog-content-length-range", signedHeaders);
+
+        using var request = new HttpRequestMessage(HttpMethod.Put, RewriteToEmulator(uploadUrl.UploadUrlValue))
+        {
+            Content = new ByteArrayContent(payload),
+        };
+        request.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
+        request.Headers.TryAddWithoutValidation("x-goog-content-length-range", uploadUrl.Headers["x-goog-content-length-range"]);
+        using var put = await s_http.SendAsync(request);
+        Assert.True(put.IsSuccessStatusCode, $"PUT failed: {put.StatusCode}");
+    }
+
     private GcsStorage NewStorage() =>
         GcsStorage.CreateBuilder(GcsFixture.Bucket)
             .WithClient(fixture.Sdk, fixture.Signer)

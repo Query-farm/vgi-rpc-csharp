@@ -65,6 +65,9 @@ public sealed class HttpRpcClientOptions
     public long AcceptedMaxResponseBytes { get; init; } = DefaultAcceptedMaxResponseBytes;
 }
 
+/// <summary>What <c>OPTIONS {prefix}/health</c> advertised. <paramref name="UploadUrlVersion"/>
+/// is the upload-URL protocol version from <c>VGI-Upload-URL-Support</c>: 1 for the retired
+/// <c>true</c>, the integer for a positive decimal, and 0 when absent or unparseable.</summary>
 public sealed record HttpServerCapabilities(
     long? MaxRequestBytes,
     long? MaxResponseBytes,
@@ -72,10 +75,22 @@ public sealed record HttpServerCapabilities(
     long? MaxExternalizedResponseBytes,
     bool AcceptMaxResponseBytesSupport,
     bool ExternalizationEnabled,
-    bool UploadUrlSupport,
+    int UploadUrlVersion,
     bool StickyEnabled,
     long? StickyDefaultTtl,
     IReadOnlyList<string> StickyEchoHeaders,
-    IReadOnlyList<ContentEncoding> SupportedEncodings);
+    IReadOnlyList<ContentEncoding> SupportedEncodings)
+{
+    /// <summary>Whether the server advertises upload URLs at any protocol version. This client
+    /// uploads only when <see cref="UploadUrlVersion"/> is exactly
+    /// <see cref="HttpRpcClient.UploadUrlProtocolVersion"/>.</summary>
+    public bool UploadUrlSupport => UploadUrlVersion > 0;
+}
 
-public sealed record UploadUrl(string Upload, string Download, DateTimeOffset ExpiresAt);
+/// <summary>One upload the client intends to make: the exact byte length and lowercase-hex SHA-256
+/// of the body it will PUT (upload-URL protocol v2).</summary>
+public sealed record UploadRequest(long Size, string Sha256);
+
+/// <summary>A server-vended upload URL pair. <paramref name="Headers"/> are the headers the PUT
+/// MUST carry, verbatim (never <c>Content-Length</c>).</summary>
+public sealed record UploadUrl(string Upload, string Download, DateTimeOffset ExpiresAt, IReadOnlyDictionary<string, string> Headers);

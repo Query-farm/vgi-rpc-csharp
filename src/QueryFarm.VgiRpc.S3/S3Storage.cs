@@ -102,24 +102,34 @@ public sealed class S3Storage : IExternalStorage, IUploadUrlProvider, IAsyncDisp
 
     /// <summary>Vends a pre-signed PUT/GET URL pair for the same new object — S3 pre-signed URLs
     /// are method-bound (see <see cref="UploadUrl"/>'s doc comment), so a caller must PUT to
-    /// <see cref="UploadUrl.UploadUrlValue"/> and later GET from <see cref="UploadUrl.DownloadUrl"/>.</summary>
-    public async Task<UploadUrl> GenerateUploadUrlAsync(Schema schema, CancellationToken cancellationToken)
+    /// <see cref="UploadUrl.UploadUrlValue"/> and later GET from <see cref="UploadUrl.DownloadUrl"/>.
+    /// The PUT signs <c>Content-Length</c> and <c>x-amz-checksum-sha256</c>, so S3/R2 itself
+    /// rejects a body of another length or digest; the checksum header is returned in
+    /// <see cref="UploadUrl.Headers"/> for the client to send verbatim.</summary>
+    public async Task<UploadUrl> GenerateUploadUrlAsync(long size, string sha256Hex, CancellationToken cancellationToken)
     {
+        ArgumentOutOfRangeException.ThrowIfLessThan(size, 1);
+        var checksum = UploadDigest.HexToBase64(sha256Hex);
         var key = _keyPrefix + Guid.NewGuid().ToString("D") + ".arrow";
         var expires = DateTime.UtcNow.Add(_presignDuration);
 
         // Deliberately NOT setting ContentType here (unlike UploadAsync's own PUT, which this
         // class fully controls): GetPreSignedUrlRequest.ContentType becomes part of what's
         // signed, so it would force whoever PUTs to uploadUrl to send that exact Content-Type
-        // header too, or SigV4 rejects the request as a signature mismatch — a coupling this
-        // hand-off to an external caller shouldn't impose.
+        // header too. Content-Length and the checksum ARE signed (X-Amz-SignedHeaders
+        // content-length;host;x-amz-checksum-sha256): that is the point of upload-URL v2.
         var putRequest = NewPresignRequest(key, HttpVerb.PUT, expires);
+        putRequest.Headers[ChecksumSha256Header] = checksum;
+        putRequest.Headers.ContentLength = size;
         var getRequest = NewPresignRequest(key, HttpVerb.GET, expires);
 
         var uploadUrl = await _client.GetPreSignedURLAsync(putRequest).ConfigureAwait(false);
         var downloadUrl = await _client.GetPreSignedURLAsync(getRequest).ConfigureAwait(false);
-        return new UploadUrl(uploadUrl, downloadUrl, new DateTimeOffset(expires, TimeSpan.Zero));
+        return new UploadUrl(uploadUrl, downloadUrl, new DateTimeOffset(expires, TimeSpan.Zero),
+            new Dictionary<string, string> { [ChecksumSha256Header] = checksum });
     }
+
+    private const string ChecksumSha256Header = "x-amz-checksum-sha256";
 
     /// <summary>Builds a <see cref="GetPreSignedUrlRequest"/> for <paramref name="key"/>, applying
     /// <see cref="_presignProtocol"/> only when a custom endpoint set it — <see cref="Protocol"/>

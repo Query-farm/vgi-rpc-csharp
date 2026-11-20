@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text;
 using Amazon;
 using Amazon.Runtime;
@@ -120,9 +121,11 @@ public sealed class S3StorageIntegrationTests(S3Fixture fixture) : IClassFixture
         var payload = Encoding.UTF8.GetBytes("client-vended upload");
 
         await using var storage = NewStorage();
-        var uploadUrl = await storage.GenerateUploadUrlAsync(s_dummySchema, CancellationToken.None);
+        var uploadUrl = await storage.GenerateUploadUrlAsync(payload.Length, Sha(payload), CancellationToken.None);
+        Assert.Equal(Convert.ToBase64String(SHA256.HashData(payload)), uploadUrl.Headers["x-amz-checksum-sha256"]);
+        Assert.DoesNotContain(uploadUrl.Headers.Keys, k => k.Equals("Content-Length", StringComparison.OrdinalIgnoreCase));
 
-        using var put = await s_http.PutAsync(new Uri(uploadUrl.UploadUrlValue), new ByteArrayContent(payload));
+        using var put = await PutAsync(uploadUrl, payload);
         Assert.Equal(System.Net.HttpStatusCode.OK, put.StatusCode);
 
         using var get = await s_http.GetAsync(uploadUrl.DownloadUrl);
@@ -132,6 +135,48 @@ public sealed class S3StorageIntegrationTests(S3Fixture fixture) : IClassFixture
         // The GET url is not authorized for PUT and vice versa — each is bound to its own method.
         using var getUsedAsPut = await s_http.PutAsync(new Uri(uploadUrl.DownloadUrl), new ByteArrayContent(payload));
         Assert.Equal(System.Net.HttpStatusCode.Forbidden, getUsedAsPut.StatusCode);
+    }
+
+    /// <summary>Upload-URL v2: the PUT is signed for the exact length and SHA-256, so storage
+    /// itself refuses a same-length body with other bytes, and a body of another length.</summary>
+    [Fact]
+    public async Task GenerateUploadUrlIsSignedForSizeAndDigest()
+    {
+        var payload = Encoding.UTF8.GetBytes("client-vended upload");
+        await using var storage = NewStorage();
+
+        var sameLength = await storage.GenerateUploadUrlAsync(payload.Length, Sha(payload), CancellationToken.None);
+        var corrupted = (byte[])payload.Clone();
+        corrupted[0] ^= 0xFF;
+        using (var refused = await PutAsync(sameLength, corrupted))
+        {
+            Assert.False(refused.IsSuccessStatusCode, $"corrupted body accepted: {refused.StatusCode}");
+        }
+
+        var otherLength = await storage.GenerateUploadUrlAsync(payload.Length, Sha(payload), CancellationToken.None);
+        using (var refused = await PutAsync(otherLength, [.. payload, (byte)'!']))
+        {
+            Assert.False(refused.IsSuccessStatusCode, $"longer body accepted: {refused.StatusCode}");
+        }
+
+        using var missing = await s_http.GetAsync(otherLength.DownloadUrl);
+        Assert.False(missing.IsSuccessStatusCode);
+    }
+
+    private static string Sha(byte[] data) => Convert.ToHexStringLower(SHA256.HashData(data));
+
+    private static async Task<HttpResponseMessage> PutAsync(QueryFarm.VgiRpc.External.UploadUrl uploadUrl, byte[] body)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Put, new Uri(uploadUrl.UploadUrlValue))
+        {
+            Content = new ByteArrayContent(body),
+        };
+        foreach (var (name, value) in uploadUrl.Headers)
+        {
+            request.Headers.TryAddWithoutValidation(name, value);
+        }
+
+        return await s_http.SendAsync(request);
     }
 
     private S3Storage NewStorage() =>
