@@ -15,11 +15,13 @@ namespace QueryFarm.VgiRpc.Http.OAuth;
 /// (<c>{issuer}/.well-known/openid-configuration</c>), with automatic key-set refresh on an
 /// unknown <c>kid</c> — <see cref="ConfigurationManager{T}"/> handles both natively, which is
 /// most of why this is far shorter than Python's hand-rolled thread-safe cache-with-refresh: the
-/// framework already provides it. Unlike Python's <c>jwt_authenticate</c>, this only supports the
-/// discovery flow — a caller-supplied raw <c>jwks_uri</c> (skipping discovery entirely) isn't
-/// wired up yet; add it if a deployment needs it.
+/// framework already provides it. This overload only supports the discovery flow; for a raw
+/// <c>jwks_uri</c>, an algorithm allow-list, a required <c>typ</c>/<c>exp</c>, a single audience,
+/// claims published to <c>AuthContext</c> and a JWKS cache that fails closed, use
+/// <see cref="Create(JwtAuthOptions)"/>, the full analog of the reference's
+/// <c>jwt_authenticate</c>.
 /// </summary>
-public static class JwtAuth
+public static partial class JwtAuth
 {
     /// <summary>
     /// Builds an <see cref="RpcHttpEndpoints.AuthenticateDelegate"/> that validates Bearer JWTs.
