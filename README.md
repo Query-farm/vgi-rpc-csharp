@@ -272,6 +272,33 @@ delegate can validate bearer tokens, client certificates, or application-specifi
 before dispatch. `QueryFarm.VgiRpc.Http.OAuth` adds JWT/JWKS validation, protected-resource
 metadata, and an OAuth 2.0 PKCE browser flow.
 
+`JwtAuth.Create(new JwtAuthOptions { ... })` is the full analog of the reference's
+`jwt_authenticate`: a raw `JwksUri` (or OIDC discovery), and opt-in hardening for RFC 9068 access
+tokens. An accepted token is published as the request's `AuthContext`, with its claims in their
+JSON types.
+
+```csharp
+var authenticate = JwtAuth.Create(new JwtAuthOptions
+{
+    Issuers = ["https://auth.example.com"],
+    Audiences = ["https://api.example.com"],
+    JwksUri = "https://auth.example.com/.well-known/jwks.json",
+    Algorithms = ["ES256"],                      // none and HS* are always refused
+    RequiredTyp = "at+jwt",                      // case-insensitive, application/ optional
+    RequireExp = true,
+    SingleAudience = true,                       // aud must be exactly one value
+    Leeway = TimeSpan.FromSeconds(60),           // on exp and nbf
+    JwksMaxAge = TimeSpan.FromMinutes(10),       // or a shorter Cache-Control: max-age
+    JwksRefreshMinInterval = TimeSpan.FromSeconds(60),
+});
+app.MapVgiRpc(server, authenticate: authenticate);
+```
+
+With `JwksMaxAge` the keys are discarded when it passes, and if the re-fetch fails the request is a
+503 with `Retry-After` (`AuthUnavailableException`), never a check against stale keys. An unknown
+`kid` re-fetches the JWKS at most once per `JwksRefreshMinInterval`. An expired token is a 401 with
+`VGI-Auth-Reason: expired_credential`; every other failure is `invalid_credential`.
+
 Whenever `PeerIdentityAuthentication.Compose` is configured with any identity
 provider, the application must install the physical-peer snapshot middleware.
 This requirement also applies to direct LocalAPI providers. Install it before
