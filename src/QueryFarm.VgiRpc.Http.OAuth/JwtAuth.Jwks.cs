@@ -159,10 +159,20 @@ public static partial class JwtAuth
                 throw new AuthFailure(AuthReason.InvalidCredential, "Invalid JWT: payload is not a JSON object");
             }
 
+            // NumericDate claims are JSON numbers (RFC 7519 §2); IdentityModel also reads a
+            // numeric string, which the reference rejects.
+            if (!IsNumericDateOrAbsent(claims, "exp") || !IsNumericDateOrAbsent(claims, "nbf") || !IsNumericDateOrAbsent(claims, "iat"))
+            {
+                throw new AuthFailure(AuthReason.InvalidCredential, "Invalid JWT: exp, nbf and iat must be numbers");
+            }
+
             var principal = claims.TryGetValue(principalClaim, out var value) ? value as string ?? value?.ToString() ?? "" : "";
             PeerIdentityAuthentication.SetAuth(context, new AuthContext(domain, authenticated: true, principal, claims));
         };
     }
+
+    private static bool IsNumericDateOrAbsent(Dictionary<string, object?> claims, string name) =>
+        !claims.TryGetValue(name, out var value) || value is long or double;
 
     private static string[] NonEmpty(IReadOnlyList<string>? values, string name)
     {

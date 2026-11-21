@@ -244,6 +244,15 @@ public sealed class JwtAuthOptionsTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task NumericDatesMustBeJsonNumbers()
+    {
+        var authenticate = Hosted();
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        Assert.Equal(AuthReason.InvalidCredential, await Rejected(authenticate, Pass(Claims(c => c["exp"] = (now + 900).ToString(System.Globalization.CultureInfo.InvariantCulture)))));
+        Assert.Equal(AuthReason.InvalidCredential, await Rejected(authenticate, Pass(Claims(c => c["nbf"] = now.ToString(System.Globalization.CultureInfo.InvariantCulture)))));
+    }
+
+    [Fact]
     public async Task ATamperedOrMalformedPassIsRefused()
     {
         var authenticate = Hosted();
