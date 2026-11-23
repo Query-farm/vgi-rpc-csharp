@@ -588,7 +588,12 @@ public static class ValueCodec
     /// is a tiny in-memory serialization (never real I/O), doesn't need custom_metadata, and
     /// benefits from not needing to bridge to async for what's fundamentally synchronous work.
     /// </summary>
-    private static IArrowArray BuildEmbeddedRecordArray(object value)
+    private static IArrowArray BuildEmbeddedRecordArray(object value) =>
+        new BinaryArray.Builder().Append(EncodeRecord(value)).Build();
+
+    /// <summary>A record serialized the way a nested record field is (schema + one row + EOS);
+    /// also the byte form of a record wrapped in a <see cref="Streaming.StateRef"/>.</summary>
+    internal static byte[] EncodeRecord(object value)
     {
         var clrType = value.GetType();
         var innerSchema = SchemaDerivation.InnerSchemaFor(clrType);
@@ -610,8 +615,11 @@ public static class ValueCodec
             writer.WriteEnd();
         }
 
-        return new BinaryArray.Builder().Append(stream.ToArray()).Build();
+        return stream.ToArray();
     }
+
+    /// <summary>The inverse of <see cref="EncodeRecord"/>.</summary>
+    internal static object DecodeRecord(byte[] bytes, Type clrType) => ExtractEmbeddedRecord(bytes, clrType);
 
     private static object ExtractEmbeddedRecord(byte[] bytes, Type clrType)
     {

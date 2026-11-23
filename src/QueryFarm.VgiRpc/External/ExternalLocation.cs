@@ -440,6 +440,17 @@ public sealed record UploadUrl(
     /// <summary>Headers the client must send on the PUT; empty when there are none.</summary>
     public IReadOnlyDictionary<string, string> Headers { get; init; } =
         Headers ?? new Dictionary<string, string>();
+
+    /// <summary>The storage id of the object the PUT creates (an S3/GCS key, a vendor
+    /// <c>object_id</c>, a fake-storage blob id). Every provider must supply it (protocol 3.4,
+    /// <c>STATE_REF_V1.md</c> §10.2): the server seals it into the grant's argument reference and
+    /// refuses a grant whose provider returned none.</summary>
+    public string ObjectId { get; init; } = "";
+
+    /// <summary>The sealed argument reference the server returned for this upload (the
+    /// <c>__upload_url__/init</c> <c>ref</c> column). Set only on the client side, from the
+    /// response; providers leave it empty.</summary>
+    public byte[] Ref { get; init; } = [];
 }
 
 /// <summary>Generates pre-signed upload URL pairs. Implementations must be thread-safe.</summary>
@@ -522,6 +533,16 @@ public sealed class ServerExternalConfig
     /// <summary>Callback invoked before the server fetches a client-vended pointer URL — throw to
     /// reject. Defaults to <see cref="ExternalFetch.HttpsOnlyValidator"/>.</summary>
     public Action<string>? UrlValidator { get; init; } = ExternalFetch.HttpsOnlyValidator;
+
+    /// <summary>A copy with <see cref="FetchConfig"/> replaced.</summary>
+    public ServerExternalConfig WithFetchConfig(FetchConfig fetchConfig) => new()
+    {
+        Storage = Storage,
+        ExternalizeThresholdBytes = ExternalizeThresholdBytes,
+        FetchConfig = fetchConfig,
+        Compression = Compression,
+        UrlValidator = UrlValidator,
+    };
 }
 
 /// <summary>

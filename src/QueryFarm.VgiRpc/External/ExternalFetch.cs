@@ -189,8 +189,31 @@ public static class ExternalFetch
 /// Python's parallel range-request fetcher.</summary>
 public sealed class FetchConfig
 {
-    /// <summary>Hard cap on encoded/on-wire download size.</summary>
-    public long MaxFetchBytes { get; init; } = 256 * 1024 * 1024;
+    /// <summary>The default <see cref="MaxFetchBytes"/>: 256 MiB.</summary>
+    public const long DefaultMaxFetchBytes = 256L * 1024 * 1024;
+
+    private readonly long? _maxFetchBytes;
+
+    /// <summary>Hard cap on encoded/on-wire download size (default <see cref="DefaultMaxFetchBytes"/>).</summary>
+    public long MaxFetchBytes
+    {
+        get => _maxFetchBytes ?? DefaultMaxFetchBytes;
+        init => _maxFetchBytes = value;
+    }
+
+    /// <summary>Whether <see cref="MaxFetchBytes"/> was set rather than defaulted: an explicit fetch
+    /// cap below the advertised upload cap refuses startup, a defaulted one is raised to it (fix 1,
+    /// see <c>MapVgiRpc</c>).</summary>
+    public bool MaxFetchBytesIsExplicit => _maxFetchBytes is not null;
+
+    /// <summary>A copy with <see cref="MaxFetchBytes"/> replaced (and so explicit).</summary>
+    public FetchConfig WithMaxFetchBytes(long maxFetchBytes) => new()
+    {
+        MaxFetchBytes = maxFetchBytes,
+        MaxDecompressedBytes = MaxDecompressedBytes,
+        MaxRedirects = MaxRedirects,
+        Timeout = Timeout,
+    };
 
     /// <summary>Hard cap after content decoding. <see langword="null"/> means
     /// <c>16 * MaxFetchBytes</c> (matching Python's default).</summary>

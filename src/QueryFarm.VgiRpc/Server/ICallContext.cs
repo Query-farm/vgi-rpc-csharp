@@ -105,4 +105,76 @@ public interface ICallContext
     /// <c>"RuntimeError"</c>).</exception>
     void RespondWithExternalRef(External.ExternalRef reference) =>
         throw new RpcException("RuntimeError", "an ExternalRef can only answer a unary call");
+
+    /// <summary>
+    /// Wraps <paramref name="value"/> in a <see cref="Streaming.StateRef"/>: stream state that does
+    /// not change across turns (<c>STATE_REF_V1.md</c> §2). Hold the result in the stream's state
+    /// and read it back on any turn with <see cref="Resolve(Streaming.StateRef)"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Valid only on the context handed to a stream method itself, while it builds the stream
+    /// (HTTP <c>/init</c>, or stream construction on the byte-stream transports). Every other
+    /// context -- unary calls, every turn (the first producer turn included), cancel -- throws
+    /// <c>state_ref_misuse</c>. State transitions copy the reference; they never create another.
+    /// Within one init, the same value (byte-equal) gives the same reference.
+    /// </para>
+    /// <para>
+    /// vgi-rpc-csharp keeps stream state in memory on every transport (single-replica in 3.4,
+    /// §5.4), so the reference simply holds the value: nothing is encoded, stored or fetched.
+    /// Treat <paramref name="value"/> as immutable afterwards.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="RpcException"><c>state_ref_misuse</c> outside a stream's init.</exception>
+    Streaming.StateRef StateRef(byte[] value) =>
+        throw StateRefErrors.StateRefMisuse(null, null);
+
+    /// <summary>Wraps a record (serialized the way a nested record field is) in a
+    /// <see cref="Streaming.StateRef"/>; see <see cref="StateRef(byte[])"/>. The same instance,
+    /// or a byte-equal record, gives the same reference, and a typed
+    /// <see cref="Resolve{T}(Streaming.StateRef)"/> returns this instance.</summary>
+    /// <exception cref="RpcException"><c>state_ref_misuse</c> outside a stream's init.</exception>
+    Streaming.StateRef StateRef<T>(T record)
+        where T : class =>
+        throw StateRefErrors.StateRefMisuse(null, null);
+
+    /// <summary>The value's bytes (§5.3). Valid on every turn and every transport.</summary>
+    /// <exception cref="RpcException"><c>invalid_state_ref</c> for a reference that does not
+    /// decode (an unknown form or codec, or a stored tag, which this server never mints).</exception>
+    byte[] Resolve(Streaming.StateRef reference)
+    {
+        ArgumentNullException.ThrowIfNull(reference);
+        return reference.ResolveBytes(Streaming.TokenCodec.MaxTokenBytes);
+    }
+
+    /// <summary>The value as a record: the instance it was created from when the reference was
+    /// made from one, else its bytes decoded as <typeparamref name="T"/>.</summary>
+    /// <exception cref="RpcException"><c>invalid_state_ref</c>, as
+    /// <see cref="Resolve(Streaming.StateRef)"/>, or when the bytes are not a
+    /// <typeparamref name="T"/>.</exception>
+    T Resolve<T>(Streaming.StateRef reference)
+        where T : class
+    {
+        ArgumentNullException.ThrowIfNull(reference);
+        return reference.ResolveRecord<T>(Streaming.TokenCodec.MaxTokenBytes);
+    }
+
+    /// <summary>
+    /// Resolves an argument reference minted by this server's <c>__upload_url__/init</c> grant
+    /// (<c>STATE_REF_V1.md</c> §10.2): opens <paramref name="reference"/> under this call's
+    /// principal, checks its sealed size and SHA-256 equal <paramref name="size"/> and
+    /// <paramref name="sha256"/>, then fetches through the process's object cache and verifies.
+    /// </summary>
+    /// <param name="reference">The sealed reference (the grant's <c>ref</c> column).</param>
+    /// <param name="size">The byte length claimed alongside it.</param>
+    /// <param name="sha256">The SHA-256 claimed alongside it, 64 lowercase hex characters.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The verified object bytes. Treat them as immutable: the object cache shares
+    /// them.</returns>
+    /// <exception cref="RpcException"><c>invalid_arguments_ref</c> (does not open for this caller,
+    /// differs from the claimed values, no object storage, or not an HTTP server: byte-stream
+    /// transports vend no grants), <c>arguments_ref_integrity</c> (fetched bytes differ),
+    /// <c>arguments_ref_missing</c> (object gone), <c>storage_unavailable</c>.</exception>
+    Task<byte[]> ResolveArgumentRefAsync(byte[] reference, long size, string sha256, CancellationToken cancellationToken = default) =>
+        throw StateRefErrors.InvalidArgumentsRef("argument references can only be resolved by an HTTP server");
 }

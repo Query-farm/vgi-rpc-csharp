@@ -757,7 +757,7 @@ public sealed class RpcServer
         using var ownedLargeBytesArguments = new LargeBytesBufferArgumentsOwner(args);
         using var shmForUnary = shm;
         await using var writer = new WireWriter(transport.Output, info.ResultSchema);
-        var context = info.HasContextParameter ? new BufferedCallContext(unary: true) : null;
+        var context = info.HasContextParameter ? new BufferedCallContext(unary: true, protocol: binding.Name, method: info.WireName) : null;
         var status = "ok";
         var errorType = "";
         var errorMessage = "";
@@ -863,7 +863,11 @@ public sealed class RpcServer
         var hookInfo = new DispatchHookInfo(info.WireName, "stream", binding.Name, _serverId);
         var hookToken = _dispatchHook?.OnDispatchStart(hookInfo);
 
-        var invokeContext = info.HasContextParameter ? new BufferedCallContext() : null;
+        // The stream method's own context is the only one where ctx.StateRef is valid
+        // (STATE_REF_V1.md §2.1): every turn below gets a StreamCallContext, which refuses it.
+        var invokeContext = info.HasContextParameter
+            ? new BufferedCallContext(protocol: binding.Name, method: info.WireName, stateRefs: new StateRefScope(binding.Name, info.WireName))
+            : null;
         IRpcStream stream;
         using var ownedLargeBytesArguments = new LargeBytesBufferArgumentsOwner(args);
         try
@@ -987,7 +991,7 @@ public sealed class RpcServer
             // always accepts an ICallContext?, independent of the constructor method's shape. A
             // StreamState reading ctx.Session (sticky sessions, docs/roadmap.md M10) needs a real
             // object here even when the constructor method itself took no ctx param.
-            var turnContext = new StreamCallContext(collector);
+            var turnContext = new StreamCallContext(collector, binding.Name, info.WireName);
             try
             {
                 // Per-turn SHM pointer resolution (M14) — reuses the ONE segment attached at
@@ -1185,13 +1189,19 @@ public sealed class RpcServer
     /// <summary>Forwards a stream turn's <see cref="ICallContext.EmitLog"/> calls into that
     /// turn's <see cref="OutputCollector"/> — matching Python's unified <c>ctx.emit_client_log</c>/
     /// <c>out.client_log()</c> (the same sink) during stream processing.</summary>
-    private sealed class StreamCallContext(OutputCollector collector) : ICallContext
+    private sealed class StreamCallContext(OutputCollector collector, string protocol, string method) : ICallContext
     {
         private readonly PeerConnectionIdentity _identity = PeerIdentityScope.Current;
         public AuthContext Auth => _identity.Auth;
         public PeerEvidenceSet PeerEvidence => _identity.Evidence;
         public void EmitLog(VgiLogLevel level, string message, IReadOnlyDictionary<string, object?>? extra = null) =>
             collector.ClientLog(level, message, extra);
+
+        // A turn is a continuation: StateRef refuses, naming the method (STATE_REF_V1.md §2.1).
+        public StateRef StateRef(byte[] value) => StateRefScope.Create(null, value, protocol, method);
+
+        public StateRef StateRef<T>(T record)
+            where T : class => StateRefScope.Create(null, record, protocol, method);
     }
 
     /// <summary>
@@ -1200,9 +1210,16 @@ public sealed class RpcServer
     /// runs to completion before <see cref="ServeOneAsync"/> gets a chance to write anything,
     /// buffer-then-flush produces the same wire sequence true incremental interleaving would.
     /// </summary>
-    private sealed class BufferedCallContext(bool unary = false) : ICallContext
+    private sealed class BufferedCallContext(bool unary = false, string? protocol = null, string? method = null, StateRefScope? stateRefs = null) : ICallContext
     {
         private readonly PeerConnectionIdentity _identity = PeerIdentityScope.Current;
+
+        // Non-null only on a stream method's own context (see ServeStreamAsync).
+        public StateRef StateRef(byte[] value) => StateRefScope.Create(stateRefs, value, protocol, method);
+
+        public StateRef StateRef<T>(T record)
+            where T : class => StateRefScope.Create(stateRefs, record, protocol, method);
+
         public AuthContext Auth => _identity.Auth;
         public PeerEvidenceSet PeerEvidence => _identity.Evidence;
         public List<LogMessage> Buffered { get; } = [];
