@@ -170,6 +170,7 @@ public static class ValueCodec
         {
             StringType => new StringArray.Builder().Append((string)value).Build(),
             BinaryType when value is byte[] bytes => new BinaryArray.Builder().Append(bytes).Build(),
+            BinaryType when value is IRawBinary raw => new BinaryArray.Builder().Append(raw.RawBinary.Span).Build(),
             BinaryType when value is RecordBatch recordBatchValue => BuildRecordBatchBinaryArray(recordBatchValue),
             BinaryType when value is Schema schemaValue => BuildSchemaBinaryArray(schemaValue),
             BinaryType => BuildEmbeddedRecordArray(value),
@@ -1176,6 +1177,7 @@ public static class ValueCodec
             BinaryArray a when effectiveType == typeof(byte[]) => a.GetBytes(index).ToArray(),
             BinaryArray a when effectiveType == typeof(RecordBatch) => ExtractRecordBatchFromBinary(a.GetBytes(index).ToArray()),
             BinaryArray a when effectiveType == typeof(Schema) => ExtractSchemaFromBinary(a.GetBytes(index).ToArray()),
+            BinaryArray a when RawBinaryFactory.IsRawBinary(effectiveType) => RawBinaryFactory.Create(effectiveType, a.GetBytes(index).ToArray()),
             BinaryArray a => ExtractEmbeddedRecord(a.GetBytes(index).ToArray(), effectiveType),
             BooleanArray a => a.GetValue(index)!.Value,
             Int8Array a => a.Values[index],

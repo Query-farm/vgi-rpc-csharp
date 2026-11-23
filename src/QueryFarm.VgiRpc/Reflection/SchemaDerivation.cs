@@ -288,6 +288,13 @@ public static class SchemaDerivation
             return BinaryType.Default;
         }
 
+        // A raw-preserving value (IRawBinary) is binary at every nesting level: its bytes are a
+        // complete IPC stream held verbatim, never a struct to reflect over.
+        if (RawBinaryFactory.IsRawBinary(type))
+        {
+            return BinaryType.Default;
+        }
+
         if (TryGetElementType(type, out var elementType))
         {
             // A collection element is always "nested" for the dataclass two-tier rule,
