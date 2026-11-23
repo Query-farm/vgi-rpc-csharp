@@ -6,7 +6,7 @@ env:
 
 on:
   push:
-    branches: [main, protocol-3.4]  # TODO(release-wave): drop protocol-3.4
+    branches: [main]
   pull_request:
   workflow_dispatch:
   # Python reference changes do not trigger this repo, so test against them daily.
@@ -81,7 +81,6 @@ jobs:
         with:
           repository: Query-farm/vgi-rpc-python
           path: .ci/vgi-rpc-python
-          ref: protocol-3.4  # TODO(release-wave): back to main once upload-URL v2 / 3.4 ships
       - uses: actions/setup-dotnet@v4
         with:
           global-json-file: global.json
@@ -179,7 +178,6 @@ jobs:
         with:
           repository: Query-farm/vgi-rpc-python
           path: _conformance/vgi-rpc
-          ref: protocol-3.4  # TODO(release-wave): back to main once upload-URL v2 / 3.4 ships
       - uses: actions/setup-dotnet@v4
         with:
           global-json-file: global.json
@@ -270,7 +268,6 @@ jobs:
         with:
           repository: Query-farm/vgi-rpc-python
           path: _conformance/vgi-rpc
-          ref: protocol-3.4  # TODO(release-wave): back to main once upload-URL v2 / 3.4 ships
       # The cross-language client-role adapter is currently shared by the Rust port. It speaks a
       # language-neutral JSONL + Arrow IPC driver protocol; this job substitutes the C# driver.
       - uses: actions/checkout@v4
@@ -354,22 +351,17 @@ jobs:
         with:
           repository: Query-farm/vgi-rpc-python
           path: _conformance/vgi-rpc
-          ref: protocol-3.4  # TODO(release-wave): back to main once upload-URL v2 / 3.4 ships
       # This repository owns the language-neutral client-role pytest adapter used for every
-      # worker. VGI_CLIENT_DRIVER substitutes the C# JSONL + Arrow IPC driver. Pinned to the
-      # protocol-3.4 branch with the reference above: the Rust worker on main still speaks
-      # upload-URL v1, which the 3.4 client refuses.
+      # worker. VGI_CLIENT_DRIVER substitutes the C# JSONL + Arrow IPC driver.
       - uses: actions/checkout@v4
         with:
           repository: Query-farm/vgi-rpc-rust
           path: _conformance/vgi-rpc-rust
-          ref: protocol-3.4  # TODO(release-wave): back to main once 3.4 ships
       - uses: actions/checkout@v4
         if: matrix.worker == 'java'
         with:
           repository: Query-farm/vgi-rpc-java
           path: _conformance/vgi-rpc-java
-          ref: protocol-3.4  # the four 3.4 conformance methods; TODO(release-wave): back to main once 3.4 ships
       # The response-budget contract is coordinated across RPC ports, so exercise the current
       # Go implementation rather than the older release pinned by the high-level vgi-go SDK.
       - uses: actions/checkout@v4
@@ -377,14 +369,12 @@ jobs:
         with:
           repository: Query-farm/vgi-rpc-go
           path: _conformance/vgi-rpc-go
-          ref: protocol-3.4  # the four 3.4 conformance methods; TODO(release-wave): back to main once 3.4 ships
       # The response-budget contract is coordinated across RPC ports, so test TypeScript main.
       - uses: actions/checkout@v4
         if: matrix.worker == 'typescript'
         with:
           repository: Query-farm/vgi-rpc-typescript
           path: _conformance/vgi-rpc-typescript
-          ref: protocol-3.4  # the four 3.4 conformance methods; TODO(release-wave): back to main once 3.4 ships
       - uses: actions/setup-dotnet@v4
         with:
           global-json-file: global.json
