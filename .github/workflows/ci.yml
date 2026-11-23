@@ -254,6 +254,13 @@ jobs:
       # secondary-protocol, identity auth-unavailable and traceback groups included. conftest.py
       # publishes the worker and client driver at session start.
       - run: python -m pytest test_csharp_conformance.py -v
+      # The blob-vendor client against the reference's fake vendor, installed above with the
+      # reference (its `vgi-rpc-fake-vendor` entry point). Without the variable these tests skip.
+      - name: Blob-vendor client against the fake vendor
+        run: >-
+          VGI_RPC_FAKE_VENDOR_BIN="$(command -v vgi-rpc-fake-vendor)"
+          dotnet test test/QueryFarm.VgiRpc.Http.Tests -c Release
+          --filter "FullyQualifiedName~BlobVendorTests"
 
   client-conformance:
     runs-on: ubuntu-latest
@@ -362,6 +369,7 @@ jobs:
         with:
           repository: Query-farm/vgi-rpc-java
           path: _conformance/vgi-rpc-java
+          ref: protocol-3.4  # the four 3.4 conformance methods; TODO(release-wave): back to main once 3.4 ships
       # The response-budget contract is coordinated across RPC ports, so exercise the current
       # Go implementation rather than the older release pinned by the high-level vgi-go SDK.
       - uses: actions/checkout@v4
@@ -369,12 +377,14 @@ jobs:
         with:
           repository: Query-farm/vgi-rpc-go
           path: _conformance/vgi-rpc-go
+          ref: protocol-3.4  # the four 3.4 conformance methods; TODO(release-wave): back to main once 3.4 ships
       # The response-budget contract is coordinated across RPC ports, so test TypeScript main.
       - uses: actions/checkout@v4
         if: matrix.worker == 'typescript'
         with:
           repository: Query-farm/vgi-rpc-typescript
           path: _conformance/vgi-rpc-typescript
+          ref: protocol-3.4  # the four 3.4 conformance methods; TODO(release-wave): back to main once 3.4 ships
       - uses: actions/setup-dotnet@v4
         with:
           global-json-file: global.json
