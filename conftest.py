@@ -72,3 +72,48 @@ def pytest_sessionstart(session: object) -> None:
 
     publish_worker()
     publish_client_driver()
+
+
+# ---------------------------------------------------------------------------------------------
+# Expected skips. A skip whose reason is not listed here fails the run: a skip nobody listed is a
+# case nobody ran, and "All tests passed" with a quiet new skip hides a coverage loss. Each entry
+# names why this runner cannot run the case.
+EXPECTED_SKIP_REASONS: dict[str, str] = {
+    # STATE_REF_V1.md §5.4 / §15: single-replica in 3.4, so the cases that need stored tags,
+    # cross-replica turns, the cursor rule, codec bytes or tag expiry are capability-gated.
+    "single-replica SDK: HTTP stream state is never serialized, so StateRefs are in-memory and inline only "
+    "(STATE_REF_V1.md §5.4)": "C# keeps HTTP stream state in server memory in 3.4 (decision 17)",
+    # Pre-existing runner gaps (no worker variant for these fixtures yet).
+    "runner provides no compression-disabled server": "no compression-disabled worker fixture",
+    "runner provides no cache-disabled server": "no call-state cache to disable (state is in memory)",
+    "server does not emit X-Request-ID": "X-Request-ID not implemented by this port",
+    "runner does not expose an isolated conformance resource-soak target": "no resource-soak fixture",
+    "runner provides no conformance_http_serve_start_fail_once_port": "no serve-start-fail-once fixture",
+    "runner provides no conformance_transport_kind_probes": "no transport-kind probe fixture",
+}
+
+_unexpected_skips: list[str] = []
+
+
+def _skip_reason(report: object) -> str:
+    longrepr = getattr(report, "longrepr", None)
+    reason = longrepr[2] if isinstance(longrepr, tuple) and len(longrepr) == 3 else str(longrepr)
+    return reason.removeprefix("Skipped: ")
+
+
+def pytest_runtest_logreport(report: object) -> None:
+    """Record every skip whose reason is not in EXPECTED_SKIP_REASONS (runs on the xdist controller too)."""
+    if getattr(report, "skipped", False) and not getattr(report, "wasxfail", None):
+        reason = _skip_reason(report)
+        if reason not in EXPECTED_SKIP_REASONS:
+            _unexpected_skips.append(f"{getattr(report, 'nodeid', '?')}: {reason}")
+
+
+def pytest_sessionfinish(session: object, exitstatus: int) -> None:
+    """Fail the run on an unlisted skip."""
+    if os.environ.get("PYTEST_XDIST_WORKER") or not _unexpected_skips:
+        return
+    sys.stderr.write("\nUnexpected skips (not in conftest.EXPECTED_SKIP_REASONS):\n")
+    for line in _unexpected_skips:
+        sys.stderr.write(f"  {line}\n")
+    session.exitstatus = 1  # type: ignore[attr-defined]

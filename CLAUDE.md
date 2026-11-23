@@ -103,6 +103,12 @@ The acceptance gate for this port is the same one every other port uses: install
 
 Filled in as each piece lands. Key decisions so far:
 
+- **Protocol 3.4 large values** (`STATE_REF_V1.md`): this port is single-replica in 3.4, so
+  `StateRef` is in-memory only, while the object store, grant `object_id`/`ref`, argument-reference
+  resolution, the object cache and fix 1 are implemented in full. See `docs/wire-protocol.md`'s
+  last section. `conftest.py`'s `EXPECTED_SKIP_REASONS` fails the conformance run on any skip it
+  does not list.
+
 - **Wire framing**: `src/QueryFarm.VgiRpc/Wire/` is a thin layer over a *vendored, patched*
   `Apache.Arrow` (`third_party/apache-arrow-dotnet/`) that adds per-batch `custom_metadata`
   support the stock NuGet package lacks — not a from-scratch FlatBuffers implementation. See

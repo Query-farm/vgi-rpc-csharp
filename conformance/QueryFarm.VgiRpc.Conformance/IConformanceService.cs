@@ -374,6 +374,30 @@ public interface IConformanceService
     [StreamKind(StreamKind.Exchange)]
     Task<RpcStream<StreamState>> ExchangeSessionCounterAsync();
 
+    // StateRef, the object cache and argument references (protocol 3.4, STATE_REF_V1.md §15).
+    // Every port implements all four; the shared suite drives them over raw HTTP and every
+    // transport.
+
+    /// <summary>Holds a <c>StateRef</c> of <c>state_ref_payload(size, compressible, seed)</c>,
+    /// created in this init handler, plus <paramref name="cursorPadding"/> incompressible bytes
+    /// held directly in the state, and resolves it on every exchange. Input
+    /// <c>{override: binary}</c> (a raw encoded ref to resolve instead); output
+    /// <c>{size, sha256, form, ref}</c>. With <paramref name="misuse"/> every exchange calls
+    /// <c>ctx.StateRef</c>, which must fail with <c>state_ref_misuse</c>.</summary>
+    [StreamKind(StreamKind.Exchange)]
+    Task<RpcStream<StreamState>> StateRefExchangeAsync(long size, bool compressible, string seed, bool misuse, long cursorPadding, ICallContext? ctx = null);
+
+    /// <summary>This worker process's object-cache counters.</summary>
+    Task<ObjectCacheStatsResult> ObjectCacheStatsAsync();
+
+    /// <summary>Moves every object-cache entry's fetch time back by <paramref name="seconds"/>;
+    /// returns how many (test hook for the one-day rule).</summary>
+    Task<long> ObjectCacheAgeAsync(long seconds);
+
+    /// <summary>Resolves an argument reference minted by this worker's <c>__upload_url__</c>
+    /// grant, under the caller's principal; returns the SHA-256 hex of the fetched bytes.</summary>
+    Task<string> ResolveArgumentRefAsync(byte[] @ref, long size, string sha256, ICallContext? ctx = null);
+
     // TODO (later milestones — see docs/roadmap.md):
     //   - echo_wide_types / echo_container_wide_types / echo_embedded_arrow / echo_deep_nested /
     //     echo_dict_encoded_string (need a dictionary-encoding attribute override for a plain

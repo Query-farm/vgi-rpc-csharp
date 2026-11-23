@@ -18,7 +18,7 @@ namespace QueryFarm.VgiRpc.ConformanceWorker;
 /// batch back). Wire contract: <c>POST /alloc</c> (optional JSON <c>{"content_encoding": "..."}</c>
 /// body) returns <c>upload_url</c>/<c>download_url</c>; <c>PUT</c> the bytes to <c>upload_url</c>.</para>
 /// </summary>
-public sealed class FakeStorageBackend(string baseUrl) : IExternalStorage, IUploadUrlProvider
+public sealed class FakeStorageBackend(string baseUrl) : IExternalStorage, IUploadUrlProvider, IObjectStore
 {
     /// <summary>
     /// A client that never reuses a connection.
@@ -83,7 +83,57 @@ public sealed class FakeStorageBackend(string baseUrl) : IExternalStorage, IUplo
             UploadUrlValue: allocation.UploadUrl ?? objectUrl,
             DownloadUrl: allocation.DownloadUrl ?? objectUrl,
             ExpiresAt: DateTimeOffset.UtcNow.AddHours(1),
-            Headers: allocation.UploadHeaders);
+            Headers: allocation.UploadHeaders)
+        {
+            ObjectId = allocation.ObjectId ?? throw new InvalidOperationException("fake-storage /alloc returned no object_id"),
+        };
+    }
+
+    /// <summary>The object API's <c>put_object</c>: a sized <c>/alloc</c> with
+    /// <c>"purpose": "object"</c> (counted as <c>object_puts</c>), then a verified PUT.</summary>
+    public async Task<string> PutObjectAsync(byte[] data, CancellationToken cancellationToken)
+    {
+        var body = new Dictionary<string, object>
+        {
+            ["size"] = data.Length,
+            ["sha256_b64"] = Convert.ToBase64String(System.Security.Cryptography.SHA256.HashData(data)),
+            ["purpose"] = "object",
+        };
+        var allocContent = new ByteArrayContent(System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(body));
+        allocContent.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+        using var allocResponse = await s_client.PostAsync($"{_baseUrl}/alloc", allocContent, cancellationToken).ConfigureAwait(false);
+        allocResponse.EnsureSuccessStatusCode();
+        var allocation = await allocResponse.Content.ReadFromJsonAsync<Allocation>(cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidOperationException("fake-storage /alloc returned no body");
+        using var content = new ByteArrayContent(data);
+        content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
+        using var put = new HttpRequestMessage(HttpMethod.Put, allocation.UploadUrl ?? allocation.ObjectUrl) { Content = content };
+        foreach (var (name, value) in allocation.UploadHeaders ?? [])
+        {
+            put.Headers.TryAddWithoutValidation(name, value);
+        }
+
+        using var putResponse = await s_client.SendAsync(put, cancellationToken).ConfigureAwait(false);
+        putResponse.EnsureSuccessStatusCode();
+        return allocation.ObjectId ?? throw new InvalidOperationException("fake-storage /alloc returned no object_id");
+    }
+
+    /// <summary>The object API's <c>get(object_id)</c>: <c>GET /objects/{id}</c> (counted as
+    /// <c>object_gets</c>; 404 is <see cref="ObjectMissingException"/>).</summary>
+    public async Task<byte[]> GetAsync(string objectId, long? maxBytes, CancellationToken cancellationToken)
+    {
+        using var response = await s_client.GetAsync($"{_baseUrl}/objects/{Uri.EscapeDataString(objectId)}", cancellationToken).ConfigureAwait(false);
+        if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            throw new ObjectMissingException("fake storage object is gone");
+        }
+
+        response.EnsureSuccessStatusCode();
+        var data = await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
+        var limit = maxBytes ?? FetchConfig.DefaultMaxFetchBytes;
+        return data.LongLength > limit
+            ? throw new InvalidOperationException($"object is {data.LongLength} bytes, over max_fetch_bytes ({limit})")
+            : data;
     }
 
     /// <summary>
@@ -116,5 +166,8 @@ public sealed class FakeStorageBackend(string baseUrl) : IExternalStorage, IUplo
 
         [JsonPropertyName("upload_headers")]
         public Dictionary<string, string>? UploadHeaders { get; set; }
+
+        [JsonPropertyName("object_id")]
+        public string? ObjectId { get; set; }
     }
 }

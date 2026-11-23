@@ -832,7 +832,7 @@ _ACCESS_LOG_FILTER = "scalar_echo.*,dataclass.echo_point,producer_stream.*,excha
 # reference pins the same value in tests/golden/protocol_hash_vector.json). Pinned literally
 # rather than recomputed from the worker, because recomputing it here would just re-derive
 # whatever this port happens to do and assert that it equals itself.
-_CONFORMANCE_PROTOCOL_HASH = "05479410c96f34410a2b10a4f6a49d59dcfd9d6d1d45ce9a9807d060a3bd6014"
+_CONFORMANCE_PROTOCOL_HASH = "22426518ead543d7e8ca3903280815d5855b9450f46739790fe66804c7e77331"
 
 
 @pytest.mark.parametrize("debug", [False, True], ids=["info", "debug"])
@@ -1619,6 +1619,44 @@ def conformance_protocol_connector(request: pytest.FixtureRequest) -> Callable[.
         return _bind(protocol, transport, request, on_log)
 
     return connect
+
+
+# ---------------------------------------------------------------------------------------------
+# StateRef, the object cache and argument references (protocol 3.4, STATE_REF_V1.md §15).
+#
+# vgi-rpc-csharp is single-replica in 3.4 (§5.4): HTTP stream state lives in server memory, so a
+# StateRef is never encoded, stored or fetched. The empty capability set below makes the shared
+# cases that need serialized state (tests 1 stored half, 2, 3, 4, 5, 10, 12) skip with
+# SINGLE_REPLICA_SKIP_REASON, which EXPECTED_SKIP_REASONS (conftest.py) lists. Those cases skip
+# before they look up conformance_state_ref_short_ttl_port / conformance_cursor_budget_ports, so
+# this runner provides neither. The object-cache and argument-reference cases (6, 7, 8, 11, 13,
+# 14) run in full against the two replicas.
+@pytest.fixture(scope="session")
+def conformance_state_ref_capabilities() -> frozenset[str]:
+    """No "serialized_state": stream state is never serialized (STATE_REF_V1.md §5.4)."""
+    return frozenset()
+
+
+@pytest.fixture(scope="session")
+def conformance_state_ref_replicas(worker_binary: Path, conformance_fake_storage: str) -> Iterator[object]:
+    """Two C# HTTP workers sharing one token key and the fake storage: no request cap, cursor rule
+    error (accepted, inert here), the shared object-cache bound, X-Conformance-Principal required."""
+    import contextlib
+
+    from vgi_rpc.conformance._state_ref_pytest import OBJECT_CACHE_TEST_BYTES, StateRefReplicas
+
+    flags = (
+        "--fake-storage", conformance_fake_storage,
+        "--token-key", os.urandom(32).hex(),
+        "--max-request-bytes", "0",
+        "--cursor-rule", "error",
+        "--object-cache-bytes", str(OBJECT_CACHE_TEST_BYTES),
+        "--require-principal",
+    )
+    with contextlib.ExitStack() as stack:
+        a = stack.enter_context(contextlib.contextmanager(_spawn_http_worker_port)(worker_binary, *flags))
+        b = stack.enter_context(contextlib.contextmanager(_spawn_http_worker_port)(worker_binary, *flags))
+        yield StateRefReplicas(ports=(a, b), storage_url=conformance_fake_storage)
 
 
 from vgi_rpc.conformance._pytest_suite import *  # noqa: E402,F401,F403

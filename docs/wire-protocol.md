@@ -61,3 +61,52 @@ Declaring matters because a derived name is an accident of the local type system
 language: six implementations of the VGI protocol derived four different names (`VgiProtocol`,
 `VgiService`, `Service`, `vgi`), which stayed invisible until `vgi_rpc.protocol` became a required
 routing key. A dot-qualified name like `vgi.v2` is additionally unspellable as a C# identifier.
+
+## Protocol 3.4: StateRef, argument references, the object store
+
+The contract is the reference's `tools/cross-port/specs/STATE_REF_V1.md`. This port is
+**single-replica in 3.4** (§5.4): HTTP stream state stays in server memory (`StreamCallRegistry`)
+and the stream token seals only a 16-byte call id, so:
+
+- `ICallContext.StateRef(byte[])` / `StateRef<T>(T)` and `Resolve(ref)` / `Resolve<T>(ref)` have
+  the spec's shape, so worker code is portable, but a reference is always held in memory
+  (`Form == "memory"`): nothing is encoded, stored, sealed per turn or fetched. `StateRef` is valid
+  only on a stream method's own context; every turn (the producer tick folded into `/init`
+  included), cancel and unary call throws `state_ref_misuse`. Within one init, byte-equal values
+  (or the same record instance) give the same reference.
+- A reference presented as bytes (`StateRef.FromEncoded`) resolves when it is inline
+  (`0x01 || codec || body`, `TokenCodec`); a stored tag (`0x02`) or an unknown form is
+  `invalid_state_ref`, answered HTTP 400.
+- The cursor rule, tag expiry and the call token's `schemas_ref` do not apply. A
+  `max_request_bytes` below 16384 logs the spec's startup warning; `VGI_RPC_STATE_REF_INLINE_BYTES`
+  is validated (positive integer) though no reference is ever encoded.
+- **Compression before sealing:** no token this port seals carries a payload (call id, sticky
+  session id, argument reference), so the codec applies only to inline `StateRef` bytes.
+- **Maximum stream duration:** `MapVgiRpc(tokenTtl:)`, default 21600 s from `/init` (zero
+  disables), alongside the 10-minute idle eviction.
+
+Implemented in full:
+
+- **Object store** (`IObjectStore.PutObjectAsync` / `GetAsync(objectId, maxBytes)`,
+  `ObjectMissingException`), a separate interface beside `IExternalStorage`; `S3Storage`,
+  `GcsStorage` and the conformance fake storage implement both. `ExternalizationOptions.ObjectStore`
+  overrides which one resolves references (default: the storage, else the upload-URL provider).
+- **Grant columns:** `__upload_url__/init` appends `object_id` and `ref`. `ref` is sealed with the
+  token key under `"vgi_rpc.argref.v1\0" || ComputeCallAad(identity, "\0server")`, the identity
+  the grant was authenticated with by the same delegate as every protocol method (peer-evidence
+  binding included). Providers must return `UploadUrl.ObjectId`; a grant without one is refused.
+  The envelope is this port's AES-256-GCM `Crypto`, not XChaCha20: references never cross ports.
+- **Argument-reference resolution:** `ICallContext.ResolveArgumentRefAsync(ref, size, sha256)`
+  (and the primitive `ArgumentRefs.ResolveAsync`) opens the ref for the caller, checks the sealed
+  size and SHA-256 against the claimed ones, then fetches through the object cache and verifies.
+  Failures are `invalid_arguments_ref`, `arguments_ref_integrity`, `arguments_ref_missing` and
+  `storage_unavailable`. Byte-stream transports vend no grants and refuse it.
+- **Object cache** (`ObjectCache.Default`): keyed by `object_id`, single-flight, byte-bounded
+  LRU (`VGI_RPC_OBJECT_CACHE_BYTES`, default `min(1 GiB, 40%` of the cgroup or available memory)),
+  entries older than one day are misses.
+- **Fix 1:** with an upload-URL provider, `VGI-Max-Upload-Bytes` is always advertised and never
+  exceeds the fetch cap: unset, it is the fetch cap; above an explicit `FetchConfig.MaxFetchBytes`,
+  `MapVgiRpc` refuses to start; above the default fetch cap, the fetch cap is raised to it.
+
+The shared conformance cases that need serialized state skip with `SINGLE_REPLICA_SKIP_REASON`;
+`conftest.py`'s `EXPECTED_SKIP_REASONS` lists every allowed skip, and any other fails the run.

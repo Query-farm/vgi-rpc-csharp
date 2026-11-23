@@ -349,11 +349,14 @@ jobs:
           path: _conformance/vgi-rpc
           ref: protocol-3.4  # TODO(release-wave): back to main once upload-URL v2 / 3.4 ships
       # This repository owns the language-neutral client-role pytest adapter used for every
-      # worker. VGI_CLIENT_DRIVER substitutes the C# JSONL + Arrow IPC driver.
+      # worker. VGI_CLIENT_DRIVER substitutes the C# JSONL + Arrow IPC driver. Pinned to the
+      # protocol-3.4 branch with the reference above: the Rust worker on main still speaks
+      # upload-URL v1, which the 3.4 client refuses.
       - uses: actions/checkout@v4
         with:
           repository: Query-farm/vgi-rpc-rust
           path: _conformance/vgi-rpc-rust
+          ref: protocol-3.4  # TODO(release-wave): back to main once 3.4 ships
       - uses: actions/checkout@v4
         if: matrix.worker == 'java'
         with:

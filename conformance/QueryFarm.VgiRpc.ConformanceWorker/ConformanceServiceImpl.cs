@@ -382,4 +382,47 @@ public sealed class ConformanceServiceImpl(IExternalStorage? externalStorage = n
 
     public Task<RpcStream<StreamState>> ExchangeSessionCounterAsync() =>
         Task.FromResult(new RpcStream<StreamState>(SessionCounterSchemas.Output, new SessionCounterExchangeState(), InputSchema: SessionCounterSchemas.ExchangeInput));
+
+    public Task<RpcStream<StreamState>> StateRefExchangeAsync(long size, bool compressible, string seed, bool misuse, long cursorPadding, ICallContext? ctx = null)
+    {
+        if (ctx is null)
+        {
+            throw new RuntimeError("state_ref_exchange needs a call context");
+        }
+
+        // Created here, in the init handler -- the only place ctx.StateRef is valid.
+        var value = ctx.StateRef(StateRefExchangeState.Payload(size, compressible, seed));
+        var padding = StateRefExchangeState.Payload(cursorPadding, false, $"{seed}:padding");
+        return Task.FromResult(new RpcStream<StreamState>(
+            StateRefExchangeState.OutputSchema, new StateRefExchangeState(value, padding, misuse), InputSchema: StateRefExchangeState.InputSchema));
+    }
+
+    public Task<ObjectCacheStatsResult> ObjectCacheStatsAsync()
+    {
+        var stats = ObjectCache.Default.Stats();
+        return Task.FromResult(new ObjectCacheStatsResult
+        {
+            ResidentBytes = stats.ResidentBytes,
+            Entries = stats.Entries,
+            MaxBytes = stats.MaxBytes,
+            Hits = stats.Hits,
+            Misses = stats.Misses,
+            Evictions = stats.Evictions,
+            Fetches = stats.Fetches,
+        });
+    }
+
+    public Task<long> ObjectCacheAgeAsync(long seconds) =>
+        Task.FromResult((long)ObjectCache.Default.AgeEntries(TimeSpan.FromSeconds(seconds)));
+
+    public async Task<string> ResolveArgumentRefAsync(byte[] @ref, long size, string sha256, ICallContext? ctx = null)
+    {
+        if (ctx is null)
+        {
+            throw new RuntimeError("resolve_argument_ref needs a call context");
+        }
+
+        var bytes = await ctx.ResolveArgumentRefAsync(@ref, size, sha256).ConfigureAwait(false);
+        return Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(bytes));
+    }
 }

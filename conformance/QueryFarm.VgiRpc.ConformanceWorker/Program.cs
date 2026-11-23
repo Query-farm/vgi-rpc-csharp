@@ -24,6 +24,12 @@ if (options is null)
     return 1;
 }
 
+// The object cache reads its bound once, at first use (as the reference's does).
+if (options.ObjectCacheBytes is { } objectCacheBytes)
+{
+    Environment.SetEnvironmentVariable(ObjectCache.BytesEnvironmentVariable, objectCacheBytes.ToString(System.Globalization.CultureInfo.InvariantCulture));
+}
+
 using var accessLog = options.AccessLogPath is { } accessLogPath ? new JsonlAccessLogSink(accessLogPath) : null;
 // Matches the reference's ConformanceService.protocol_version. Declaring it
 // makes this worker enforce the version gate like every other port, and makes
@@ -165,6 +171,21 @@ if (options.Http)
             throw new InvalidOperationException("conformance fixture: no matching X-Conformance-Auth-Reason");
         };
     }
+    else if (options.RequirePrincipal)
+    {
+        // Like --sticky-auth's delegate, but a request without the header is refused (401).
+        authenticate = context =>
+        {
+            var principal = context.Request.Headers["X-Conformance-Principal"].ToString();
+            if (string.IsNullOrEmpty(principal))
+            {
+                throw new AuthFailure(AuthReason.MissingCredential, "X-Conformance-Principal is required");
+            }
+
+            AuthIdentity.SetOn(context, "conformance", principal);
+            return Task.CompletedTask;
+        };
+    }
     else if (options.ConformanceMtlsSubject)
     {
         // MtlsAuth.FromSubject() reads X-SSL-Client-Cert (URL-encoded PEM) and accepts any
@@ -260,19 +281,20 @@ if (options.Http)
             Storage = backend,
             ExternalizeThresholdBytes = options.ExternalizeThresholdBytes,
             Compression = workerCompression,
-            FetchConfig = new FetchConfig
-            {
-                MaxFetchBytes = options.MaxFetchBytes ?? new FetchConfig().MaxFetchBytes,
-                MaxDecompressedBytes = options.MaxDecompressedFetchBytes,
-            },
+            // MaxFetchBytes only when given: an explicit fetch cap below the upload cap refuses
+            // startup, a defaulted one is raised to it (fix 1).
+            FetchConfig = options.MaxFetchBytes is { } maxFetchBytes
+                ? new FetchConfig { MaxFetchBytes = maxFetchBytes, MaxDecompressedBytes = options.MaxDecompressedFetchBytes }
+                : new FetchConfig { MaxDecompressedBytes = options.MaxDecompressedFetchBytes },
             UrlValidator = urlValidator,
         };
         externalization = new ExternalizationOptions
         {
             External = externalConfig,
             UploadUrlProvider = backend,
-            MaxRequestBytes = options.MaxRequestBytes ?? options.ExternalizeThresholdBytes,
-            MaxUploadBytes = 64 * 1024 * 1024,
+            MaxRequestBytes = options.NoRequestCap ? null : options.MaxRequestBytes ?? options.ExternalizeThresholdBytes,
+            // Never above the fetch cap (fix 1), as the reference worker does.
+            MaxUploadBytes = Math.Min(64 * 1024 * 1024, externalConfig.FetchConfig.MaxFetchBytes),
             MaxExternalizedResponseBytes = options.MaxExternalizedResponseBytes,
         };
     }
@@ -283,7 +305,8 @@ if (options.Http)
         externalization = new ExternalizationOptions { MaxRequestBytes = maxRequestBytesOnly };
     }
 
-    app.MapVgiRpc(server, maxResponseBytes: options.MaxResponseBytes ?? 65536, authenticate: authenticate, proxyHint: options.ConformanceProxyHint, corsPolicyName: corsEnabled ? CorsPolicyName : null, tokenKey: tokenKey, sticky: sticky, proxyProofRequired: proxyProofRequired, externalization: externalization);
+    app.MapVgiRpc(server, maxResponseBytes: options.MaxResponseBytes ?? 65536, authenticate: authenticate, proxyHint: options.ConformanceProxyHint, corsPolicyName: corsEnabled ? CorsPolicyName : null, tokenKey: tokenKey, sticky: sticky, proxyProofRequired: proxyProofRequired, externalization: externalization,
+        tokenTtl: options.TokenTtlSeconds is { } ttlSeconds ? TimeSpan.FromSeconds(ttlSeconds) : null);
 
     // Test-only admin endpoint — NOT part of MapVgiRpc's real surface. Lets
     // TestSticky::test_drain_rejects_new_opens flip the drain flag over the wire instead of
@@ -402,9 +425,17 @@ internal sealed class CliOptions
     public bool RejectLocalhostRedirects { get; private init; }
     public long? MaxResponseBytes { get; private init; }
     public long? MaxExternalizedResponseBytes { get; private init; }
+    public bool NoRequestCap { get; private init; }
+    public long? TokenTtlSeconds { get; private init; }
+    public long? ObjectCacheBytes { get; private init; }
+    public bool RequirePrincipal { get; private init; }
 
     public static CliOptions? Parse(string[] args)
     {
+        var noRequestCap = false;
+        long? tokenTtlSeconds = null;
+        long? objectCacheBytes = null;
+        var requirePrincipal = false;
         string? unixPath = null;
         string? tcpArg = null;
         var http = false;
@@ -561,6 +592,14 @@ internal sealed class CliOptions
                     break;
                 case "--max-request-bytes":
                     maxRequestBytes = long.Parse(RequireValue(args, ref i, "--max-request-bytes"));
+                    // 0 means "no request cap" (the storage mode otherwise defaults the cap to the
+                    // externalization threshold), as in the reference worker.
+                    noRequestCap = maxRequestBytes == 0;
+                    if (noRequestCap)
+                    {
+                        maxRequestBytes = null;
+                    }
+
                     break;
                 case "--compression":
                     compressionAlgorithm = RequireValue(args, ref i, "--compression");
@@ -582,6 +621,29 @@ internal sealed class CliOptions
                     break;
                 case "--max-externalized-response-bytes":
                     maxExternalizedResponseBytes = long.Parse(RequireValue(args, ref i, "--max-externalized-response-bytes"));
+                    break;
+                case "--cursor-rule":
+                    // Accepted for parity with the reference worker (warn|error). This port's
+                    // stream state is never serialized (single-replica, STATE_REF_V1.md §5.4), so
+                    // there is no cursor to measure and the rule has nothing to act on.
+                    var rule = RequireValue(args, ref i, "--cursor-rule");
+                    if (rule is not ("warn" or "error"))
+                    {
+                        throw new ArgumentException($"--cursor-rule must be warn|error, got '{rule}'");
+                    }
+
+                    break;
+                case "--token-ttl":
+                    tokenTtlSeconds = long.Parse(RequireValue(args, ref i, "--token-ttl"));
+                    break;
+                case "--object-cache-bytes":
+                    objectCacheBytes = long.Parse(RequireValue(args, ref i, "--object-cache-bytes"));
+                    break;
+                case "--require-principal":
+                    // Authenticates every RPC route (the grant included) by X-Conformance-Principal
+                    // and answers 401 without it: the shared StateRef / argument-reference cases
+                    // need two principals and an unauthenticated grant refused like any call.
+                    requirePrincipal = true;
                     break;
                 default:
                     Console.Error.WriteLine($"Unknown argument: {args[i]}");
@@ -629,6 +691,10 @@ internal sealed class CliOptions
             RejectLocalhostRedirects = rejectLocalhostRedirects,
             MaxResponseBytes = maxResponseBytesOverride,
             MaxExternalizedResponseBytes = maxExternalizedResponseBytes,
+            NoRequestCap = noRequestCap,
+            TokenTtlSeconds = tokenTtlSeconds,
+            ObjectCacheBytes = objectCacheBytes,
+            RequirePrincipal = requirePrincipal,
         };
     }
 
