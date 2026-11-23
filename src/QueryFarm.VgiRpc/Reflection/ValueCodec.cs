@@ -634,6 +634,20 @@ public static class ValueCodec
         for (var i = 0; i < innerSchema.FieldsList.Count; i++)
         {
             var field = innerSchema.GetFieldByIndex(i);
+            if (i >= row.ColumnCount)
+            {
+                // A trailing field the sender's schema predates (e.g. vgi 3.4's appended
+                // BindRequest.arguments_location): a nullable one is absent, as the reference's
+                // dataclass default makes it; a required one is a clear error, not an index fault.
+                if (field.IsNullable)
+                {
+                    continue;
+                }
+
+                throw new InvalidOperationException(
+                    $"Embedded record for '{clrType.Name}' has {row.ColumnCount} columns and lacks the required field '{field.Name}'.");
+            }
+
             var property = clrType.GetProperty(FindClrPropertyName(clrType, field))!;
             property.SetValue(instance, ExtractSingleValue(row.Column(i), 0, property.PropertyType));
         }
