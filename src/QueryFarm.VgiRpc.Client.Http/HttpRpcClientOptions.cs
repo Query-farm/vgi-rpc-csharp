@@ -93,4 +93,14 @@ public sealed record UploadRequest(long Size, string Sha256);
 
 /// <summary>A server-vended upload URL pair. <paramref name="Headers"/> are the headers the PUT
 /// MUST carry, verbatim (never <c>Content-Length</c>).</summary>
-public sealed record UploadUrl(string Upload, string Download, DateTimeOffset ExpiresAt, IReadOnlyDictionary<string, string> Headers);
+public sealed record UploadUrl(string Upload, string Download, DateTimeOffset ExpiresAt, IReadOnlyDictionary<string, string> Headers)
+{
+    /// <summary>The storage id of the object the PUT creates (protocol 3.4 <c>object_id</c>
+    /// column; empty from an older server).</summary>
+    public string ObjectId { get; init; } = "";
+
+    /// <summary>The sealed argument reference for that object (protocol 3.4 <c>ref</c> column,
+    /// <c>STATE_REF_V1.md</c> §10.2), bound to this client's principal; empty from an older
+    /// server. Present it with the object's size and SHA-256 to name the object in a later call.</summary>
+    public byte[] Ref { get; init; } = [];
+}

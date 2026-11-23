@@ -147,9 +147,20 @@ public static class RpcHttpEndpoints
     /// On by default; <see langword="false"/> is for a deployment that composes them itself -- required
     /// when its authentication depends on proxy-injected evidence (<paramref name="proxyProofRequired"/>
     /// or a <paramref name="proxyHint"/>), which otherwise refuses to start.</param>
-    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null, long? maxResponseBytes = null, AuthenticateDelegate? authenticate = null, string? proxyHint = null, string? corsPolicyName = null, StickySessionRegistry? sticky = null, bool proxyProofRequired = false, ExternalizationOptions? externalization = null, long? hostingMaxRequestBytes = null, long? hostingMaxResponseBytes = null, long? preferredResponseBytes = null, bool identityBearer = true)
+    /// <param name="tokenTtl">Maximum stream duration, counted from <c>/init</c>: a continuation of
+    /// an older stream is refused like an unknown one (the 3.4 <c>token_ttl</c>,
+    /// <c>STATE_REF_V1.md</c> §12). <see langword="null"/> means
+    /// <see cref="StreamCallRegistry.DefaultMaxAge"/> (6 hours); <see cref="TimeSpan.Zero"/>
+    /// disables it. Idle streams are still evicted after 10 minutes without a turn.</param>
+    /// <exception cref="ArgumentException">An explicit fetch cap below the upload cap (see
+    /// <see cref="ExternalizationOptions.MaxUploadBytes"/>), a non-positive
+    /// <see cref="ExternalizationOptions.MaxUploadBytes"/>, or an invalid
+    /// <c>VGI_RPC_STATE_REF_INLINE_BYTES</c>.</exception>
+    public static IEndpointRouteBuilder MapVgiRpc(this IEndpointRouteBuilder endpoints, RpcServer server, string prefix = "", int? compressionLevel = 1, byte[]? tokenKey = null, long? maxResponseBytes = null, AuthenticateDelegate? authenticate = null, string? proxyHint = null, string? corsPolicyName = null, StickySessionRegistry? sticky = null, bool proxyProofRequired = false, ExternalizationOptions? externalization = null, long? hostingMaxRequestBytes = null, long? hostingMaxResponseBytes = null, long? preferredResponseBytes = null, bool identityBearer = true, TimeSpan? tokenTtl = null)
     {
         ValidateResponseBudget(maxResponseBytes, nameof(maxResponseBytes));
+        externalization = ResolveUploadCap(externalization);
+        _ = StateRefInlineBytesFromEnvironment();
         // Close the identity loop (WIRE_PROTOCOL.md §16): a server hosting vgi_rpc.Identity.v2 with
         // sealed-grant keys or a resolve_token hook accepts those credentials as bearers, after the
         // deployment's own authenticator. A deployment whose authentication depends on proxy-injected
@@ -176,6 +187,7 @@ public static class RpcHttpEndpoints
         ValidateResponseBudget(preferredResponseBytes, nameof(preferredResponseBytes));
         var effectiveMaxResponseBytes = MinLimit(maxResponseBytes, hostingMaxResponseBytes);
         var effectiveMaxRequestBytes = MinLimit(externalization?.MaxRequestBytes, hostingMaxRequestBytes);
+        WarnBelowRequestFloor(effectiveMaxRequestBytes);
         // A require-mode proof gate is itself a proxy dependency: a request that reached the
         // service without passing through the proxy is refused, and a 401 that does not say so
         // reads as a bad credential. The reference derives the note from the proof header when
@@ -186,7 +198,12 @@ public static class RpcHttpEndpoints
         }
 
         tokenKey ??= RandomNumberGenerator.GetBytes(32);
-        var registry = new StreamCallRegistry();
+        if (tokenTtl is { } ttl && ttl < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(tokenTtl), "tokenTtl must not be negative (zero disables it)");
+        }
+
+        var registry = new StreamCallRegistry(maxAge: tokenTtl);
         void Stamp(HttpContext context)
         {
             ApplyResponseBudgetCapabilities(context.Response, effectiveMaxRequestBytes, effectiveMaxResponseBytes);
@@ -237,7 +254,7 @@ public static class RpcHttpEndpoints
 
         if (externalization?.UploadUrlProvider is not null)
         {
-            var uploadUrl = endpoints.MapPost($"{prefix}/__upload_url__/init", (HttpContext context) => { Stamp(context); return HandleUploadUrlAsync(server, context, authenticate, proxyHint, externalization, effectiveMaxResponseBytes); });
+            var uploadUrl = endpoints.MapPost($"{prefix}/__upload_url__/init", (HttpContext context) => { Stamp(context); return HandleUploadUrlAsync(server, context, authenticate, proxyHint, externalization, effectiveMaxResponseBytes, tokenKey); });
             if (corsPolicyName is not null)
             {
                 uploadUrl.RequireCors(corsPolicyName);
@@ -245,6 +262,128 @@ public static class RpcHttpEndpoints
         }
 
         return endpoints;
+    }
+
+    /// <summary>Below this <c>max_request_bytes</c> the server warns at startup and disables the
+    /// cursor rule (<c>STATE_REF_V1.md</c> §9).</summary>
+    public const long RequestBytesFloor = 16384;
+
+    /// <summary>Environment variable for the largest compressed <c>StateRef</c> payload kept inline
+    /// (§9). This port never encodes a <c>StateRef</c> (single-replica, §5.4), but the knob is
+    /// validated like every SDK's, so one deployment configuration works for all of them.</summary>
+    public const string StateRefInlineBytesEnvironmentVariable = "VGI_RPC_STATE_REF_INLINE_BYTES";
+
+    /// <summary>The default of <see cref="StateRefInlineBytesEnvironmentVariable"/>.</summary>
+    public const int DefaultStateRefInlineBytes = 16384;
+
+    /// <summary>Reads <see cref="StateRefInlineBytesEnvironmentVariable"/>: a positive integer, else
+    /// <see cref="DefaultStateRefInlineBytes"/> when unset.</summary>
+    /// <exception cref="ArgumentException">Set, but not a positive integer.</exception>
+    public static int StateRefInlineBytesFromEnvironment(Func<string, string?>? environment = null)
+    {
+        var raw = (environment ?? Environment.GetEnvironmentVariable)(StateRefInlineBytesEnvironmentVariable);
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return DefaultStateRefInlineBytes;
+        }
+
+        return int.TryParse(raw.Trim(), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var value) && value > 0
+            ? value
+            : throw new ArgumentException($"{StateRefInlineBytesEnvironmentVariable} must be a positive integer, got '{raw}'");
+    }
+
+    /// <summary>The startup warning for a request cap below <see cref="RequestBytesFloor"/>, or
+    /// <see langword="null"/> when there is none. Conformance and test servers deliberately use such
+    /// caps, so it is a warning, never a refusal; this port has no cursor rule to disable (its
+    /// stream state is never serialized, §5.4), so the warning is the whole rule here.</summary>
+    public static string? RequestFloorWarning(long? maxRequestBytes) =>
+        maxRequestBytes is { } cap && cap > 0 && cap < RequestBytesFloor
+            ? $"max_request_bytes ({cap}) is below {RequestBytesFloor}: the cursor rule is disabled and stream continuations may not fit"
+            : null;
+
+    private static void WarnBelowRequestFloor(long? maxRequestBytes)
+    {
+        if (RequestFloorWarning(maxRequestBytes) is { } warning)
+        {
+            Console.Error.WriteLine($"vgi_rpc warning: {warning}");
+        }
+    }
+
+    /// <summary>
+    /// Fix 1 (vgi-rpc-python <c>3a8d584</c>): with an upload-URL provider, <c>VGI-Max-Upload-Bytes</c>
+    /// is always advertised and never exceeds the inbound fetch cap the server later applies to the
+    /// uploaded pointer -- advertising more would let a client upload a request the server then
+    /// refuses, after the whole upload.
+    /// </summary>
+    /// <remarks>
+    /// <list type="bullet">
+    /// <item>No <see cref="ExternalizationOptions.MaxUploadBytes"/>: the fetch cap is advertised.</item>
+    /// <item>An upload cap above an <i>explicit</i> <see cref="FetchConfig.MaxFetchBytes"/>: an
+    /// explicit contradiction, refused at startup.</item>
+    /// <item>An upload cap above the <i>default</i> fetch cap: setting the upload size is how an
+    /// operator says "accept requests this large", so the effective fetch cap is raised to it (the
+    /// reference's <c>VGI_RPC_MAX_FETCH_BYTES</c> rule).</item>
+    /// </list>
+    /// </remarks>
+    public static ExternalizationOptions? ResolveUploadCap(ExternalizationOptions? externalization)
+    {
+        if (externalization?.UploadUrlProvider is null)
+        {
+            return externalization;
+        }
+
+        var external = externalization.External;
+        var fetch = external?.FetchConfig ?? new FetchConfig();
+        var fetchCap = fetch.MaxFetchBytes;
+        if (externalization.MaxUploadBytes is not { } uploadCap)
+        {
+            return externalization.With(maxUploadBytes: fetchCap);
+        }
+
+        if (uploadCap < 1)
+        {
+            throw new ArgumentException($"MaxUploadBytes must be a positive integer, got {uploadCap}", nameof(externalization));
+        }
+
+        if (uploadCap <= fetchCap)
+        {
+            return externalization;
+        }
+
+        if (fetch.MaxFetchBytesIsExplicit)
+        {
+            throw new ArgumentException(
+                $"MaxUploadBytes ({uploadCap}) exceeds the server's inbound fetch cap (FetchConfig.MaxFetchBytes = {fetchCap}): "
+                + "clients would upload requests the server then refuses to fetch. Raise MaxFetchBytes or lower MaxUploadBytes.",
+                nameof(externalization));
+        }
+
+        return external is null
+            ? externalization
+            : externalization.With(external: external.WithFetchConfig(fetch.WithMaxFetchBytes(uploadCap)));
+    }
+
+    /// <summary>Resolves one argument reference for a call: <see cref="Server.ICallContext.ResolveArgumentRefAsync"/>.</summary>
+    internal delegate Task<byte[]> ArgumentRefResolverDelegate(byte[] reference, long size, string sha256, CancellationToken cancellationToken);
+
+    private static ArgumentRefResolverDelegate ArgumentRefResolver(HttpContext context, byte[] tokenKey, ExternalizationOptions? externalization)
+    {
+        var identity = AuthIdentity.GetFrom(context);
+        return (reference, size, sha256, cancellationToken) => ArgumentRefs.ResolveAsync(
+            reference, size, sha256, tokenKey, identity,
+            externalization?.EffectiveObjectStore,
+            externalization?.External?.FetchConfig.MaxFetchBytes ?? FetchConfig.DefaultMaxFetchBytes,
+            externalization?.ObjectCache,
+            cancellationToken);
+    }
+
+    private static Task<byte[]> ResolveArgumentRef(ArgumentRefResolverDelegate? resolver, byte[] reference, long size, string sha256, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(reference);
+        ArgumentNullException.ThrowIfNull(sha256);
+        return resolver is null
+            ? throw StateRefErrors.InvalidArgumentsRef("argument references can only be resolved by an HTTP server")
+            : resolver(reference, size, sha256, cancellationToken);
     }
 
     private static void ApplyResponseBudgetCapabilities(HttpResponse response,
@@ -266,6 +405,11 @@ public static class RpcHttpEndpoints
             new Field("download_url", Apache.Arrow.Types.StringType.Default, nullable: false),
             new Field("expires_at", new Apache.Arrow.Types.TimestampType(Apache.Arrow.Types.TimeUnit.Microsecond, "UTC"), nullable: false),
             new Field("upload_headers", s_uploadHeadersType, nullable: false),
+            // Protocol 3.4 (STATE_REF_V1.md §10.2): the storage id of the object the PUT creates,
+            // and a sealed argument reference for it, bound to the requesting principal. Clients
+            // read the columns by name and may ignore these two.
+            new Field("object_id", Apache.Arrow.Types.StringType.Default, nullable: false),
+            new Field("ref", Apache.Arrow.Types.BinaryType.Default, nullable: false),
         ],
         metadata: null);
 
@@ -283,9 +427,13 @@ public static class RpcHttpEndpoints
     /// band. Follows the same dispatch shape as unary calls (auth gate, request-cap enforcement,
     /// standard wire request/response framing) despite the <c>/init</c> suffix — unlike a real
     /// stream method, this is always answered in one shot; there is no matching <c>/exchange</c>.</summary>
+    /// <remarks>Authenticated exactly as a protocol method is -- the same delegate, so the same
+    /// identity, peer-evidence binding and anonymous fallback -- because each entry's <c>ref</c> is
+    /// sealed to that identity and must open for the same client's later call
+    /// (<c>STATE_REF_V1.md</c> §10.2).</remarks>
     private static async Task HandleUploadUrlAsync(RpcServer server, HttpContext context,
         AuthenticateDelegate? authenticate, string? proxyHint,
-        ExternalizationOptions externalization, long? maxResponseBytes)
+        ExternalizationOptions externalization, long? maxResponseBytes, byte[] tokenKey)
     {
         if (await TryRejectUnauthenticatedAsync(context, authenticate, proxyHint).ConfigureAwait(false))
         {
@@ -384,11 +532,24 @@ public static class RpcHttpEndpoints
         }
 
         var uploadUrls = new UploadUrl[entries.Count];
+        var refs = new byte[entries.Count][];
+        var grantIdentity = AuthIdentity.GetFrom(context);
         try
         {
             for (var i = 0; i < entries.Count; i++)
             {
-                uploadUrls[i] = await externalization.UploadUrlProvider!.GenerateUploadUrlAsync(entries[i].Size, entries[i].Sha256, cancellationToken).ConfigureAwait(false);
+                var provider = externalization.UploadUrlProvider!;
+                uploadUrls[i] = await provider.GenerateUploadUrlAsync(entries[i].Size, entries[i].Sha256, cancellationToken).ConfigureAwait(false);
+                if (string.IsNullOrEmpty(uploadUrls[i].ObjectId))
+                {
+                    throw new InvalidOperationException(
+                        $"{provider.GetType().Name}.GenerateUploadUrlAsync returned no ObjectId (required since vgi-rpc protocol 3.4)");
+                }
+
+                // Minted from the *claimed* (size, sha256) under the identity this request was
+                // authenticated with -- the one a later call presenting the ref is authenticated
+                // with too.
+                refs[i] = ArgumentRefs.Mint(tokenKey, grantIdentity, entries[i].Size, entries[i].Sha256, uploadUrls[i].ObjectId);
             }
         }
         catch (Exception exc) when (!cancellationToken.IsCancellationRequested)
@@ -410,8 +571,13 @@ public static class RpcHttpEndpoints
             var headersArray = new Apache.Arrow.MapArray.Builder(s_uploadHeadersType);
             var headerKeys = (Apache.Arrow.StringArray.Builder)headersArray.KeyBuilder;
             var headerValues = (Apache.Arrow.StringArray.Builder)headersArray.ValueBuilder;
-            foreach (var u in uploadUrls)
+            var objectIdArray = new Apache.Arrow.StringArray.Builder();
+            var refArray = new Apache.Arrow.BinaryArray.Builder();
+            for (var entry = 0; entry < uploadUrls.Length; entry++)
             {
+                var u = uploadUrls[entry];
+                objectIdArray.Append(u.ObjectId);
+                refArray.Append(refs[entry].AsSpan());
                 uploadArray.Append(u.UploadUrlValue);
                 downloadArray.Append(u.DownloadUrl);
                 expiresArray.Append(u.ExpiresAt);
@@ -430,7 +596,7 @@ public static class RpcHttpEndpoints
                 }
             }
 
-            var resultBatch = new RecordBatch(s_uploadUrlResultSchema, [uploadArray.Build(), downloadArray.Build(), expiresArray.Build(), headersArray.Build()], uploadUrls.Length);
+            var resultBatch = new RecordBatch(s_uploadUrlResultSchema, [uploadArray.Build(), downloadArray.Build(), expiresArray.Build(), headersArray.Build(), objectIdArray.Build(), refArray.Build()], uploadUrls.Length);
             await writer.WriteOwnedBatchAsync(resultBatch, null, cancellationToken).ConfigureAwait(false);
         }
 
@@ -1281,7 +1447,9 @@ public static class RpcHttpEndpoints
                 stickyState,
                 PeerIdentityAuthentication.GetAuth(context),
                 PeerIdentityAuthentication.GetEvidence(context),
-                responseLimitBytes, preferredLimitBytes, unary: true)
+                responseLimitBytes, preferredLimitBytes, unary: true,
+                protocol: protocol, method: method,
+                argumentRefs: ArgumentRefResolver(context, tokenKey, externalization))
             : null;
 
         var responseBuffer = new MemoryStream();
@@ -1746,7 +1914,13 @@ public static class RpcHttpEndpoints
                 stickyState,
                 PeerIdentityAuthentication.GetAuth(context),
                 PeerIdentityAuthentication.GetEvidence(context),
-                responseLimitBytes, preferredLimitBytes)
+                responseLimitBytes, preferredLimitBytes,
+                protocol: protocol, method: method,
+                // The stream method's own context: the only one where ctx.StateRef is valid
+                // (STATE_REF_V1.md §2.1). The producer tick folded into this request below is a
+                // turn, and refuses it, as the pipe's first turn does.
+                stateRefs: new StateRefScope(protocol, method),
+                argumentRefs: ArgumentRefResolver(context, tokenKey, externalization))
             : null;
 
         IRpcStream stream;
@@ -1826,7 +2000,8 @@ public static class RpcHttpEndpoints
                 stickyState,
                 PeerIdentityAuthentication.GetAuth(context),
                 PeerIdentityAuthentication.GetEvidence(context),
-                responseLimitBytes, preferredLimitBytes);
+                responseLimitBytes, preferredLimitBytes,
+                protocol, method, ArgumentRefResolver(context, tokenKey, externalization));
             try
             {
                 using var tickBatch = ValueCodec.EmptyRow(s_emptySchema);
@@ -2211,7 +2386,8 @@ public static class RpcHttpEndpoints
             stickyState,
             PeerIdentityAuthentication.GetAuth(context),
             PeerIdentityAuthentication.GetEvidence(context),
-            responseLimitBytes, preferredLimitBytes);
+            responseLimitBytes, preferredLimitBytes,
+            protocol, method, ArgumentRefResolver(context, tokenKey, externalization));
         Exception? turnException = null;
         try
         {
@@ -2444,6 +2620,14 @@ public static class RpcHttpEndpoints
         string methodType = "unary",
         string? streamId = null)
     {
+        // invalid_state_ref raised while a method or state runs is a token-shaped failure: HTTP
+        // 400 with the RPC error batch, like any other token refusal (STATE_REF_V1.md §6).
+        if (httpStatusCode == StatusCodes.Status500InternalServerError
+            && exception is RpcException { ErrorKind: StateRefErrors.InvalidStateRefKind })
+        {
+            httpStatusCode = httpStatusForLog = StatusCodes.Status400BadRequest;
+        }
+
         var start = Stopwatch.GetTimestamp();
         using var buffer = new MemoryStream();
         await using (var writer = new WireWriter(buffer, schema))
@@ -2674,9 +2858,22 @@ public static class RpcHttpEndpoints
         PeerEvidenceSet? peerEvidence = null,
         long? responseLimitBytes = null,
         long? preferredResponseBytes = null,
-        bool unary = false) : Server.ICallContext
+        bool unary = false,
+        string? protocol = null,
+        string? method = null,
+        StateRefScope? stateRefs = null,
+        ArgumentRefResolverDelegate? argumentRefs = null) : Server.ICallContext
     {
         public List<LogMessage> Buffered { get; } = [];
+
+        // Non-null only on a stream method's own (init) context.
+        public StateRef StateRef(byte[] value) => StateRefScope.Create(stateRefs, value, protocol, method);
+
+        public StateRef StateRef<T>(T record)
+            where T : class => StateRefScope.Create(stateRefs, record, protocol, method);
+
+        public Task<byte[]> ResolveArgumentRefAsync(byte[] reference, long size, string sha256, CancellationToken cancellationToken = default) =>
+            ResolveArgumentRef(argumentRefs, reference, size, sha256, cancellationToken);
 
         /// <summary>The ref <see cref="Server.ICallContext.RespondWithExternalRef"/> asked to
         /// answer with, if any — unary dispatch writes its pointer instead of the return value.</summary>
@@ -2722,8 +2919,20 @@ public static class RpcHttpEndpoints
         AuthContext? auth = null,
         PeerEvidenceSet? peerEvidence = null,
         long? responseLimitBytes = null,
-        long? preferredResponseBytes = null) : Server.ICallContext
+        long? preferredResponseBytes = null,
+        string? protocol = null,
+        string? method = null,
+        ArgumentRefResolverDelegate? argumentRefs = null) : Server.ICallContext
     {
+        // Every turn is a continuation: StateRef refuses, naming the method (STATE_REF_V1.md §2.1).
+        public StateRef StateRef(byte[] value) => StateRefScope.Create(null, value, protocol, method);
+
+        public StateRef StateRef<T>(T record)
+            where T : class => StateRefScope.Create(null, record, protocol, method);
+
+        public Task<byte[]> ResolveArgumentRefAsync(byte[] reference, long size, string sha256, CancellationToken cancellationToken = default) =>
+            ResolveArgumentRef(argumentRefs, reference, size, sha256, cancellationToken);
+
         public AuthContext Auth { get; } = auth ?? AuthContext.Anonymous;
 
         public PeerEvidenceSet PeerEvidence { get; } = peerEvidence ?? PeerEvidenceSet.Empty;

@@ -133,6 +133,37 @@ public sealed class UploadUrlRequestTests
         Assert.All(urls, u => Assert.False(u.Headers.ContainsKey("Content-Length")));
     }
 
+    private static readonly byte[] s_tokenKey = RandomNumberGenerator.GetBytes(32);
+
+    /// <summary>Protocol 3.4 grant columns (STATE_REF_V1.md §10.2): each entry carries the
+    /// provider's <c>object_id</c> and a <c>ref</c> sealed to the requesting identity (anonymous
+    /// here) over the claimed size and SHA-256.</summary>
+    [Fact]
+    public async Task V2Request_CarriesObjectIdAndASealedRef()
+    {
+        await using var host = await StartHostAsync();
+        await using var client = new HttpRpcClient(host.Address, new HttpRpcClientOptions { Protocol = "PingService" });
+        var urls = await client.RequestUploadUrlsAsync(
+            [new UploadRequest(10, s_shaA), new UploadRequest(20, s_shaA)], TestContext.Current.CancellationToken);
+
+        for (var i = 0; i < urls.Count; i++)
+        {
+            Assert.StartsWith("object-", urls[i].ObjectId, StringComparison.Ordinal);
+            var opened = ArgumentRefs.Open(s_tokenKey, null, urls[i].Ref);
+            Assert.Equal(new ArgumentRef(i == 0 ? 10 : 20, s_shaA, urls[i].ObjectId), opened);
+            Assert.Throws<Errors.RpcException>(() => ArgumentRefs.Open(s_tokenKey, new AuthIdentity("d", "someone"), urls[i].Ref));
+        }
+    }
+
+    [Fact]
+    public async Task Capabilities_AdvertiseTheUploadCap()
+    {
+        await using var host = await StartHostAsync();
+        using var http = new System.Net.Http.HttpClient { BaseAddress = host.Address };
+        using var health = await http.GetAsync("/health", TestContext.Current.CancellationToken);
+        Assert.Equal(MaxUploadBytes.ToString(System.Globalization.CultureInfo.InvariantCulture), health.Headers.GetValues("VGI-Max-Upload-Bytes").Single());
+    }
+
     [Fact]
     public async Task RetiredCountShape_IsRefused()
     {
@@ -466,6 +497,7 @@ public sealed class UploadUrlRequestTests
 
         app.MapVgiRpc(
             new RpcServer(typeof(IPingService), new PingService()),
+            tokenKey: s_tokenKey,
             externalization: new ExternalizationOptions
             {
                 UploadUrlProvider = provider,
@@ -513,8 +545,8 @@ public sealed class UploadUrlRequestTests
                 ["Content-Length"] = size.ToString(System.Globalization.CultureInfo.InvariantCulture),
             };
             return Task.FromResult(storage is null
-                ? new External.UploadUrl($"https://upload.invalid/{n}", $"https://download.invalid/{n}", DateTimeOffset.UtcNow.AddHours(1), headers)
-                : new External.UploadUrl($"{storage.BaseAddress}/store/{n}?size={size}", $"{storage.BaseAddress}/store/{n}", DateTimeOffset.UtcNow.AddHours(1), headers));
+                ? new External.UploadUrl($"https://upload.invalid/{n}", $"https://download.invalid/{n}", DateTimeOffset.UtcNow.AddHours(1), headers) { ObjectId = $"object-{n}" }
+                : new External.UploadUrl($"{storage.BaseAddress}/store/{n}?size={size}", $"{storage.BaseAddress}/store/{n}", DateTimeOffset.UtcNow.AddHours(1), headers) { ObjectId = $"{n}" });
         }
     }
 

@@ -617,6 +617,7 @@ public sealed class HttpRpcClientTests
             long size, string sha256Hex, CancellationToken cancellationToken) => Task.FromResult(new QueryFarm.VgiRpc.External.UploadUrl(
                 "https://upload.invalid/" + _suffix,
                 "https://download.invalid/" + _suffix,
-                DateTimeOffset.UtcNow.AddHours(1)));
+                DateTimeOffset.UtcNow.AddHours(1))
+            { ObjectId = "long-" + _suffix });
     }
 }

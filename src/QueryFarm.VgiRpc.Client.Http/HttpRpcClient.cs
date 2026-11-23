@@ -440,6 +440,12 @@ public sealed partial class HttpRpcClient : IRpcClient, IProtocolAddressableClie
                     ?? throw new InvalidDataException("Upload URL response column 'download_url' must be utf8.");
                 var expirations = batch.Batch.Column(expirationIndex) as TimestampArray
                     ?? throw new InvalidDataException("Upload URL response column 'expires_at' must be timestamp.");
+                // Protocol 3.4 grant columns (STATE_REF_V1.md §10.2), read by name and optional: a
+                // server without them still answers a v2 client.
+                var objectIdIndex = batch.Batch.Schema.GetFieldIndex("object_id");
+                var refIndex = batch.Batch.Schema.GetFieldIndex("ref");
+                var objectIds = objectIdIndex >= 0 ? batch.Batch.Column(objectIdIndex) as StringArray : null;
+                var refs = refIndex >= 0 ? batch.Batch.Column(refIndex) as BinaryArray : null;
                 for (var index = 0; index < batch.Batch.Length; index++)
                 {
                     result.Add(new UploadUrl(
@@ -449,7 +455,11 @@ public sealed partial class HttpRpcClient : IRpcClient, IProtocolAddressableClie
                             ?? throw new InvalidDataException("Upload URL response contained a null download_url."),
                         expirations.GetTimestamp(index)
                             ?? throw new InvalidDataException("Upload URL response contained a null expires_at."),
-                        ReadUploadHeaders(headerMaps, headerKeys, headerValues, index)));
+                        ReadUploadHeaders(headerMaps, headerKeys, headerValues, index))
+                    {
+                        ObjectId = objectIds?.GetString(index) ?? "",
+                        Ref = refs is not null && !refs.IsNull(index) ? refs.GetBytes(index).ToArray() : [],
+                    });
                 }
             }
         }

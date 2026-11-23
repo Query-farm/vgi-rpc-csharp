@@ -17,7 +17,7 @@ namespace QueryFarm.VgiRpc.S3;
 /// URL. <see cref="AmazonS3Client"/> is documented thread-safe for concurrent calls, satisfying
 /// both interfaces' thread-safety requirement.</para>
 /// </summary>
-public sealed class S3Storage : IExternalStorage, IUploadUrlProvider, IAsyncDisposable
+public sealed class S3Storage : IExternalStorage, IUploadUrlProvider, IObjectStore, IAsyncDisposable
 {
     private const string ContentType = "application/vnd.apache.arrow.stream";
 
@@ -126,7 +126,70 @@ public sealed class S3Storage : IExternalStorage, IUploadUrlProvider, IAsyncDisp
         var uploadUrl = await _client.GetPreSignedURLAsync(putRequest).ConfigureAwait(false);
         var downloadUrl = await _client.GetPreSignedURLAsync(getRequest).ConfigureAwait(false);
         return new UploadUrl(uploadUrl, downloadUrl, new DateTimeOffset(expires, TimeSpan.Zero),
-            new Dictionary<string, string> { [ChecksumSha256Header] = checksum });
+            new Dictionary<string, string> { [ChecksumSha256Header] = checksum })
+        {
+            ObjectId = key,
+        };
+    }
+
+    /// <summary>The object API's <c>put_object</c> (<c>STATE_REF_V1.md</c> §10.1): a SigV4
+    /// <c>PutObject</c> under <c>&lt;keyPrefix&gt;&lt;uuid&gt;.bin</c> carrying
+    /// <c>ChecksumSHA256</c>, so S3/R2 verify the body. Returns the key. Objects carry no TTL:
+    /// set a lifecycle rule of at least one day on the key prefix.</summary>
+    public async Task<string> PutObjectAsync(byte[] data, CancellationToken cancellationToken)
+    {
+        var key = _keyPrefix + Guid.NewGuid().ToString("N") + ".bin";
+        using var stream = new MemoryStream(data);
+        var putRequest = new PutObjectRequest
+        {
+            BucketName = _bucket,
+            Key = key,
+            InputStream = stream,
+            ContentType = "application/octet-stream",
+            ChecksumSHA256 = Convert.ToBase64String(System.Security.Cryptography.SHA256.HashData(data)),
+            AutoCloseStream = false,
+        };
+        _ = await _client.PutObjectAsync(putRequest, cancellationToken).ConfigureAwait(false);
+        return key;
+    }
+
+    /// <summary>The object API's <c>get(object_id)</c>: a <c>GetObject</c> of the key, capped at
+    /// <paramref name="maxBytes"/> (default 256 MiB). <c>NoSuchKey</c>/404 is
+    /// <see cref="ObjectMissingException"/>.</summary>
+    public async Task<byte[]> GetAsync(string objectId, long? maxBytes, CancellationToken cancellationToken)
+    {
+        var limit = maxBytes ?? FetchConfig.DefaultMaxFetchBytes;
+        GetObjectResponse response;
+        try
+        {
+            response = await _client.GetObjectAsync(_bucket, objectId, cancellationToken).ConfigureAwait(false);
+        }
+        catch (AmazonS3Exception exc) when (exc.StatusCode == System.Net.HttpStatusCode.NotFound || exc.ErrorCode == "NoSuchKey")
+        {
+            throw new ObjectMissingException("S3 object is gone");
+        }
+
+        using (response)
+        {
+            if (response.ContentLength > limit)
+            {
+                throw new InvalidOperationException($"S3 object is {response.ContentLength} bytes, over max_fetch_bytes ({limit})");
+            }
+
+            using var buffer = new MemoryStream();
+            var chunk = new byte[81920];
+            int read;
+            while ((read = await response.ResponseStream.ReadAsync(chunk, cancellationToken).ConfigureAwait(false)) > 0)
+            {
+                buffer.Write(chunk, 0, read);
+                if (buffer.Length > limit)
+                {
+                    throw new InvalidOperationException($"S3 object exceeds max_fetch_bytes ({limit})");
+                }
+            }
+
+            return buffer.ToArray();
+        }
     }
 
     private const string ChecksumSha256Header = "x-amz-checksum-sha256";

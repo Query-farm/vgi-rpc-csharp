@@ -19,17 +19,28 @@ namespace QueryFarm.VgiRpc.Http;
 /// single-process deployment — which is what this port has (no multi-worker HTTP hosting yet) —
 /// at the cost of streams not surviving a process restart or being resumable on a different node.
 /// Revisit if/when this port needs horizontal HTTP scaling.
+///
+/// <para>Two clocks bound an entry: <c>ttl</c>, the idle eviction (default 10 minutes since the
+/// last turn), and <c>maxAge</c>, the maximum stream duration counted from <c>/init</c> -- the
+/// <c>token_ttl</c> every vgi-rpc SDK applies to its stream tokens (<c>STATE_REF_V1.md</c> §12,
+/// default <see cref="DefaultMaxAge"/>, 6 hours; zero disables it).</para>
 /// </summary>
-public sealed class StreamCallRegistry(TimeSpan? ttl = null)
+public sealed class StreamCallRegistry(TimeSpan? ttl = null, TimeSpan? maxAge = null)
 {
+    /// <summary>The default maximum stream duration: 21600 seconds (6 hours), the 3.4
+    /// <c>token_ttl</c>.</summary>
+    public static readonly TimeSpan DefaultMaxAge = TimeSpan.FromSeconds(21600);
+
     private readonly ConcurrentDictionary<string, Entry> _calls = new();
     private readonly TimeSpan _ttl = ttl ?? TimeSpan.FromMinutes(10);
+    private readonly TimeSpan _maxAge = maxAge ?? DefaultMaxAge;
 
     private sealed class Entry(IRpcStream stream, string principalKey, long? responseLimitBytes)
     {
         public IRpcStream Stream { get; } = stream;
         public string PrincipalKey { get; } = principalKey;
         public long? ResponseLimitBytes { get; } = responseLimitBytes;
+        public DateTimeOffset CreatedAt { get; } = DateTimeOffset.UtcNow;
         public DateTimeOffset LastAccess { get; set; } = DateTimeOffset.UtcNow;
     }
 
@@ -61,7 +72,8 @@ public sealed class StreamCallRegistry(TimeSpan? ttl = null)
     {
         if (_calls.TryGetValue(key, out var entry))
         {
-            if (DateTimeOffset.UtcNow - entry.LastAccess >= _ttl)
+            var now = DateTimeOffset.UtcNow;
+            if (now - entry.LastAccess >= _ttl || (_maxAge > TimeSpan.Zero && now - entry.CreatedAt > _maxAge))
             {
                 _calls.TryRemove(new KeyValuePair<string, Entry>(key, entry));
                 stream = null!;

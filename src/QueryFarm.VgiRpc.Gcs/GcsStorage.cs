@@ -17,7 +17,7 @@ namespace QueryFarm.VgiRpc.Gcs;
 /// URL. <see cref="StorageClient"/> is documented safe for concurrent use, satisfying both
 /// interfaces' thread-safety requirement.</para>
 /// </summary>
-public sealed class GcsStorage : IExternalStorage, IUploadUrlProvider, IDisposable
+public sealed class GcsStorage : IExternalStorage, IUploadUrlProvider, IObjectStore, IDisposable
 {
     private const string ContentType = "application/vnd.apache.arrow.stream";
 
@@ -104,7 +104,49 @@ public sealed class GcsStorage : IExternalStorage, IUploadUrlProvider, IDisposab
         var uploadUrl = await _signer.SignAsync(putTemplate, options, cancellationToken).ConfigureAwait(false);
         var downloadUrl = await _signer.SignAsync(_bucket, key, _signDuration, HttpMethod.Get, signingVersion: SigningVersion.V4, cancellationToken: cancellationToken).ConfigureAwait(false);
 
-        return new UploadUrl(uploadUrl, downloadUrl, expiresAt, headers);
+        return new UploadUrl(uploadUrl, downloadUrl, expiresAt, headers) { ObjectId = key };
+    }
+
+    /// <summary>The object API's <c>put_object</c> (<c>STATE_REF_V1.md</c> §10.1): uploads under
+    /// <c>&lt;keyPrefix&gt;&lt;uuid&gt;.bin</c> (create-only) and returns the name. GCS cannot verify
+    /// a SHA-256 at storage; callers verify the digest on read. Objects carry no TTL: set Object
+    /// Lifecycle Management of at least one day on the key prefix.</summary>
+    public async Task<string> PutObjectAsync(byte[] data, CancellationToken cancellationToken)
+    {
+        var key = _keyPrefix + Guid.NewGuid().ToString("N") + ".bin";
+        using var stream = new MemoryStream(data);
+        _ = await _client.UploadObjectAsync(
+            new GcsObject { Bucket = _bucket, Name = key, ContentType = UploadContentType },
+            stream,
+            new UploadObjectOptions { IfGenerationMatch = 0 },
+            cancellationToken).ConfigureAwait(false);
+        return key;
+    }
+
+    /// <summary>The object API's <c>get(object_id)</c>: downloads the named object, capped at
+    /// <paramref name="maxBytes"/> (default 256 MiB). A 404 is
+    /// <see cref="ObjectMissingException"/>.</summary>
+    public async Task<byte[]> GetAsync(string objectId, long? maxBytes, CancellationToken cancellationToken)
+    {
+        var limit = maxBytes ?? FetchConfig.DefaultMaxFetchBytes;
+        try
+        {
+            var metadata = await _client.GetObjectAsync(_bucket, objectId, cancellationToken: cancellationToken).ConfigureAwait(false);
+            if (metadata.Size is { } size && (long)size > limit)
+            {
+                throw new InvalidOperationException($"GCS object is {size} bytes, over max_fetch_bytes ({limit})");
+            }
+
+            using var buffer = new MemoryStream();
+            _ = await _client.DownloadObjectAsync(metadata, buffer, cancellationToken: cancellationToken).ConfigureAwait(false);
+            return buffer.Length > limit
+                ? throw new InvalidOperationException($"GCS object exceeds max_fetch_bytes ({limit})")
+                : buffer.ToArray();
+        }
+        catch (Google.GoogleApiException exc) when (exc.HttpStatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            throw new ObjectMissingException("GCS object is gone");
+        }
     }
 
     private const string UploadContentType = "application/octet-stream";
