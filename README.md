@@ -397,6 +397,24 @@ app.MapVgiRpc(server, externalization: externalization);
 the equivalent integration for Google Cloud Storage. Both implementations support server-managed
 uploads and signed upload/download URL pairs.
 
+### Blob vendor
+
+`VendorStorage` talks to a Query.Farm blob vendor, which holds the storage credentials so the
+server never does: it externalizes results, vends sized and checksummed client upload URLs (with
+the grant's `object_id` and sealed `ref`), and resolves argument references (`IObjectStore`). Every
+vended URL is pinned to the vendor's `/v1/info` hosts. `ExternalizationOptions.FromEnvironment()`
+builds the whole configuration from `VGI_BLOB_VENDOR_URL`, `VGI_BLOB_VENDOR_TOKEN`,
+`VGI_RPC_EXTERNALIZE_THRESHOLD_BYTES`, `VGI_RPC_EXTERNAL_COMPRESSION`, `VGI_RPC_MAX_REQUEST_BYTES`,
+`VGI_RPC_MAX_UPLOAD_BYTES` and `VGI_RPC_MAX_FETCH_BYTES` (an upload cap above an explicit fetch cap
+refuses to start):
+
+```csharp
+app.MapVgiRpc(server, tokenKey: sharedKey, externalization: ExternalizationOptions.FromEnvironment());
+```
+
+`VendorBlobClient` stores raw byte blobs (purpose `fs`) for callers that keep their own
+references, verifying each read against the reference's size and SHA-256.
+
 ### Pre-published results (`ExternalRef`)
 
 A large unary result that rarely changes (a catalog, say) can be published once and handed back

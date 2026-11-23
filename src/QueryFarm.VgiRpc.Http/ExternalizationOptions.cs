@@ -47,6 +47,54 @@ public sealed class ExternalizationOptions
     public IObjectStore? EffectiveObjectStore =>
         ObjectStore ?? External?.Storage as IObjectStore ?? UploadUrlProvider as IObjectStore;
 
+    /// <summary>Further capability headers stamped on every response beside vgi-rpc's own (e.g. an
+    /// application protocol's <c>VGI-Arguments-Ref-Bytes</c>). Names must not collide with
+    /// vgi-rpc's headers.</summary>
+    public IReadOnlyDictionary<string, string>? CapabilityHeaders { get; init; }
+
+    /// <summary>
+    /// The options the blob-vendor environment describes (vgi-rpc-go
+    /// <c>ConfigureHTTPServerFromEnv</c>): <c>VGI_RPC_MAX_REQUEST_BYTES</c> is advertised and
+    /// enforced whenever set; with <c>VGI_BLOB_VENDOR_URL</c>, large results are externalized
+    /// through a <see cref="VendorStorage"/>
+    /// (<see cref="BlobVendorEnvironment.ServerConfigFrom"/>), which also vends client upload URLs
+    /// and resolves argument references, and <c>VGI-Max-Upload-Bytes</c> is advertised
+    /// (<c>VGI_RPC_MAX_UPLOAD_BYTES</c>, else the inbound fetch cap). <see langword="null"/> when
+    /// neither is set.
+    /// </summary>
+    /// <param name="environment">Variable lookup; defaults to the process environment.</param>
+    /// <exception cref="ArgumentException">A malformed or contradictory value.</exception>
+    public static ExternalizationOptions? FromEnvironment(Func<string, string?>? environment = null)
+    {
+        var maxRequest = BlobVendorEnvironment.PositiveInt(BlobVendorEnvironment.MaxRequestBytes, environment);
+        var external = BlobVendorEnvironment.ServerConfigFrom(environment);
+        if (external is null)
+        {
+            return maxRequest is null ? null : new ExternalizationOptions { MaxRequestBytes = maxRequest };
+        }
+
+        return new ExternalizationOptions
+        {
+            External = external,
+            UploadUrlProvider = external.Storage as IUploadUrlProvider,
+            MaxRequestBytes = maxRequest,
+            MaxUploadBytes = BlobVendorEnvironment.PositiveInt(BlobVendorEnvironment.MaxUploadBytes, environment),
+        };
+    }
+
+    /// <summary>A copy with <see cref="CapabilityHeaders"/> replaced.</summary>
+    public ExternalizationOptions WithCapabilityHeaders(IReadOnlyDictionary<string, string>? headers) => new()
+    {
+        External = External,
+        UploadUrlProvider = UploadUrlProvider,
+        MaxRequestBytes = MaxRequestBytes,
+        MaxUploadBytes = MaxUploadBytes,
+        MaxExternalizedResponseBytes = MaxExternalizedResponseBytes,
+        ObjectStore = ObjectStore,
+        ObjectCache = ObjectCache,
+        CapabilityHeaders = headers,
+    };
+
     internal ExternalizationOptions With(long? maxUploadBytes = null, ServerExternalConfig? external = null) => new()
     {
         External = external ?? External,
@@ -56,6 +104,7 @@ public sealed class ExternalizationOptions
         MaxExternalizedResponseBytes = MaxExternalizedResponseBytes,
         ObjectStore = ObjectStore,
         ObjectCache = ObjectCache,
+        CapabilityHeaders = CapabilityHeaders,
     };
 
     /// <summary>Hard cap on the raw (pre-compression) byte count of any single externalized

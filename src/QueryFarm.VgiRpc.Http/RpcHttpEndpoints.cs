@@ -217,6 +217,14 @@ public static class RpcHttpEndpoints
                     context.Response.Headers["VGI-Max-Upload-Bytes"] = maxUploadBytes.ToString(System.Globalization.CultureInfo.InvariantCulture);
                 }
             }
+
+            if (externalization?.CapabilityHeaders is { } extra)
+            {
+                foreach (var (name, value) in extra)
+                {
+                    context.Response.Headers[name] = value;
+                }
+            }
         }
         var health = endpoints.MapMethods($"{prefix}/health", ["GET", "HEAD"], (HttpContext context) => { Stamp(context); return HandleHealthAsync(server, context, proxyProofRequired); });
         var capabilities = endpoints.MapMethods($"{prefix}/health", ["OPTIONS"], (HttpContext context) => { Stamp(context); return HandleCapabilitiesAsync(server, context, effectiveMaxResponseBytes, sticky, proxyProofRequired, externalization, effectiveMaxRequestBytes, authenticate, proxyHint); });
