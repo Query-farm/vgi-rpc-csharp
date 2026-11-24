@@ -415,6 +415,18 @@ app.MapVgiRpc(server, tokenKey: sharedKey, externalization: ExternalizationOptio
 `VendorBlobClient` stores raw byte blobs (purpose `fs`) for callers that keep their own
 references, verifying each read against the reference's size and SHA-256.
 
+### Storage transfer timeouts
+
+Storage transfers (the vendor's signed PUT and GET, `S3Storage` PUT/GET, ExternalLocation fetches)
+have a 30 s connect timeout and a 30 s **stall** timeout (no bytes moving: no request-body chunk
+written, no response bytes read) and no whole-request deadline, so a large object on a slow link is
+never cut off while it is moving. A stalled, reset or refused transfer, a 429 and a 5xx are retried
+(3 attempts, 0.25 s doubling backoff capped at 5 s, jittered). Set
+`VGI_RPC_STORAGE_STALL_TIMEOUT_SECONDS` to change the stall timeout (also `VendorOptions.StallTimeout`,
+`FetchConfig.StallTimeout`, `S3Storage.Builder.WithTransferTimeouts`). Vendor API calls keep a 30 s
+total timeout (`VendorOptions.Timeout`). `GcsStorage` uses the Google client's own timeouts and
+retries (resumable uploads in 10 MiB chunks); pass your own `StorageClient` to change them.
+
 ### Pre-published results (`ExternalRef`)
 
 A large unary result that rarely changes (a catalog, say) can be published once and handed back

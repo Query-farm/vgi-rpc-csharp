@@ -84,11 +84,21 @@ public sealed record VendorInfo(
 /// <summary>Tunes a vendor client. The defaults suit production.</summary>
 public sealed class VendorOptions
 {
-    /// <summary>Per-request timeout. Default 30 s.</summary>
+    /// <summary>Total timeout of one vendor API call (<c>/v1/info</c>, <c>/v1/blobs/put</c>, ...).
+    /// Default 30 s. Storage transfers (the signed PUT and GET) have no total deadline: they use
+    /// <see cref="ConnectTimeout"/> and <see cref="StallTimeout"/>.</summary>
     public TimeSpan Timeout { get; init; } = TimeSpan.FromSeconds(30);
 
-    /// <summary>Attempts per request; transport errors, 429 and 5xx are retried with exponential
-    /// backoff. Default 3.</summary>
+    /// <summary>TCP + TLS connect timeout of a storage transfer. Default 30 s.</summary>
+    public TimeSpan ConnectTimeout { get; init; } = StorageTimeouts.DefaultConnect;
+
+    /// <summary>How long a storage transfer may move no bytes (no request-body chunk written, no
+    /// response bytes read) before it fails and is retried. A transfer that keeps moving bytes is
+    /// never cut off. Default 30 s, or <c>VGI_RPC_STORAGE_STALL_TIMEOUT_SECONDS</c>.</summary>
+    public TimeSpan StallTimeout { get; init; } = StorageTimeouts.StallFromEnvironment();
+
+    /// <summary>Attempts per request; transport errors (connect, reset, stall), 429 and 5xx are
+    /// retried with exponential backoff (capped at 5 s, jittered). Default 3.</summary>
     public int MaxAttempts { get; init; } = 3;
 
     /// <summary>Base delay between attempts. Default 250 ms.</summary>
@@ -402,7 +412,6 @@ public static class PinnedHosts
 internal sealed class VendorApi : IDisposable
 {
     private const int MaxResponseBytes = 16 << 20;
-    private static readonly TimeSpan s_maxBackoff = TimeSpan.FromSeconds(5);
 
     private readonly string _baseUrl;
     private readonly string _token;
@@ -437,7 +446,9 @@ internal sealed class VendorApi : IDisposable
         {
             Timeout = _options.Timeout,
         };
-        _storage = new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false, UseCookies = false }) { Timeout = _options.Timeout };
+        // Storage hosts: a bare client with a connect timeout and no total deadline; each attempt
+        // is bounded by a stall watchdog instead (StorageSendAsync).
+        _storage = StorageTransport.NewClient(_options.ConnectTimeout);
     }
 
     public bool LoopbackHttp { get; }
@@ -451,18 +462,16 @@ internal sealed class VendorApi : IDisposable
     }
 
     private async Task<HttpResponseMessage> SendAsync(
-        Func<HttpRequestMessage> build, string url, string op, bool storage, CancellationToken cancellationToken)
+        Func<HttpRequestMessage> build, string url, string op, CancellationToken cancellationToken)
     {
-        var client = storage ? _storage : _vendor;
+        var client = _vendor;
         var lastError = "";
         var status = 0;
         for (var attempt = 0; attempt < Attempts; attempt++)
         {
             if (attempt > 0)
             {
-                var delay = TimeSpan.FromTicks(Math.Min(_options.Backoff.Ticks * (1L << (attempt - 1)), s_maxBackoff.Ticks));
-                delay = TimeSpan.FromTicks((long)(delay.Ticks * (0.5 + (Random.Shared.NextDouble() / 2))));
-                await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                await Task.Delay(StorageTransport.Backoff(_options.Backoff, attempt), cancellationToken).ConfigureAwait(false);
             }
 
             HttpResponseMessage response;
@@ -492,6 +501,65 @@ internal sealed class VendorApi : IDisposable
             }
 
             return response;
+        }
+
+        throw new BlobVendorException(
+            $"blob vendor {op} failed after {Attempts} attempts ({lastError}): {ExternalFetch.RedactUrl(url)}", status);
+    }
+
+    /// <summary>
+    /// One storage (signed URL) request with retries: connect errors, resets, stalls (also while
+    /// <paramref name="consume"/> reads the body), 429 and 5xx are retried with backoff. Each
+    /// attempt runs under a <see cref="StallWatchdog"/> and no total deadline, so a transfer that
+    /// keeps moving bytes is never cut off. <paramref name="consume"/> handles a final
+    /// (non-retryable-status) response; a <see cref="BlobVendorException"/> it throws is not
+    /// retried.
+    /// </summary>
+    private async Task<T> StorageSendAsync<T>(
+        Func<StallWatchdog, HttpRequestMessage> build,
+        string url,
+        string op,
+        Func<HttpResponseMessage, StallWatchdog, Task<T>> consume,
+        CancellationToken cancellationToken)
+    {
+        var lastError = "";
+        var status = 0;
+        for (var attempt = 0; attempt < Attempts; attempt++)
+        {
+            if (attempt > 0)
+            {
+                await Task.Delay(StorageTransport.Backoff(_options.Backoff, attempt), cancellationToken).ConfigureAwait(false);
+            }
+
+            using var watchdog = new StallWatchdog(_options.StallTimeout, _options.ConnectTimeout, cancellationToken);
+            try
+            {
+                using var request = build(watchdog);
+                using var response = await _storage.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, watchdog.Token).ConfigureAwait(false);
+                watchdog.Progress();
+                if (response.StatusCode == HttpStatusCode.TooManyRequests || (int)response.StatusCode >= 500)
+                {
+                    status = (int)response.StatusCode;
+                    lastError = $"HTTP {status}";
+                    continue;
+                }
+
+                return await consume(response, watchdog).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw new BlobVendorException($"blob vendor {op} cancelled: {ExternalFetch.RedactUrl(url)}");
+            }
+            catch (StorageBodyTooLargeException exc)
+            {
+                throw new BlobVendorException($"blob vendor {op}: {exc.Message}");
+            }
+            catch (Exception exc) when (exc is HttpRequestException or OperationCanceledException or IOException)
+            {
+                // Never exc.Message: it can embed the full (signed) URL.
+                status = 0;
+                lastError = watchdog.Stalled ? "stalled" : exc is HttpRequestException { HttpRequestError: HttpRequestError.ConnectionError } ? "connect error" : "transport error";
+            }
         }
 
         throw new BlobVendorException(
@@ -535,7 +603,7 @@ internal sealed class VendorApi : IDisposable
 
                 return request;
             },
-            url, op, storage: false, cancellationToken).ConfigureAwait(false);
+            url, op, cancellationToken).ConfigureAwait(false);
         byte[] data;
         try
         {
@@ -817,10 +885,10 @@ internal sealed class VendorApi : IDisposable
             headers.Add(new("Content-Encoding", contentEncoding));
         }
 
-        using var response = await SendAsync(
-            () =>
+        await StorageSendAsync(
+            watchdog =>
             {
-                var request = new HttpRequestMessage(HttpMethod.Put, grant.UploadUrl) { Content = new ByteArrayContent(data) };
+                var request = new HttpRequestMessage(HttpMethod.Put, grant.UploadUrl) { Content = new WatchedContent(data, watchdog) };
                 foreach (var (name, value) in headers)
                 {
                     if (!request.Headers.TryAddWithoutValidation(name, value))
@@ -831,15 +899,22 @@ internal sealed class VendorApi : IDisposable
 
                 return request;
             },
-            grant.UploadUrl, "upload", storage: true, cancellationToken).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode)
-        {
-            var body = await ReadCappedAsync(response, 1 << 16, cancellationToken).ConfigureAwait(false);
-            var code = S3ErrorCode(body);
-            throw new BlobVendorException(
-                $"signed upload failed: HTTP {(int)response.StatusCode}{(code.Length > 0 ? " " + code : "")}: {ExternalFetch.RedactUrl(grant.UploadUrl)}",
-                (int)response.StatusCode, code);
-        }
+            grant.UploadUrl,
+            "upload",
+            async (response, watchdog) =>
+            {
+                if (!response.IsSuccessStatusCode)
+                {
+                    var body = await StorageTransport.ReadCappedAsync(response, 1 << 16, watchdog).ConfigureAwait(false);
+                    var code = S3ErrorCode(body);
+                    throw new BlobVendorException(
+                        $"signed upload failed: HTTP {(int)response.StatusCode}{(code.Length > 0 ? " " + code : "")}: {ExternalFetch.RedactUrl(grant.UploadUrl)}",
+                        (int)response.StatusCode, code);
+                }
+
+                return true;
+            },
+            cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>GETs a signed URL on the bare storage client, pinned and capped.</summary>
@@ -854,28 +929,27 @@ internal sealed class VendorApi : IDisposable
             throw new BlobVendorException($"download rejected: {exc.Message}");
         }
 
-        using var response = await SendAsync(() => new HttpRequestMessage(HttpMethod.Get, url), url, "download", storage: true, cancellationToken)
-            .ConfigureAwait(false);
-        if (response.StatusCode != HttpStatusCode.OK)
-        {
-            var body = await ReadCappedAsync(response, 1 << 16, cancellationToken).ConfigureAwait(false);
-            throw new BlobVendorException(
-                $"download failed: HTTP {(int)response.StatusCode}: {ExternalFetch.RedactUrl(url)}", (int)response.StatusCode, S3ErrorCode(body));
-        }
+        return await StorageSendAsync(
+            _ => new HttpRequestMessage(HttpMethod.Get, url),
+            url,
+            "download",
+            async (response, watchdog) =>
+            {
+                if (response.StatusCode != HttpStatusCode.OK)
+                {
+                    var body = await StorageTransport.ReadCappedAsync(response, 1 << 16, watchdog).ConfigureAwait(false);
+                    throw new BlobVendorException(
+                        $"download failed: HTTP {(int)response.StatusCode}: {ExternalFetch.RedactUrl(url)}", (int)response.StatusCode, S3ErrorCode(body));
+                }
 
-        if (response.Content.Headers.ContentLength > maxBytes)
-        {
-            throw new BlobVendorException($"download of {response.Content.Headers.ContentLength} bytes exceeds the {maxBytes}-byte cap");
-        }
+                if (response.Content.Headers.ContentLength > maxBytes)
+                {
+                    throw new BlobVendorException($"download of {response.Content.Headers.ContentLength} bytes exceeds the {maxBytes}-byte cap");
+                }
 
-        try
-        {
-            return await ReadCappedAsync(response, maxBytes, cancellationToken).ConfigureAwait(false);
-        }
-        catch (Exception exc) when (exc is HttpRequestException or IOException)
-        {
-            throw new BlobVendorException($"download failed while reading: {ExternalFetch.RedactUrl(url)}");
-        }
+                return await StorageTransport.ReadCappedAsync(response, maxBytes, watchdog).ConfigureAwait(false);
+            },
+            cancellationToken).ConfigureAwait(false);
     }
 }
 
@@ -960,13 +1034,6 @@ public abstract class VendorClientBase : IDisposable
             throw new BlobVendorException($"blob vendor returned a URL off its pinned hosts: {exc.Message}");
         }
     }
-
-    private protected CancellationTokenSource RequestTimeout(CancellationToken cancellationToken)
-    {
-        var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        cts.CancelAfter(Api.Attempts * (Options.Timeout + TimeSpan.FromSeconds(5)));
-        return cts;
-    }
 }
 
 /// <summary>
@@ -1008,11 +1075,10 @@ public sealed class VendorStorage : VendorClientBase, IExternalStorage, IUploadU
     /// <inheritdoc/>
     public async Task<string> UploadAsync(byte[] data, Schema schema, string? contentEncoding, CancellationToken cancellationToken)
     {
-        using var cts = RequestTimeout(cancellationToken);
-        var grant = await Api.PutAsync(data.LongLength, B64Sha256(data), _purpose, null, contentEncoding, null, null, cts.Token).ConfigureAwait(false);
+        var grant = await Api.PutAsync(data.LongLength, B64Sha256(data), _purpose, null, contentEncoding, null, null, cancellationToken).ConfigureAwait(false);
         Check(grant.UploadUrl);
-        await Api.PutObjectAsync(grant, data, contentEncoding, cts.Token).ConfigureAwait(false);
-        var downloadUrl = grant.DownloadUrl.Length > 0 ? grant.DownloadUrl : (await Api.GetAsync(grant.ObjectId, cts.Token).ConfigureAwait(false)).DownloadUrl;
+        await Api.PutObjectAsync(grant, data, contentEncoding, cancellationToken).ConfigureAwait(false);
+        var downloadUrl = grant.DownloadUrl.Length > 0 ? grant.DownloadUrl : (await Api.GetAsync(grant.ObjectId, cancellationToken).ConfigureAwait(false)).DownloadUrl;
         Check(downloadUrl);
         return downloadUrl;
     }
@@ -1035,8 +1101,7 @@ public sealed class VendorStorage : VendorClientBase, IExternalStorage, IUploadU
             throw new ArgumentException("upload sha256 must be 64 hex characters", nameof(sha256Hex));
         }
 
-        using var cts = RequestTimeout(cancellationToken);
-        var grant = await Api.PutAsync(size, Convert.ToBase64String(digest), BlobPurpose.Rpc, null, null, null, ClientUploadOrigin, cts.Token)
+        var grant = await Api.PutAsync(size, Convert.ToBase64String(digest), BlobPurpose.Rpc, null, null, null, ClientUploadOrigin, cancellationToken)
             .ConfigureAwait(false);
         if (grant.DownloadUrl.Length == 0)
         {
@@ -1068,11 +1133,10 @@ public sealed class VendorStorage : VendorClientBase, IExternalStorage, IUploadU
     /// <inheritdoc/>
     public async Task<string> PutObjectAsync(byte[] data, CancellationToken cancellationToken)
     {
-        using var cts = RequestTimeout(cancellationToken);
-        var grant = await Api.PutAsync(data.LongLength, B64Sha256(data), BlobPurpose.Rpc, null, null, null, StateRefOrigin, cts.Token)
+        var grant = await Api.PutAsync(data.LongLength, B64Sha256(data), BlobPurpose.Rpc, null, null, null, StateRefOrigin, cancellationToken)
             .ConfigureAwait(false);
         Check(grant.UploadUrl);
-        await Api.PutObjectAsync(grant, data, null, cts.Token).ConfigureAwait(false);
+        await Api.PutObjectAsync(grant, data, null, cancellationToken).ConfigureAwait(false);
         return grant.ObjectId;
     }
 
@@ -1080,11 +1144,10 @@ public sealed class VendorStorage : VendorClientBase, IExternalStorage, IUploadU
     public async Task<byte[]> GetAsync(string objectId, long? maxBytes, CancellationToken cancellationToken)
     {
         var cap = maxBytes is > 0 ? maxBytes.Value : FetchConfig.DefaultMaxFetchBytes;
-        using var cts = RequestTimeout(cancellationToken);
         VendorApi.BlobLocation location;
         try
         {
-            location = await Api.GetAsync(objectId, cts.Token).ConfigureAwait(false);
+            location = await Api.GetAsync(objectId, cancellationToken).ConfigureAwait(false);
         }
         catch (BlobVendorException exc) when (exc.Code is "not_found" or "not_uploaded" || exc.Status == 404)
         {
@@ -1103,7 +1166,7 @@ public sealed class VendorStorage : VendorClientBase, IExternalStorage, IUploadU
 
         try
         {
-            return await Api.DownloadAsync(location.DownloadUrl, ValidateUrl, cap, cts.Token).ConfigureAwait(false);
+            return await Api.DownloadAsync(location.DownloadUrl, ValidateUrl, cap, cancellationToken).ConfigureAwait(false);
         }
         catch (BlobVendorException exc) when (exc.Status == 404)
         {

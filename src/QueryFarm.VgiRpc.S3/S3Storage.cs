@@ -16,6 +16,11 @@ namespace QueryFarm.VgiRpc.S3;
 /// <para>Uploads under <c>&lt;keyPrefix&gt;&lt;uuid&gt;.arrow</c> and returns a V4 pre-signed GET
 /// URL. <see cref="AmazonS3Client"/> is documented thread-safe for concurrent calls, satisfying
 /// both interfaces' thread-safety requirement.</para>
+/// <para>Transfers have no whole-request deadline (the SDK's default 100 s <c>Timeout</c> would fail
+/// a large object on a slow link): <c>AmazonS3Config.Timeout</c> is infinite and each PUT/GET runs
+/// under a stall watchdog instead (<see cref="StorageTimeouts"/>: 30 s with no bytes moving, or
+/// <c>VGI_RPC_STORAGE_STALL_TIMEOUT_SECONDS</c>), retried up to 3 attempts on a stall. The SDK's
+/// own retry policy still handles 5xx, throttling and connection errors.</para>
 /// </summary>
 public sealed class S3Storage : IExternalStorage, IUploadUrlProvider, IObjectStore, IAsyncDisposable
 {
@@ -26,7 +31,9 @@ public sealed class S3Storage : IExternalStorage, IUploadUrlProvider, IObjectSto
     private readonly string _keyPrefix;
     private readonly TimeSpan _presignDuration;
     private readonly Protocol? _presignProtocol;
+    private readonly StorageTimeouts _timeouts;
     private int _disposed;
+    private const int StallAttempts = 3;
 
     private S3Storage(Builder builder)
     {
@@ -34,9 +41,13 @@ public sealed class S3Storage : IExternalStorage, IUploadUrlProvider, IObjectSto
         _keyPrefix = builder.KeyPrefix.EndsWith('/') ? builder.KeyPrefix : builder.KeyPrefix + "/";
         _presignDuration = builder.PresignDuration;
 
+        _timeouts = builder.Timeouts ?? StorageTimeouts.FromEnvironment();
         var config = new AmazonS3Config
         {
             ForcePathStyle = builder.ForcePathStyle,
+
+            // No total deadline: each transfer is bounded by a stall watchdog (WithStallRetriesAsync).
+            Timeout = System.Threading.Timeout.InfiniteTimeSpan,
         };
 
         // Setting RegionEndpoint together with a custom ServiceURL is a real AWSSDK.S3 v4
@@ -80,21 +91,25 @@ public sealed class S3Storage : IExternalStorage, IUploadUrlProvider, IObjectSto
     public async Task<string> UploadAsync(byte[] data, Schema schema, string? contentEncoding, CancellationToken cancellationToken)
     {
         var key = _keyPrefix + Guid.NewGuid().ToString("D") + ".arrow";
-        using var stream = new MemoryStream(data);
-        var putRequest = new PutObjectRequest
+        await WithStallRetriesAsync("PUT", async watchdog =>
         {
-            BucketName = _bucket,
-            Key = key,
-            InputStream = stream,
-            ContentType = ContentType,
-            AutoCloseStream = false,
-        };
-        if (contentEncoding is not null)
-        {
-            putRequest.Headers.ContentEncoding = contentEncoding;
-        }
+            using var stream = new ProgressStream(new MemoryStream(data), watchdog);
+            var putRequest = new PutObjectRequest
+            {
+                BucketName = _bucket,
+                Key = key,
+                InputStream = stream,
+                ContentType = ContentType,
+                AutoCloseStream = false,
+            };
+            if (contentEncoding is not null)
+            {
+                putRequest.Headers.ContentEncoding = contentEncoding;
+            }
 
-        _ = await _client.PutObjectAsync(putRequest, cancellationToken).ConfigureAwait(false);
+            _ = await _client.PutObjectAsync(putRequest, watchdog.Token).ConfigureAwait(false);
+            return true;
+        }, cancellationToken).ConfigureAwait(false);
 
         var presignRequest = NewPresignRequest(key, HttpVerb.GET, DateTime.UtcNow.Add(_presignDuration));
         return await _client.GetPreSignedURLAsync(presignRequest).ConfigureAwait(false);
@@ -139,17 +154,22 @@ public sealed class S3Storage : IExternalStorage, IUploadUrlProvider, IObjectSto
     public async Task<string> PutObjectAsync(byte[] data, CancellationToken cancellationToken)
     {
         var key = _keyPrefix + Guid.NewGuid().ToString("N") + ".bin";
-        using var stream = new MemoryStream(data);
-        var putRequest = new PutObjectRequest
+        var checksum = Convert.ToBase64String(System.Security.Cryptography.SHA256.HashData(data));
+        await WithStallRetriesAsync("PUT", async watchdog =>
         {
-            BucketName = _bucket,
-            Key = key,
-            InputStream = stream,
-            ContentType = "application/octet-stream",
-            ChecksumSHA256 = Convert.ToBase64String(System.Security.Cryptography.SHA256.HashData(data)),
-            AutoCloseStream = false,
-        };
-        _ = await _client.PutObjectAsync(putRequest, cancellationToken).ConfigureAwait(false);
+            using var stream = new ProgressStream(new MemoryStream(data), watchdog);
+            var putRequest = new PutObjectRequest
+            {
+                BucketName = _bucket,
+                Key = key,
+                InputStream = stream,
+                ContentType = "application/octet-stream",
+                ChecksumSHA256 = checksum,
+                AutoCloseStream = false,
+            };
+            _ = await _client.PutObjectAsync(putRequest, watchdog.Token).ConfigureAwait(false);
+            return true;
+        }, cancellationToken).ConfigureAwait(false);
         return key;
     }
 
@@ -159,36 +179,71 @@ public sealed class S3Storage : IExternalStorage, IUploadUrlProvider, IObjectSto
     public async Task<byte[]> GetAsync(string objectId, long? maxBytes, CancellationToken cancellationToken)
     {
         var limit = maxBytes ?? FetchConfig.DefaultMaxFetchBytes;
-        GetObjectResponse response;
-        try
+        return await WithStallRetriesAsync("GET", async watchdog =>
         {
-            response = await _client.GetObjectAsync(_bucket, objectId, cancellationToken).ConfigureAwait(false);
-        }
-        catch (AmazonS3Exception exc) when (exc.StatusCode == System.Net.HttpStatusCode.NotFound || exc.ErrorCode == "NoSuchKey")
-        {
-            throw new ObjectMissingException("S3 object is gone");
-        }
-
-        using (response)
-        {
-            if (response.ContentLength > limit)
+            GetObjectResponse response;
+            try
             {
-                throw new InvalidOperationException($"S3 object is {response.ContentLength} bytes, over max_fetch_bytes ({limit})");
+                response = await _client.GetObjectAsync(_bucket, objectId, watchdog.Token).ConfigureAwait(false);
+            }
+            catch (AmazonS3Exception exc) when (exc.StatusCode == System.Net.HttpStatusCode.NotFound || exc.ErrorCode == "NoSuchKey")
+            {
+                throw new ObjectMissingException("S3 object is gone");
             }
 
-            using var buffer = new MemoryStream();
-            var chunk = new byte[81920];
-            int read;
-            while ((read = await response.ResponseStream.ReadAsync(chunk, cancellationToken).ConfigureAwait(false)) > 0)
+            using (response)
             {
-                buffer.Write(chunk, 0, read);
-                if (buffer.Length > limit)
+                watchdog.Progress();
+                if (response.ContentLength > limit)
                 {
-                    throw new InvalidOperationException($"S3 object exceeds max_fetch_bytes ({limit})");
+                    throw new InvalidOperationException($"S3 object is {response.ContentLength} bytes, over max_fetch_bytes ({limit})");
+                }
+
+                using var buffer = new MemoryStream();
+                var chunk = new byte[81920];
+                int read;
+                while ((read = await response.ResponseStream.ReadAsync(chunk, watchdog.Token).ConfigureAwait(false)) > 0)
+                {
+                    watchdog.Progress();
+                    buffer.Write(chunk, 0, read);
+                    if (buffer.Length > limit)
+                    {
+                        throw new InvalidOperationException($"S3 object exceeds max_fetch_bytes ({limit})");
+                    }
+                }
+
+                return buffer.ToArray();
+            }
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Runs one SDK transfer per attempt under a fresh <see cref="StallWatchdog"/>; an
+    /// attempt the watchdog cancelled (no bytes moving for the stall timeout) is retried, up to
+    /// <see cref="StallAttempts"/> in all, with jittered exponential backoff. Anything else
+    /// propagates (the SDK has already applied its own retry policy).</summary>
+    private async Task<T> WithStallRetriesAsync<T>(string op, Func<StallWatchdog, Task<T>> attempt, CancellationToken cancellationToken)
+    {
+        for (var n = 0; ; n++)
+        {
+            if (n > 0)
+            {
+                var delay = TimeSpan.FromMilliseconds(Math.Min(250 * (1 << (n - 1)), 5000) * (0.5 + (Random.Shared.NextDouble() / 2)));
+                await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+            }
+
+            using var watchdog = new StallWatchdog(_timeouts.Stall, _timeouts.Connect, cancellationToken);
+            try
+            {
+                return await attempt(watchdog).ConfigureAwait(false);
+            }
+            catch (Exception exc) when (watchdog.Stalled && !cancellationToken.IsCancellationRequested
+                && exc is OperationCanceledException or IOException or HttpRequestException or AmazonServiceException)
+            {
+                if (n + 1 >= StallAttempts)
+                {
+                    throw new TimeoutException($"S3 {op} stalled (no bytes moved for {_timeouts.Stall.TotalSeconds:0.###} s) on each of {StallAttempts} attempts");
                 }
             }
-
-            return buffer.ToArray();
         }
     }
 
@@ -236,6 +291,7 @@ public sealed class S3Storage : IExternalStorage, IUploadUrlProvider, IObjectSto
         internal bool ForcePathStyle { get; private set; }
         internal TimeSpan PresignDuration { get; private set; } = TimeSpan.FromHours(1);
         internal AWSCredentials? Credentials { get; private set; }
+        internal StorageTimeouts? Timeouts { get; private set; }
 
         internal Builder(string bucket) => Bucket = bucket;
 
@@ -257,7 +313,64 @@ public sealed class S3Storage : IExternalStorage, IUploadUrlProvider, IObjectSto
         /// <summary>Overrides the credentials (default: the SDK's own default credential chain).</summary>
         public Builder WithCredentials(AWSCredentials credentials) { Credentials = credentials; return this; }
 
+        /// <summary>Connect and stall timeouts of each transfer (default
+        /// <see cref="StorageTimeouts.FromEnvironment"/>: 30 s / 30 s).</summary>
+        public Builder WithTransferTimeouts(StorageTimeouts timeouts) { Timeouts = timeouts; return this; }
+
         /// <summary>Builds the configured <see cref="S3Storage"/>.</summary>
         public S3Storage Build() => new(this);
+    }
+}
+
+/// <summary>A read-through stream that reports each read as transfer progress (the SDK reads the
+/// request body from it as it sends).</summary>
+internal sealed class ProgressStream(Stream inner, StallWatchdog watchdog) : Stream
+{
+    public override bool CanRead => inner.CanRead;
+    public override bool CanSeek => inner.CanSeek;
+    public override bool CanWrite => false;
+    public override long Length => inner.Length;
+
+    public override long Position
+    {
+        get => inner.Position;
+        set => inner.Position = value;
+    }
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        var n = inner.Read(buffer, offset, count);
+        watchdog.Progress();
+        return n;
+    }
+
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        var n = await inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+        watchdog.Progress();
+        return n;
+    }
+
+    public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+        ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+    public override long Seek(long offset, SeekOrigin origin) => inner.Seek(offset, origin);
+
+    public override void Flush()
+    {
+    }
+
+    public override void SetLength(long value) => throw new NotSupportedException();
+
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            inner.Dispose();
+        }
+
+        base.Dispose(disposing);
     }
 }

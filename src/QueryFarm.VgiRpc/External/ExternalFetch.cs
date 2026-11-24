@@ -18,11 +18,16 @@ namespace QueryFarm.VgiRpc.External;
 /// </summary>
 public static class ExternalFetch
 {
-    private static readonly HttpClient s_client = new(new HttpClientHandler
-    {
-        AllowAutoRedirect = false, // redirects are followed manually so each hop can be validated
-        AutomaticDecompression = System.Net.DecompressionMethods.None, // Content-Encoding is informational metadata here, not a negotiated transport encoding — decompressed manually against ExternalCompression
-    });
+    // Redirects are followed manually so each hop can be validated; Content-Encoding is
+    // informational metadata here, not a negotiated transport encoding (decompressed manually
+    // against ExternalCompression). Connect timeout 30 s and no total deadline: each attempt is
+    // bounded by FetchConfig.Timeout up to the response headers and by a stall watchdog
+    // (FetchConfig.StallTimeout) over the body, so a large object on a slow link is never cut off
+    // while bytes are still arriving.
+    private static readonly HttpClient s_client = StorageTransport.NewClient(StorageTimeouts.DefaultConnect);
+
+    private const int Attempts = 3;
+    private static readonly TimeSpan s_backoff = TimeSpan.FromMilliseconds(250);
 
     /// <summary>Rejects URLs that do not use the <c>https</c> scheme — the default
     /// <see cref="ServerExternalConfig.UrlValidator"/>/<see cref="ClientExternalConfig.UrlValidator"/>.</summary>
@@ -95,17 +100,79 @@ public static class ExternalFetch
                 }
             }
 
-            using var request = new HttpRequestMessage(HttpMethod.Get, current);
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            cts.CancelAfter(config.Timeout);
-            HttpResponseMessage response;
-            try
+            // Retry connect errors, resets, stalls (also mid-body), 429 and 5xx: up to Attempts
+            // tries with jittered exponential backoff. A body that keeps arriving is read to the
+            // end however slowly it comes.
+            HttpResponseMessage? response = null;
+            StallWatchdog? watchdog = null;
+            byte[]? encoded = null;
+            var lastError = "";
+            for (var attempt = 0; attempt < Attempts; attempt++)
             {
-                response = await s_client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token).ConfigureAwait(false);
+                if (attempt > 0)
+                {
+                    await Task.Delay(StorageTransport.Backoff(s_backoff, attempt), cancellationToken).ConfigureAwait(false);
+                }
+
+                response?.Dispose();
+                response = null;
+                watchdog?.Dispose();
+                watchdog = new StallWatchdog(config.StallTimeout, StorageTimeouts.DefaultConnect, cancellationToken);
+                using var request = new HttpRequestMessage(HttpMethod.Get, current);
+                try
+                {
+                    using (var headerDeadline = CancellationTokenSource.CreateLinkedTokenSource(watchdog.Token))
+                    {
+                        headerDeadline.CancelAfter(config.Timeout);
+                        response = await s_client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, headerDeadline.Token).ConfigureAwait(false);
+                    }
+
+                    watchdog.Progress();
+                    var code = (int)response.StatusCode;
+                    if (code == 429 || code >= 500)
+                    {
+                        lastError = $"HTTP {code}";
+                        continue;
+                    }
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        break;
+                    }
+
+                    if (response.Content.Headers.ContentLength is { } declaredLength && declaredLength > config.MaxFetchBytes)
+                    {
+                        throw new RpcException("RuntimeError", $"ExternalLocation fetch exceeded max_fetch_bytes ({declaredLength} > {config.MaxFetchBytes}) for {RedactUrl(current)}");
+                    }
+
+                    encoded = await ReadBoundedAsync(response.Content, config.MaxFetchBytes, "max_fetch_bytes", current, watchdog).ConfigureAwait(false);
+                    break;
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    response?.Dispose();
+                    watchdog.Dispose();
+                    throw;
+                }
+                catch (RpcException)
+                {
+                    response?.Dispose();
+                    watchdog.Dispose();
+                    throw;
+                }
+                catch (Exception exc) when (exc is HttpRequestException or OperationCanceledException or IOException)
+                {
+                    lastError = watchdog.Stalled ? "stalled" : exc.GetType().Name;
+                    response?.Dispose();
+                    response = null;
+                }
             }
-            catch (Exception exc) when (exc is HttpRequestException or TaskCanceledException)
+
+            watchdog?.Dispose();
+            if (response is null || (encoded is null && ((int)response.StatusCode == 429 || (int)response.StatusCode >= 500)))
             {
-                throw new RpcException("RuntimeError", $"ExternalLocation fetch failed for {RedactUrl(current)}: {exc.GetType().Name}");
+                response?.Dispose();
+                throw new RpcException("RuntimeError", $"ExternalLocation fetch failed for {RedactUrl(current)} after {Attempts} attempts: {lastError}");
             }
 
             using (response)
@@ -124,12 +191,10 @@ public static class ExternalFetch
                     throw new RpcException("RuntimeError", $"ExternalLocation fetch failed with status {(int)response.StatusCode} for {RedactUrl(current)}");
                 }
 
-                if (response.Content.Headers.ContentLength is { } declaredLength && declaredLength > config.MaxFetchBytes)
+                if (encoded is null)
                 {
-                    throw new RpcException("RuntimeError", $"ExternalLocation fetch exceeded max_fetch_bytes ({declaredLength} > {config.MaxFetchBytes}) for {RedactUrl(current)}");
+                    throw new RpcException("RuntimeError", $"ExternalLocation fetch failed for {RedactUrl(current)}: {lastError}");
                 }
-
-                var encoded = await ReadBoundedAsync(response.Content, config.MaxFetchBytes, "max_fetch_bytes", current, cancellationToken).ConfigureAwait(false);
 
                 var contentEncoding = response.Content.Headers.ContentEncoding.FirstOrDefault();
                 if (string.IsNullOrEmpty(contentEncoding))
@@ -165,14 +230,15 @@ public static class ExternalFetch
     /// <summary>Streams <paramref name="content"/> into memory, aborting as soon as the running
     /// total exceeds <paramref name="capBytes"/> — a missing/understated <c>Content-Length</c>
     /// must not let an oversized body be read to completion before the cap is enforced.</summary>
-    private static async Task<byte[]> ReadBoundedAsync(HttpContent content, long capBytes, string capName, string urlForError, CancellationToken cancellationToken)
+    private static async Task<byte[]> ReadBoundedAsync(HttpContent content, long capBytes, string capName, string urlForError, StallWatchdog watchdog)
     {
-        await using var stream = await content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        await using var stream = await content.ReadAsStreamAsync(watchdog.Token).ConfigureAwait(false);
         using var buffer = new MemoryStream();
         var chunk = new byte[81920];
         int read;
-        while ((read = await stream.ReadAsync(chunk, cancellationToken).ConfigureAwait(false)) > 0)
+        while ((read = await stream.ReadAsync(chunk, watchdog.Token).ConfigureAwait(false)) > 0)
         {
+            watchdog.Progress();
             buffer.Write(chunk, 0, read);
             if (buffer.Length > capBytes)
             {
@@ -213,6 +279,7 @@ public sealed class FetchConfig
         MaxDecompressedBytes = MaxDecompressedBytes,
         MaxRedirects = MaxRedirects,
         Timeout = Timeout,
+        StallTimeout = StallTimeout,
     };
 
     /// <summary>Hard cap after content decoding. <see langword="null"/> means
@@ -223,8 +290,12 @@ public sealed class FetchConfig
     /// <c>0</c> rejects any redirect.</summary>
     public int MaxRedirects { get; init; } = 5;
 
-    /// <summary>Overall deadline for one fetch (one hop's request/response cycle; the redirect
-    /// loop as a whole is bounded by <see cref="MaxRedirects"/>, not by a single shared deadline —
-    /// a documented simplification versus Python's single end-to-end timeout).</summary>
+    /// <summary>Deadline for one attempt's response headers (connect, send, and the server's time to
+    /// first byte). The body has no total deadline: it is bounded by <see cref="StallTimeout"/>, so a
+    /// large object on a slow link is read to the end while bytes keep arriving. Default 60 s.</summary>
     public TimeSpan Timeout { get; init; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>How long the response body may deliver no bytes before the fetch fails (and is
+    /// retried, up to 3 attempts). Default 30 s, or <c>VGI_RPC_STORAGE_STALL_TIMEOUT_SECONDS</c>.</summary>
+    public TimeSpan StallTimeout { get; init; } = StorageTimeouts.StallFromEnvironment();
 }
