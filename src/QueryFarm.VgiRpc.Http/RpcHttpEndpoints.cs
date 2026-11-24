@@ -205,28 +205,48 @@ public static class RpcHttpEndpoints
 
         var registry = new StreamCallRegistry(maxAge: tokenTtl);
 
-        // Responses no endpoint here produces (an unmatched path's 404, a CORS preflight, a
-        // framework 5xx) advertise too, when the host lets us join its pipeline. Hosts that build
-        // their own pipeline call UseVgiRpcProtocolVersions first themselves.
+        // Responses no endpoint here produces (an unmatched path's 404, a CORS preflight, an
+        // authentication gate's 401, a framework 5xx) carry the same capability headers as a 200,
+        // when the host lets us join its pipeline. Hosts that build their own pipeline, or put a
+        // gate ahead of this call, register UseVgiRpcCapabilityHeaders first themselves.
         if (endpoints is IApplicationBuilder pipeline)
         {
-            pipeline.UseVgiRpcProtocolVersions(server);
+            pipeline.UseVgiRpcCapabilityHeaders(server);
         }
 
-        void Stamp(HttpContext context)
+        void StampResponse(HttpResponse response, bool onlyIfAbsent)
         {
+            var headers = response.Headers;
+            void Set(string name, string value)
+            {
+                if (!onlyIfAbsent || !headers.ContainsKey(name))
+                {
+                    headers[name] = value;
+                }
+            }
+
             // Protocol version negotiation (PROTOCOL_VERSIONS_V1.md §4.1): every response names the
             // window of every gated protocol, present even when empty ("negotiates, gates nothing").
-            context.Response.Headers[ProtocolVersions.Header] = server.ProtocolVersions;
-            ApplyResponseBudgetCapabilities(context.Response, effectiveMaxRequestBytes, effectiveMaxResponseBytes);
+            Set(ProtocolVersions.Header, server.ProtocolVersions);
+            Set(AcceptMaxResponseBytesSupportHeader, "true");
+            if (effectiveMaxRequestBytes is { } requestCap)
+            {
+                Set("VGI-Max-Request-Bytes", requestCap.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+
+            if (effectiveMaxResponseBytes is { } responseCap)
+            {
+                Set("VGI-Max-Response-Bytes", responseCap.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+
             // Like the reference's capability headers: every response advertises the upload-URL
-            // protocol, so a client holding any response (a 413 included) can tell v2 from v1.
+            // protocol, so a client holding any response (a 413 or a 401 included) can tell v2 from v1.
             if (externalization?.UploadUrlProvider is not null)
             {
-                context.Response.Headers["VGI-Upload-URL-Support"] = UploadUrlProtocolVersion;
+                Set("VGI-Upload-URL-Support", UploadUrlProtocolVersion);
                 if (externalization.MaxUploadBytes is { } maxUploadBytes)
                 {
-                    context.Response.Headers["VGI-Max-Upload-Bytes"] = maxUploadBytes.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    Set("VGI-Max-Upload-Bytes", maxUploadBytes.ToString(System.Globalization.CultureInfo.InvariantCulture));
                 }
             }
 
@@ -234,10 +254,17 @@ public static class RpcHttpEndpoints
             {
                 foreach (var (name, value) in extra)
                 {
-                    context.Response.Headers[name] = value;
+                    Set(name, value);
                 }
             }
         }
+
+        // What UseVgiRpcCapabilityHeaders stamps on responses no endpoint here produced: only the
+        // headers they lack, so a gate's own answer keeps whatever it set.
+        s_capabilityStampers.AddOrUpdate(server, response => StampResponse(response, onlyIfAbsent: true));
+
+        void Stamp(HttpContext context) => StampResponse(context.Response, onlyIfAbsent: false);
+
         var health = endpoints.MapMethods($"{prefix}/health", ["GET", "HEAD"], (HttpContext context) => { Stamp(context); return HandleHealthAsync(server, context, proxyProofRequired); });
         var capabilities = endpoints.MapMethods($"{prefix}/health", ["OPTIONS"], (HttpContext context) => { Stamp(context); return HandleCapabilitiesAsync(server, context, effectiveMaxResponseBytes, sticky, proxyProofRequired, externalization, effectiveMaxRequestBytes, authenticate, proxyHint); });
         // RPC paths are namespaced by protocol: {prefix}/{protocol}/{method}[/init|/exchange].
@@ -284,14 +311,19 @@ public static class RpcHttpEndpoints
         return endpoints;
     }
 
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<RpcServer, Action<HttpResponse>> s_capabilityStampers = new();
+
     /// <summary>
-    /// Stamps <c>VGI-Protocol-Versions</c> (PROTOCOL_VERSIONS_V1.md §4.1) on every response the
-    /// pipeline gives from here on, including ones no vgi-rpc endpoint produced: an unmatched
-    /// path's 404, a CORS preflight answered by <c>UseCors</c>, a framework error. Register it
-    /// ahead of <c>UseCors</c> and anything else that may answer on its own. <c>MapVgiRpc</c>
-    /// registers it itself when given a <c>WebApplication</c>; calling it twice is harmless.
+    /// Stamps the capability headers -- <c>VGI-Protocol-Versions</c> (PROTOCOL_VERSIONS_V1.md §4.1),
+    /// and, once <c>MapVgiRpc</c> has mapped <paramref name="server"/>, the response budgets, the
+    /// upload-URL and externalization headers -- on every response the pipeline gives from here on,
+    /// including ones no vgi-rpc endpoint produced: an authentication gate's 401 (a client needs
+    /// them there to start OAuth), an unmatched path's 404, a CORS preflight answered by
+    /// <c>UseCors</c>, a framework error. Only headers a response lacks are added. Register it ahead
+    /// of any gate, <c>UseCors</c>, and anything else that may answer on its own; <c>MapVgiRpc</c>
+    /// registers it itself when given a <c>WebApplication</c>, and calling it twice is harmless.
     /// </summary>
-    public static IApplicationBuilder UseVgiRpcProtocolVersions(this IApplicationBuilder app, RpcServer server)
+    public static IApplicationBuilder UseVgiRpcCapabilityHeaders(this IApplicationBuilder app, RpcServer server)
     {
         ArgumentNullException.ThrowIfNull(server);
         return app.Use(async (context, next) =>
@@ -299,7 +331,11 @@ public static class RpcHttpEndpoints
             var response = context.Response;
             response.OnStarting(() =>
             {
-                if (!response.Headers.ContainsKey(ProtocolVersions.Header))
+                if (s_capabilityStampers.TryGetValue(server, out var stamp))
+                {
+                    stamp(response);
+                }
+                else if (!response.Headers.ContainsKey(ProtocolVersions.Header))
                 {
                     response.Headers[ProtocolVersions.Header] = server.ProtocolVersions;
                 }
@@ -430,16 +466,6 @@ public static class RpcHttpEndpoints
         return resolver is null
             ? throw StateRefErrors.InvalidArgumentsRef("argument references can only be resolved by an HTTP server")
             : resolver(reference, size, sha256, cancellationToken);
-    }
-
-    private static void ApplyResponseBudgetCapabilities(HttpResponse response,
-        long? maxRequestBytes, long? maxResponseBytes)
-    {
-        response.Headers[AcceptMaxResponseBytesSupportHeader] = "true";
-        if (maxRequestBytes is { } requestCap)
-            response.Headers["VGI-Max-Request-Bytes"] = requestCap.ToString();
-        if (maxResponseBytes is { } responseCap)
-            response.Headers["VGI-Max-Response-Bytes"] = responseCap.ToString();
     }
 
     private static readonly Apache.Arrow.Types.MapType s_uploadHeadersType =
