@@ -37,6 +37,20 @@ public static class StorageBackendEnvironment
     /// <summary>Presigned URL lifetime in seconds (default 3600, capped by credential expiry).</summary>
     public const string UrlTtl = "VGI_STORAGE_URL_TTL_SECONDS";
 
+    /// <summary><c>1</c> allows <c>http://</c> storage endpoints (test and private networks only).</summary>
+    public const string AllowPlainHttp = "VGI_STORAGE_ALLOW_PLAIN_HTTP";
+
+    /// <summary>Refuses a plain-http <paramref name="url"/> unless <c>VGI_STORAGE_ALLOW_PLAIN_HTTP=1</c>.</summary>
+    /// <exception cref="ArgumentException">An http URL without the opt-in.</exception>
+    public static void RequireHttpsUnlessAllowed(Func<string, string?> environment, string name, string? url)
+    {
+        if (url is not null && url.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+            && environment(AllowPlainHttp)?.Trim().ToLowerInvariant() is not ("1" or "true" or "yes" or "on"))
+        {
+            throw new ArgumentException($"{name} is plain http; set {AllowPlainHttp}=1 to allow it (test and private networks only)");
+        }
+    }
+
     /// <summary>The default presigned URL lifetime: one hour.</summary>
     public static readonly TimeSpan DefaultUrlTtl = TimeSpan.FromHours(1);
 

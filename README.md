@@ -429,8 +429,12 @@ clients), `_CHECKSUM` (`sha256`, or `none`: no upload grants), `_VERIFY`, explic
 chain), and `VGI_STORAGE_URL_TTL_SECONDS` (capped by the credentials' expiry).
 `GcsStorageEnvironment.ExternalizationFromEnvironment()` does the same for `VGI_STORAGE_GCS_*`. The
 SDK's CRC32 trailing checksum is off by default (`S3Storage.Builder.WithRequestChecksumCalculation`);
-PUTs carry an explicit SHA-256. Add a lifecycle rule expiring `<prefix>rpc/` and `<prefix>obj/`
-after 1–2 days; the server never deletes.
+PUTs carry an explicit SHA-256, and no aws-chunked streaming signature (R2 refuses it). Keys:
+`<prefix>rpc/` (results, grants, StateRef and argument objects) and `<prefix>fs/` (function storage,
+deleted best effort); add lifecycle rules of 1 day on `rpc/` and 2 days on `fs/`. An `http://`
+endpoint needs `VGI_STORAGE_ALLOW_PLAIN_HTTP=1`; an explicit session token should come with
+`VGI_STORAGE_S3_SESSION_EXPIRES` (else URL lifetimes cannot be capped); with a public endpoint the
+server must reach it too (request-upload pointers are fetched by URL).
 
 ### Storage transfer timeouts
 

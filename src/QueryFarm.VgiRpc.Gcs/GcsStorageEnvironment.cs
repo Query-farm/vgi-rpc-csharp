@@ -11,7 +11,9 @@ namespace QueryFarm.VgiRpc.Gcs;
 /// <c>VGI_STORAGE_GCS_ENDPOINT</c> (emulator or custom endpoint),
 /// <c>VGI_STORAGE_GCS_CREDENTIALS_FILE</c> (else Application Default Credentials:
 /// <c>GOOGLE_APPLICATION_CREDENTIALS</c>, workload identity, the metadata server) and
-/// <c>VGI_STORAGE_URL_TTL_SECONDS</c>. URLs are V4-signed (at most 7 days).
+/// <c>VGI_STORAGE_URL_TTL_SECONDS</c>, <c>VGI_STORAGE_GCS_VERIFY</c> (<c>1</c>: check the bucket at
+/// startup) and <c>VGI_STORAGE_ALLOW_PLAIN_HTTP</c> (an <c>http://</c> endpoint). URLs are V4-signed (at
+/// most 7 days; not bound to token expiry, so the credential cap does not apply).
 /// </summary>
 public static class GcsStorageEnvironment
 {
@@ -26,6 +28,9 @@ public static class GcsStorageEnvironment
 
     /// <summary>Service-account or external-account credentials file.</summary>
     public const string CredentialsFile = "VGI_STORAGE_GCS_CREDENTIALS_FILE";
+
+    /// <summary><c>1</c> checks the bucket at startup.</summary>
+    public const string Verify = "VGI_STORAGE_GCS_VERIFY";
 
     private static string? Read(Func<string, string?> env, string name) =>
         env(name)?.Trim() is { Length: > 0 } v ? v : null;
@@ -49,6 +54,7 @@ public static class GcsStorageEnvironment
                 throw new ArgumentException($"{Endpoint} must be an absolute http(s) URL: {ExternalFetch.RedactUrl(endpoint)}");
             }
 
+            StorageBackendEnvironment.RequireHttpsUnlessAllowed(env, Endpoint, endpoint);
             credential ??= GoogleCredential.GetApplicationDefault();
             var client = new StorageClientBuilder { BaseUri = endpoint.TrimEnd('/') + "/storage/v1/", Credential = credential }.Build();
             builder.WithClient(client, UrlSigner.FromCredential(credential));
@@ -58,7 +64,13 @@ public static class GcsStorageEnvironment
             builder.WithCredential(credential);
         }
 
-        return builder.Build();
+        var storage = builder.Build();
+        if (Read(env, Verify)?.ToLowerInvariant() is "1" or "true" or "yes" or "on")
+        {
+            storage.VerifyAsync().GetAwaiter().GetResult();
+        }
+
+        return storage;
     }
 
     /// <summary>The server options for the gcs backend: results externalized to the bucket, inbound

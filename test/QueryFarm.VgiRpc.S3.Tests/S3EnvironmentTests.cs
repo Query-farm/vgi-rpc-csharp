@@ -54,6 +54,11 @@ public sealed class S3EnvironmentTests
                      Env(("VGI_STORAGE_S3_BUCKET", "b"), ("VGI_STORAGE_S3_ACCESS_KEY_ID", "a")),
                      Env(("VGI_STORAGE_S3_BUCKET", "b"), ("VGI_STORAGE_S3_SESSION_TOKEN", "t")),
                      Env(("VGI_STORAGE_S3_BUCKET", "b"), ("VGI_STORAGE_S3_FORCE_PATH_STYLE", "maybe")),
+                     // Plain http needs the opt-in (endpoint and public endpoint).
+                     Env(("VGI_STORAGE_S3_BUCKET", "b"), ("VGI_STORAGE_S3_ENDPOINT", "http://minio:9000")),
+                     Env(("VGI_STORAGE_S3_BUCKET", "b"), ("VGI_STORAGE_S3_PUBLIC_ENDPOINT", "http://s3.example.com")),
+                     Env(("VGI_STORAGE_S3_BUCKET", "b"), ("VGI_STORAGE_S3_ACCESS_KEY_ID", "a"), ("VGI_STORAGE_S3_SECRET_ACCESS_KEY", "s"),
+                         ("VGI_STORAGE_S3_SESSION_TOKEN", "t"), ("VGI_STORAGE_S3_SESSION_EXPIRES", "tomorrow")),
                  })
         {
             Assert.Throws<ArgumentException>(() => S3StorageEnvironment.BuilderFrom(bad));
@@ -65,6 +70,7 @@ public sealed class S3EnvironmentTests
             ("VGI_STORAGE_S3_BUCKET", "my-bucket"),
             ("VGI_STORAGE_S3_PREFIX", "vgi"),
             ("VGI_STORAGE_S3_ENDPOINT", "http://minio.internal:9000"),
+            ("VGI_STORAGE_ALLOW_PLAIN_HTTP", "1"),
             ("VGI_STORAGE_S3_PUBLIC_ENDPOINT", "https://s3.example.com"),
             ("VGI_STORAGE_S3_REGION", "auto"),
             ("VGI_STORAGE_URL_TTL_SECONDS", "600"),
@@ -96,7 +102,10 @@ public sealed class S3EnvironmentTests
         {
             ["VGI_STORAGE_S3_ENDPOINT"] = endpoint,
             ["VGI_STORAGE_S3_BUCKET"] = Environment.GetEnvironmentVariable("VGI_TEST_S3_BUCKET"),
-            ["VGI_STORAGE_S3_PREFIX"] = "vgi-csharp-test/",
+            ["VGI_STORAGE_S3_PREFIX"] = (Environment.GetEnvironmentVariable("VGI_TEST_S3_PREFIX") ?? "") + "vgi-csharp-test/",
+            ["VGI_STORAGE_S3_REGION"] = Environment.GetEnvironmentVariable("VGI_TEST_S3_REGION"),
+            ["VGI_STORAGE_S3_SESSION_EXPIRES"] = Environment.GetEnvironmentVariable("VGI_TEST_S3_SESSION_EXPIRES"),
+            ["VGI_STORAGE_ALLOW_PLAIN_HTTP"] = "1",
             ["VGI_STORAGE_S3_ACCESS_KEY_ID"] = Environment.GetEnvironmentVariable("VGI_TEST_S3_ACCESS_KEY_ID"),
             ["VGI_STORAGE_S3_SECRET_ACCESS_KEY"] = Environment.GetEnvironmentVariable("VGI_TEST_S3_SECRET_ACCESS_KEY"),
             ["VGI_STORAGE_S3_SESSION_TOKEN"] = Environment.GetEnvironmentVariable("VGI_TEST_S3_SESSION_TOKEN"),
@@ -121,13 +130,14 @@ public sealed class S3EnvironmentTests
 
         var options = S3StorageEnvironment.ExternalizationFromEnvironment(env);
         Assert.NotNull(options.UploadUrlProvider);
-        await using var storage = (S3Storage)options.External!.Storage;
+        await using var storage = (S3Storage)options.External!.Storage!;
 
         var obj = Encoding.UTF8.GetBytes(string.Concat(Enumerable.Repeat("state ref object ", 1000)));
         var id = await storage.PutObjectAsync(obj, CancellationToken.None);
-        Assert.StartsWith("vgi-csharp-test/obj/", id, StringComparison.Ordinal);
+        var prefix = (Environment.GetEnvironmentVariable("VGI_TEST_S3_PREFIX") ?? "") + "vgi-csharp-test/";
+        Assert.StartsWith(prefix + "rpc/", id, StringComparison.Ordinal);
         Assert.Equal(obj, await storage.GetAsync(id, null, CancellationToken.None));
-        await Assert.ThrowsAsync<ObjectMissingException>(() => storage.GetAsync("vgi-csharp-test/obj/nope.bin", null, CancellationToken.None));
+        await Assert.ThrowsAsync<ObjectMissingException>(() => storage.GetAsync(prefix + "rpc/nope.bin", null, CancellationToken.None));
 
         var result = Encoding.UTF8.GetBytes("arrow result bytes");
         var url = await storage.UploadAsync(result, s_schema, null, CancellationToken.None);
@@ -153,7 +163,9 @@ public sealed class S3EnvironmentTests
 
         var flipped = (byte[])body.Clone();
         flipped[3] ^= 1;
-        Assert.Contains(await Put(flipped, true), new[] { 400, 403 });
+        // A body with another digest is a checksum failure (400): the checksum is a signed header,
+        // not an unsigned query parameter the store would ignore.
+        Assert.Equal(400, await Put(flipped, true));
         Assert.Contains(await Put(body[1..], true), new[] { 400, 403 });
         Assert.Contains(await Put(body, false), new[] { 400, 403 });
         Assert.Equal(200, await Put(body, true));
@@ -174,7 +186,7 @@ public sealed class S3EnvironmentTests
         Assert.Null(options.UploadUrlProvider);
         Assert.Null(options.MaxUploadBytes);
         Assert.NotNull(options.EffectiveObjectStore);
-        await using var storage = (S3Storage)options.External!.Storage;
+        await using var storage = (S3Storage)options.External!.Storage!;
         var id = await storage.PutObjectAsync([1, 2, 3], CancellationToken.None);
         Assert.Equal(new byte[] { 1, 2, 3 }, await storage.GetAsync(id, null, CancellationToken.None));
         var url = await storage.UploadAsync([4, 5], s_schema, null, CancellationToken.None);
@@ -191,12 +203,46 @@ public sealed class S3EnvironmentTests
             return;
         }
 
+        if (!endpoint.Contains("127.0.0.1", StringComparison.Ordinal))
+        {
+            return; // needs a loopback endpoint to alias; not applicable to a real service
+        }
+
         await using var storage = S3StorageEnvironment.FromEnvironment(env);
         var url = await storage.UploadAsync([7, 7], s_schema, null, CancellationToken.None);
         Assert.Contains("://localhost:", url, StringComparison.Ordinal);
         Assert.Equal(new byte[] { 7, 7 }, await s_http.GetByteArrayAsync(url, TestContext.Current.CancellationToken));
         var id = await storage.PutObjectAsync([8], CancellationToken.None);
         Assert.Equal(new byte[] { 8 }, await storage.GetAsync(id, null, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Minio_FunctionStorageDeletesAreBestEffort()
+    {
+        if (MinioEnv() is not { } env)
+        {
+            Assert.Skip("VGI_TEST_S3_ENDPOINT is not set");
+            return;
+        }
+
+        await using var storage = S3StorageEnvironment.FromEnvironment(env);
+        var scope = storage.FunctionStorageKey($"scope-{Guid.NewGuid():N}/");
+        foreach (var name in new[] { "a", "b", "c" })
+        {
+            await storage.PutKeyAsync(scope + name, Encoding.UTF8.GetBytes(name), "application/octet-stream", null, CancellationToken.None);
+        }
+
+        await storage.DeleteKeyAsync(scope + "a", TestContext.Current.CancellationToken);
+        await Assert.ThrowsAsync<ObjectMissingException>(() => storage.GetAsync(scope + "a", null, CancellationToken.None));
+        await storage.DeleteKeyAsync(scope + "missing", TestContext.Current.CancellationToken);
+        await storage.DeletePrefixAsync(scope, TestContext.Current.CancellationToken);
+        // VGI_TEST_S3_NO_LIST: a credential without ListBucket (an R2 object token) cannot delete by
+        // prefix; best effort means no error either way.
+        if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("VGI_TEST_S3_NO_LIST")))
+        {
+            await Assert.ThrowsAsync<ObjectMissingException>(() => storage.GetAsync(scope + "b", null, CancellationToken.None));
+            await Assert.ThrowsAsync<ObjectMissingException>(() => storage.GetAsync(scope + "c", null, CancellationToken.None));
+        }
     }
 
     [Fact]
@@ -210,12 +256,14 @@ public sealed class S3EnvironmentTests
 
         await using var missing = S3StorageEnvironment.FromEnvironment(missingEnv);
         var error = await Assert.ThrowsAsync<InvalidOperationException>(() => missing.VerifyAsync(TestContext.Current.CancellationToken));
-        Assert.Contains("does not exist", error.Message, StringComparison.Ordinal);
+        // A bucket-scoped credential (R2 tokens) gets 403 for any other bucket.
+        Assert.True(error.Message.Contains("does not exist", StringComparison.Ordinal) || error.Message.Contains("access denied", StringComparison.Ordinal), error.Message);
         await using var denied = S3StorageEnvironment.FromEnvironment(MinioEnv(
-            ("VGI_STORAGE_S3_ACCESS_KEY_ID", "AKIDWRONGWRONG"), ("VGI_STORAGE_S3_SECRET_ACCESS_KEY", "wrongwrongwrong"),
+            ("VGI_STORAGE_S3_ACCESS_KEY_ID", "0123456789abcdef0123456789abcdef"), ("VGI_STORAGE_S3_SECRET_ACCESS_KEY", "wrongwrongwrongwrongwrongwrongwrongwrongwrongwrongwrongwrongwron"),
             ("VGI_STORAGE_S3_SESSION_TOKEN", null), ("VGI_STORAGE_S3_VERIFY", null))!);
         error = await Assert.ThrowsAsync<InvalidOperationException>(() => denied.VerifyAsync(TestContext.Current.CancellationToken));
-        Assert.Contains("access denied", error.Message, StringComparison.Ordinal);
+        // RustFS answers 403; R2 401 or 400 for an unknown key.
+        Assert.True(error.Message.Contains("access denied", StringComparison.Ordinal) || error.Message.Contains("HTTP 400", StringComparison.Ordinal), error.Message);
         Assert.DoesNotContain("wrongwrongwrong", error.Message, StringComparison.Ordinal);
     }
 }
@@ -259,6 +307,7 @@ public sealed class S3CredentialRotationTests
             ["VGI_STORAGE_S3_ENDPOINT"] = endpoint,
             ["VGI_STORAGE_S3_BUCKET"] = Environment.GetEnvironmentVariable("VGI_TEST_S3_BUCKET"),
             ["VGI_STORAGE_S3_PREFIX"] = "vgi-csharp-rotation/",
+            ["VGI_STORAGE_ALLOW_PLAIN_HTTP"] = "1",
         };
         await using var storage = S3StorageEnvironment.FromEnvironment(name => map.GetValueOrDefault(name));
         var id = await storage.PutObjectAsync(Encoding.UTF8.GetBytes("stored under the first credentials"), CancellationToken.None);

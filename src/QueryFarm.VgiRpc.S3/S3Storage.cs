@@ -29,9 +29,11 @@ public enum S3ChecksumMode
 /// <see cref="S3StorageEnvironment"/> (direct-storage contract v1).
 ///
 /// <para>Keys: results and client uploads under <c>&lt;keyPrefix&gt;rpc/&lt;uuid&gt;.arrow</c>, objects
-/// (<c>StateRef</c>, argument references) under <c>&lt;keyPrefix&gt;obj/&lt;uuid&gt;.bin</c>, function
-/// storage under <c>&lt;keyPrefix&gt;fs/</c>. vgi-rpc never deletes: add a lifecycle rule expiring
-/// <c>rpc/</c> and <c>obj/</c> after 1–2 days.</para>
+/// (<c>StateRef</c>, argument references) under <c>&lt;keyPrefix&gt;rpc/&lt;uuid&gt;.bin</c>, function
+/// storage under <c>&lt;keyPrefix&gt;fs/</c>. Only function storage deletes, best effort
+/// (<see cref="DeleteKeyAsync"/>, <see cref="DeletePrefixAsync"/>): add lifecycle rules expiring
+/// <c>rpc/</c> after 1 day and <c>fs/</c> after 2 days. With a public endpoint the server must be able
+/// to reach it too: request-upload pointers are fetched by URL.</para>
 /// <para>Credentials: <see cref="Builder.WithCredentials"/> (e.g. a <see cref="SessionAWSCredentials"/>
 /// with a session token), else the SDK's default chain (environment, shared profile with
 /// <c>role_arn</c>/<c>credential_process</c>/SSO, web identity, ECS/EKS Pod Identity, EC2 IMDSv2),
@@ -167,7 +169,10 @@ public sealed class S3Storage : IExternalStorage, IUploadUrlProvider, IObjectSto
     {
         var credentials = _clients.Value.Credentials;
         _ = await credentials.GetCredentialsAsync().ConfigureAwait(false);
-        if (credentials.Expiration is not { } expiration)
+        // An explicit session token carries no expiry of its own: the operator's
+        // VGI_STORAGE_S3_SESSION_EXPIRES (Builder.WithCredentialsExpiry) stands in for it.
+        DateTime? known = credentials.Expiration ?? _builder.CredentialsExpiry?.UtcDateTime;
+        if (known is not { } expiration)
         {
             return _urlTtl;
         }
@@ -219,7 +224,8 @@ public sealed class S3Storage : IExternalStorage, IUploadUrlProvider, IObjectSto
                 throw new InvalidOperationException(exc.StatusCode switch
                 {
                     System.Net.HttpStatusCode.NotFound => $"S3: bucket '{_bucket}' does not exist (HTTP 404); check {S3StorageEnvironment.Bucket}",
-                    System.Net.HttpStatusCode.Forbidden => $"S3: access denied to bucket '{_bucket}' (HTTP 403); check the credentials and that they allow s3:ListBucket, s3:GetObject and s3:PutObject on it",
+                    System.Net.HttpStatusCode.Forbidden or System.Net.HttpStatusCode.Unauthorized =>
+                        $"S3: access denied to bucket '{_bucket}' (HTTP {(int)exc.StatusCode}); check the credentials and that they allow s3:ListBucket, s3:GetObject and s3:PutObject on it",
                     System.Net.HttpStatusCode.MovedPermanently or System.Net.HttpStatusCode.BadRequest =>
                         $"S3: bucket '{_bucket}' is not in region '{region}' (HTTP {(int)exc.StatusCode} {exc.ErrorCode}); set {S3StorageEnvironment.Region}",
                     _ => $"S3: bucket check for '{_bucket}' failed: HTTP {(int)exc.StatusCode} {exc.ErrorCode}",
@@ -314,13 +320,13 @@ public sealed class S3Storage : IExternalStorage, IUploadUrlProvider, IObjectSto
     }
 
     /// <summary>The object API's <c>put_object</c> (<c>STATE_REF_V1.md</c> §10.1): a SigV4
-    /// <c>PutObject</c> under <c>&lt;keyPrefix&gt;obj/&lt;uuid&gt;.bin</c> (carrying
+    /// <c>PutObject</c> under <c>&lt;keyPrefix&gt;rpc/&lt;uuid&gt;.bin</c> (carrying
     /// <c>ChecksumSHA256</c> with <see cref="S3ChecksumMode.Sha256"/>, so S3/R2 verify the body).
     /// Returns the key. Objects carry no TTL: set a lifecycle rule of at least one day on the key
     /// prefix.</summary>
     public async Task<string> PutObjectAsync(byte[] data, CancellationToken cancellationToken)
     {
-        var key = _keyPrefix + "obj/" + Guid.NewGuid().ToString("N") + ".bin";
+        var key = _keyPrefix + "rpc/" + Guid.NewGuid().ToString("N") + ".bin";
         await PutKeyAsync(key, data, "application/octet-stream", null, cancellationToken).ConfigureAwait(false);
         return key;
     }
@@ -347,6 +353,11 @@ public sealed class S3Storage : IExternalStorage, IUploadUrlProvider, IObjectSto
                 InputStream = stream,
                 ContentType = contentType,
                 AutoCloseStream = false,
+
+                // No aws-chunked streaming signature (STREAMING-AWS4-HMAC-SHA256-PAYLOAD): Cloudflare
+                // R2 and other S3-compatible stores refuse it. The body is in memory, so a plain
+                // signed PUT with Content-Length costs nothing.
+                UseChunkEncoding = false,
             };
             if (checksum is not null)
             {
@@ -407,6 +418,51 @@ public sealed class S3Storage : IExternalStorage, IUploadUrlProvider, IObjectSto
                 return buffer.ToArray();
             }
         }, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Deletes <paramref name="key"/>, best effort: one attempt, every failure ignored (the
+    /// lifecycle rule is the backstop).</summary>
+    public async Task DeleteKeyAsync(string key, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(_timeouts.Connect + _timeouts.Stall);
+            _ = await Client.DeleteObjectAsync(_bucket, key, cts.Token).ConfigureAwait(false);
+        }
+        catch (Exception exc) when (exc is AmazonServiceException or AmazonClientException or HttpRequestException or IOException or OperationCanceledException)
+        {
+        }
+    }
+
+    /// <summary>Deletes every object under the full key <paramref name="prefix"/>, best effort
+    /// (ListObjectsV2 pages + DeleteObjects; every failure ignored).</summary>
+    public async Task DeletePrefixAsync(string prefix, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            string? token = null;
+            for (var page = 0; page < 100; page++)
+            {
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                cts.CancelAfter(_timeouts.Connect + _timeouts.Stall);
+                var listed = await Client.ListObjectsV2Async(new ListObjectsV2Request { BucketName = _bucket, Prefix = prefix, ContinuationToken = token }, cts.Token).ConfigureAwait(false);
+                var keys = (listed.S3Objects ?? []).Where(o => o.Key.StartsWith(prefix, StringComparison.Ordinal)).Select(o => new KeyVersion { Key = o.Key }).ToList();
+                if (keys.Count > 0)
+                {
+                    _ = await Client.DeleteObjectsAsync(new DeleteObjectsRequest { BucketName = _bucket, Objects = keys, Quiet = true }, cts.Token).ConfigureAwait(false);
+                }
+
+                token = listed.IsTruncated == true ? listed.NextContinuationToken : null;
+                if (token is null)
+                {
+                    return;
+                }
+            }
+        }
+        catch (Exception exc) when (exc is AmazonServiceException or AmazonClientException or HttpRequestException or IOException or OperationCanceledException)
+        {
+        }
     }
 
     /// <summary>Runs one SDK transfer per attempt under a fresh <see cref="StallWatchdog"/>; an
@@ -496,6 +552,7 @@ public sealed class S3Storage : IExternalStorage, IUploadUrlProvider, IObjectSto
         internal StorageTimeouts? Timeouts { get; private set; }
         internal S3ChecksumMode Checksum { get; private set; } = S3ChecksumMode.Sha256;
         internal RequestChecksumCalculation RequestChecksumCalculation { get; private set; } = RequestChecksumCalculation.WHEN_REQUIRED;
+        internal DateTimeOffset? CredentialsExpiry { get; private set; }
 
         internal Builder(string bucket) => Bucket = bucket;
 
@@ -528,6 +585,10 @@ public sealed class S3Storage : IExternalStorage, IUploadUrlProvider, IObjectSto
 
         /// <summary>Overrides the credentials (default: the SDK's own default credential chain).</summary>
         public Builder WithCredentials(AWSCredentials credentials) { Credentials = credentials; return this; }
+
+        /// <summary>When credentials with no expiry of their own (an explicit session token) expire, so
+        /// presigned URL lifetimes are capped at it (<c>VGI_STORAGE_S3_SESSION_EXPIRES</c>).</summary>
+        public Builder WithCredentialsExpiry(DateTimeOffset expiry) { CredentialsExpiry = expiry; return this; }
 
         /// <summary>Connect and stall timeouts of each transfer (default
         /// <see cref="StorageTimeouts.FromEnvironment"/>: 30 s / 30 s).</summary>

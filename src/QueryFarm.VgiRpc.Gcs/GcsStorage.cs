@@ -149,6 +149,27 @@ public sealed class GcsStorage : IExternalStorage, IUploadUrlProvider, IObjectSt
         }
     }
 
+    /// <summary>Checks the bucket exists and the credentials can read it (<c>VGI_STORAGE_GCS_VERIFY</c>).</summary>
+    /// <exception cref="InvalidOperationException">Bucket missing or access denied, with an actionable
+    /// message.</exception>
+    public async Task VerifyAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            _ = await _client.GetBucketAsync(_bucket, cancellationToken: cancellationToken).ConfigureAwait(false);
+        }
+        catch (Google.GoogleApiException exc)
+        {
+            throw new InvalidOperationException(exc.HttpStatusCode switch
+            {
+                System.Net.HttpStatusCode.NotFound => $"GCS: bucket '{_bucket}' does not exist (HTTP 404); check VGI_STORAGE_GCS_BUCKET",
+                System.Net.HttpStatusCode.Forbidden or System.Net.HttpStatusCode.Unauthorized =>
+                    $"GCS: access denied to bucket '{_bucket}' (HTTP {(int)exc.HttpStatusCode}); check the credentials (storage.buckets.get, storage.objects.create/get)",
+                _ => $"GCS: bucket check for '{_bucket}' failed: HTTP {(int)exc.HttpStatusCode}",
+            }, exc);
+        }
+    }
+
     private const string UploadContentType = "application/octet-stream";
 
     /// <summary>Disposes the underlying <see cref="StorageClient"/>, but only when it was created

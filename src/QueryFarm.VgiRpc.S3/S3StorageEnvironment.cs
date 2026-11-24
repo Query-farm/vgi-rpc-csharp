@@ -16,6 +16,8 @@ namespace QueryFarm.VgiRpc.S3;
 /// <item><term><c>VGI_STORAGE_S3_PUBLIC_ENDPOINT</c></term><description>endpoint for the URLs handed to clients (default the endpoint)</description></item>
 /// <item><term><c>VGI_STORAGE_S3_CHECKSUM</c></term><description><c>sha256</c> (default) or <c>none</c></description></item>
 /// <item><term><c>VGI_STORAGE_URL_TTL_SECONDS</c></term><description>presigned URL lifetime (default 3600, capped by credential expiry)</description></item>
+/// <item><term><c>VGI_STORAGE_S3_SESSION_EXPIRES</c></term><description>expiry of explicit session credentials, RFC 3339 or epoch seconds (caps URL lifetimes)</description></item>
+/// <item><term><c>VGI_STORAGE_ALLOW_PLAIN_HTTP</c></term><description><c>1</c>: allow an <c>http://</c> endpoint or public endpoint (refused otherwise)</description></item>
 /// <item><term><c>VGI_STORAGE_S3_VERIFY</c></term><description><c>1</c>: HEAD the bucket at startup (otherwise on first use)</description></item>
 /// <item><term><c>VGI_STORAGE_S3_ACCESS_KEY_ID</c>, <c>_SECRET_ACCESS_KEY</c>, <c>_SESSION_TOKEN</c></term><description>explicit credentials (default the AWS chain)</description></item>
 /// </list>
@@ -55,6 +57,26 @@ public static class S3StorageEnvironment
     /// <summary>Explicit session token.</summary>
     public const string SessionToken = "VGI_STORAGE_S3_SESSION_TOKEN";
 
+    /// <summary>Expiry of the explicit session credentials (RFC 3339 or epoch seconds).</summary>
+    public const string SessionExpires = "VGI_STORAGE_S3_SESSION_EXPIRES";
+
+    internal static DateTimeOffset? ExpiryFrom(Func<string, string?> env)
+    {
+        if (Read(env, SessionExpires) is not { } raw)
+        {
+            return null;
+        }
+
+        if (long.TryParse(raw, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var epoch))
+        {
+            return DateTimeOffset.FromUnixTimeSeconds(epoch);
+        }
+
+        return DateTimeOffset.TryParse(raw, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeUniversal, out var t)
+            ? t
+            : throw new ArgumentException($"{SessionExpires} must be an RFC 3339 timestamp or epoch seconds, got '{raw}'");
+    }
+
     private static string? Read(Func<string, string?> env, string name) =>
         env(name)?.Trim() is { Length: > 0 } v ? v : null;
 
@@ -88,6 +110,8 @@ public static class S3StorageEnvironment
         var bucket = Read(env, Bucket) ?? throw new ArgumentException($"{Bucket} is required for the s3 backend");
         var builder = S3Storage.CreateBuilder(bucket).WithKeyPrefix(Read(env, Prefix) ?? "");
         var endpoint = EndpointFrom(env, Endpoint);
+        StorageBackendEnvironment.RequireHttpsUnlessAllowed(env, Endpoint, endpoint);
+        StorageBackendEnvironment.RequireHttpsUnlessAllowed(env, PublicEndpoint, EndpointFrom(env, PublicEndpoint));
         if (endpoint is not null)
         {
             builder.WithServiceUrl(endpoint);
@@ -116,6 +140,16 @@ public static class S3StorageEnvironment
         {
             case (not null, not null):
                 builder.WithCredentials(token is null ? new BasicAWSCredentials(key, secret) : new SessionAWSCredentials(key, secret, token));
+                if (ExpiryFrom(env) is { } expiry)
+                {
+                    builder.WithCredentialsExpiry(expiry);
+                }
+                else if (token is not null)
+                {
+                    Console.Error.WriteLine(
+                        $"vgi-rpc: {SessionToken} is set without {SessionExpires}: presigned URL lifetimes cannot be capped at the credentials' expiry; set it, or use credential_process or the standard AWS chain");
+                }
+
                 break;
             case (null, null) when token is not null:
                 throw new ArgumentException($"{SessionToken} is set without {AccessKeyId} and {SecretAccessKey}");
