@@ -196,15 +196,50 @@ public class VersionException : RpcException
     }
 }
 
-/// <summary>The client and server declared incompatible <c>protocol_version</c> major.minor values.</summary>
+/// <summary>A request's <c>protocol_version</c> is absent, malformed, or outside the server's
+/// window for its protocol (PROTOCOL_VERSIONS_V1.md §4.3): kind
+/// <c>protocol_version_unsupported</c>, code <c>FAILED_PRECONDITION</c>.</summary>
 public sealed class ProtocolVersionException : VersionException
 {
-    public const string ErrorKindConst = Wire.MetadataKeys.ErrorKinds.ProtocolVersionMismatch;
+    public const string ErrorKindConst = Wire.MetadataKeys.ErrorKinds.ProtocolVersionUnsupported;
 
     public ProtocolVersionException(string message)
         : base(nameof(ProtocolVersionException), message, ErrorKindConst)
     {
         ErrorCode = ErrorCodes.FailedPrecondition;
+    }
+
+    /// <summary>The server's full <c>VGI-Protocol-Versions</c> advertisement, carried in an
+    /// <see cref="ErrorInfo"/> detail and as the <c>vgi_rpc.protocol_versions</c> key on the error
+    /// batch; <see langword="null"/> when unknown.</summary>
+    public string? ServerVersions { get; init; }
+
+    /// <summary>A refusal naming both windows: one <c>protocol_version</c> violation, and an
+    /// <see cref="ErrorInfo"/> with the server's advertisement and the client's windows (when it
+    /// sent them).</summary>
+    public static ProtocolVersionException Unsupported(
+        string message, string protocol, string? clientVersion, string serverWindow, string serverVersions, string? clientVersions)
+    {
+        var metadata = new Dictionary<string, string>(StringComparer.Ordinal) { [Wire.ProtocolVersions.Key] = serverVersions };
+        if (!string.IsNullOrEmpty(clientVersions))
+        {
+            metadata[Wire.ProtocolVersions.ClientKey] = clientVersions;
+        }
+
+        return new ProtocolVersionException(message)
+        {
+            ServerVersions = serverVersions,
+            ErrorDetails =
+            [
+                new PreconditionFailure(
+                [
+                    new PreconditionViolation(
+                        "protocol_version", protocol,
+                        $"client declares {(string.IsNullOrEmpty(clientVersion) ? "<none>" : clientVersion)}, server supports {serverWindow}"),
+                ]).ToJson(),
+                new ErrorInfo(metadata).ToJson(),
+            ],
+        };
     }
 
     /// <param name="message">The directional, human-readable explanation.</param>

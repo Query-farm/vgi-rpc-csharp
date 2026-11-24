@@ -75,7 +75,8 @@ public static class RpcErrorDecoder
         RpcException error = errorKind switch
         {
             MetadataKeys.ErrorKinds.MethodNotImplemented => new MethodNotImplementedException(message),
-            MetadataKeys.ErrorKinds.ProtocolVersionMismatch => new ProtocolVersionException(message),
+            MetadataKeys.ErrorKinds.ProtocolVersionMismatch or MetadataKeys.ErrorKinds.ProtocolVersionUnsupported
+                => new ProtocolVersionException(message) { ServerVersions = batch.GetMetadata(ProtocolVersions.Key) },
             MetadataKeys.ErrorKinds.SessionLost => new SessionLostException(message),
             MetadataKeys.ErrorKinds.ServerDraining => new ServerDrainingException(message),
             _ => errorType switch
@@ -96,7 +97,7 @@ public static class RpcErrorDecoder
         RpcException error, string code, string? kind, IReadOnlyList<JsonElement> details) => error switch
         {
             MethodNotImplementedException e => new MethodNotImplementedException(e.ErrorMessage) { ErrorCode = code, ErrorKind = kind, ErrorDetails = details },
-            ProtocolVersionException e => new ProtocolVersionException(e.ErrorMessage) { ErrorCode = code, ErrorKind = kind, ErrorDetails = details },
+            ProtocolVersionException e => new ProtocolVersionException(e.ErrorMessage) { ErrorCode = code, ErrorKind = kind, ErrorDetails = details, ServerVersions = e.ServerVersions },
             SessionLostException e => new SessionLostException(e.ErrorMessage) { ErrorCode = code, ErrorKind = kind, ErrorDetails = details },
             ServerDrainingException e => new ServerDrainingException(e.ErrorMessage) { ErrorCode = code, ErrorKind = kind, ErrorDetails = details },
             _ => new RpcException(error.ErrorType, error.ErrorMessage, error.RemoteTraceback, error.RequestId, kind, code, details),

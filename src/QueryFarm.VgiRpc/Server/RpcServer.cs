@@ -48,6 +48,14 @@ public sealed class RpcServer
     /// <summary>The service interface's simple name — the access log's <c>protocol</c> field.</summary>
     public string ProtocolName { get; }
 
+    private readonly Dictionary<string, VersionRange> _versionWindows = new(StringComparer.Ordinal);
+
+    /// <summary>The <c>VGI-Protocol-Versions</c> advertisement (PROTOCOL_VERSIONS_V1.md §4.1):
+    /// <c>name=MIN-MAX[, ...]</c> for every gated protocol, primary first; empty when nothing here is
+    /// versioned. Sent on every HTTP response and as <c>vgi_rpc.protocol_versions</c> on reflection
+    /// results, <c>__transport_options__</c> replies and refusals.</summary>
+    public string ProtocolVersions { get; }
+
     /// <summary>
     /// The canonical SHA-256 digest of the application protocol's description — the access log's
     /// <c>protocol_hash</c> field for a call this server's own binding owns.
@@ -177,6 +185,11 @@ public sealed class RpcServer
     /// <see langword="null"/>, read <c>VGI_RPC_GRANT_KEYS</c> and friends (the default, as the
     /// reference does) -- unset means grants are off and nothing changes. <see langword="false"/>
     /// turns grants off regardless of the environment.</param>
+    /// <param name="protocolVersionRanges">Override the <c>major.minor</c> window a hosted protocol
+    /// accepts and advertises in <c>VGI-Protocol-Versions</c>, keyed by wire name
+    /// (<c>{"vgi.v3": "3.3-3.4"}</c>; PROTOCOL_VERSIONS_V1.md §5). Default: exactly each protocol's
+    /// declared version. Naming a protocol that is not hosted or declares no version, or a malformed
+    /// range, throws. How fixture workers impersonate an older server.</param>
     /// <exception cref="ArgumentException">A protocol's name is malformed, claims the reserved
     /// <c>vgi_rpc.</c> prefix (however the name was derived), or repeats another's; an
     /// implementation does not implement its interface; or a declared version is not
@@ -185,7 +198,8 @@ public sealed class RpcServer
         Type serviceInterface, object implementation, string? serverId = null, IAccessLogSink? accessLog = null,
         IReadOnlyList<IRpcDispatchHook>? dispatchHooks = null, string? expectedProtocolVersion = null,
         IdentityImpl? identity = null, IReadOnlyList<HostedProtocol>? additionalProtocols = null,
-        GrantKeys? grantKeys = null, bool grantKeysFromEnvironment = true)
+        GrantKeys? grantKeys = null, bool grantKeysFromEnvironment = true,
+        IReadOnlyDictionary<string, string>? protocolVersionRanges = null)
     {
         ArgumentNullException.ThrowIfNull(serviceInterface);
         ArgumentNullException.ThrowIfNull(implementation);
@@ -255,6 +269,32 @@ public sealed class RpcServer
 
         _applicationBindings = bindings;
         _bindingsByName = byName;
+
+        // Version windows (PROTOCOL_VERSIONS_V1.md §5): each versioned binding accepts exactly its
+        // declared major.minor unless overridden; the advertisement lists them in hosting order.
+        foreach (var binding in bindings)
+        {
+            if (binding.Version is { } declared && VersionRange.Exactly(declared) is { } window)
+            {
+                _versionWindows[binding.Name] = window;
+            }
+        }
+
+        foreach (var (name, range) in protocolVersionRanges ?? new Dictionary<string, string>())
+        {
+            if (!_versionWindows.ContainsKey(name))
+            {
+                throw new ArgumentException(
+                    $"protocolVersionRanges names '{name}', which is not a hosted protocol that declares a protocol version. "
+                    + $"Versioned protocols here: [{string.Join(", ", _versionWindows.Keys)}]", nameof(protocolVersionRanges));
+            }
+
+            _versionWindows[name] = VersionRange.Parse(range)
+                ?? throw new ArgumentException($"protocolVersionRanges['{name}'] is not a MIN-MAX range of MAJOR.MINOR: '{range}'", nameof(protocolVersionRanges));
+        }
+
+        ProtocolVersions = Wire.ProtocolVersions.Format(
+            bindings.Where(b => _versionWindows.ContainsKey(b.Name)).Select(b => (b.Name, _versionWindows[b.Name])));
 
         // Identity is registered AFTER reflection (which this port hosts unconditionally, and
         // which is listed ahead of it in HostedProtocols below) so that it appears in
@@ -340,8 +380,10 @@ public sealed class RpcServer
     /// gated, so a client of a secondary protocol that has no version is not refused because the
     /// primary has one (WIRE_PROTOCOL.md §13).
     /// </remarks>
-    internal static ProtocolVersionException? GateVersion(ProtocolBinding binding, AnnotatedBatch request) =>
-        binding.Version is { } version ? CheckProtocolVersion(request, version, binding.Name) : null;
+    internal ProtocolVersionException? GateVersion(ProtocolBinding binding, AnnotatedBatch request) =>
+        binding.Version is not null && _versionWindows.TryGetValue(binding.Name, out var window)
+            ? CheckProtocolVersion(request, window, binding.Name)
+            : null;
 
     /// <summary>Resolves and validates the wire name an application protocol is hosted under.</summary>
     /// <remarks>
@@ -687,6 +729,7 @@ public sealed class RpcServer
                 [MetadataKeys.TransportShm] = "true",
                 [MetadataKeys.ServerId] = _serverId,
                 [MetadataKeys.RequestVersion] = MetadataKeys.CurrentRequestVersion,
+                [Wire.ProtocolVersions.Key] = ProtocolVersions,
             };
             await using var transportWriter = new WireWriter(transport.Output, s_emptySchema);
             await transportWriter.WriteOwnedBatchAsync(ValueCodec.EmptyRow(s_emptySchema), responseMetadata, cancellationToken).ConfigureAwait(false);
@@ -1344,10 +1387,13 @@ public sealed class RpcServer
         var builder = new BinaryArray.Builder();
         builder.Append((ReadOnlySpan<byte>)payload);
         var batch = new RecordBatch(schema, [builder.Build()], 1);
+        // Reflection is exempt from the version gate, so its results are where a client of any
+        // version learns the server's windows, on every transport (PROTOCOL_VERSIONS_V1.md §4.1).
         var md = new Dictionary<string, string>
         {
             [MetadataKeys.ServerId] = _serverId,
             [MetadataKeys.RequestVersion] = MetadataKeys.CurrentRequestVersion,
+            [Wire.ProtocolVersions.Key] = ProtocolVersions,
         };
         await using (var writer = new WireWriter(output, schema))
         {
@@ -1499,64 +1545,56 @@ public sealed class RpcServer
         return sa.GetString(0) ?? "";
     }
 
-    /// <summary>The application-level protocol-version guard — see the constructor's
-    /// <c>expectedProtocolVersion</c> doc comment. Returns <see langword="null"/> when the
-    /// request's declared version shares its major AND minor with <paramref name="serverVersion"/>
-    /// (patch is deliberately ignored), else a populated <see cref="ProtocolVersionException"/>
-    /// ready to write back on the wire. Mirrors the canonical Python <c>_check_protocol_version</c>
-    /// message shape exactly, including its four distinct "direction" phrasings, so cross-language
-    /// error text stays recognizable regardless of which side authored the mismatch.</summary>
-    private static ProtocolVersionException? CheckProtocolVersion(AnnotatedBatch request, string serverVersion, string protocolName)
+    /// <summary>The version gate (PROTOCOL_VERSIONS_V1.md §4.3, §5): <see langword="null"/> when the
+    /// request's <c>major.minor</c> lies inside <paramref name="window"/> (patch is informational),
+    /// else a <c>protocol_version_unsupported</c> refusal naming both windows and which side to
+    /// upgrade. The client's own windows (<c>vgi_rpc.protocol_versions_client</c>) are quoted, never
+    /// a reason to refuse. Mirrors the Python reference's message shapes.</summary>
+    private ProtocolVersionException? CheckProtocolVersion(AnnotatedBatch request, VersionRange window, string protocolName)
     {
+        const string Unsupported = MetadataKeys.ErrorKinds.ProtocolVersionUnsupported;
+        var clientRanges = request.GetMetadata(Wire.ProtocolVersions.ClientKey);
+        var serverWindow = $"this server supports {protocolName} {window}";
+        ProtocolVersionException Refuse(string? clientVersion, string message) =>
+            ProtocolVersionException.Unsupported(message, protocolName, clientVersion, window.ToString(), ProtocolVersions, clientRanges);
+
         var clientVersion = request.GetMetadata(MetadataKeys.ProtocolVersion);
         if (clientVersion is null)
         {
-            return new ProtocolVersionException(FormatProtocolMismatch(
-                protocolName, null, serverVersion,
-                "the client did not send a vgi_rpc.protocol_version metadata key. This is either a " +
-                "vgi-rpc framework bug or a non-VGI client connecting to a VGI worker."),
-                protocolName, null, serverVersion);
+            return Refuse(null,
+                $"{Unsupported}: the client did not send vgi_rpc.protocol_version for {protocolName}; {serverWindow}. "
+                + "This is either a vgi-rpc framework bug or a non-VGI client connecting to a VGI worker.");
         }
 
-        if (TryParseSemver(clientVersion) is not { } clientParts)
+        if (TryParseSemver(clientVersion) is not { } client)
         {
-            return new ProtocolVersionException(FormatProtocolMismatch(
-                protocolName, clientVersion, serverVersion,
-                "client sent a malformed protocol_version. Expected canonical semver MAJOR.MINOR.PATCH."),
-                protocolName, clientVersion, serverVersion);
+            return Refuse(clientVersion,
+                $"{Unsupported}: the client sent a malformed protocol_version '{clientVersion}' for {protocolName} "
+                + $"(expected canonical semver MAJOR.MINOR.PATCH); {serverWindow}.");
         }
 
-        // A malformed server-declared version is this process's own misconfiguration, not
-        // something a client sent — that deserves a hard failure, not a wire-level RPC error.
-        var serverParts = TryParseSemver(serverVersion)
-            ?? throw new InvalidOperationException($"expectedProtocolVersion '{serverVersion}' is not valid semver.");
-
-        if (clientParts.Major == serverParts.Major && clientParts.Minor == serverParts.Minor)
+        var mm = (client.Major, client.Minor);
+        if (window.Contains(mm))
         {
             return null;
         }
 
-        var clientIsOlder = clientParts.Major < serverParts.Major
-            || (clientParts.Major == serverParts.Major && clientParts.Minor < serverParts.Minor);
-        var direction = clientIsOlder
-            ? $"client is too old; upgrade the VGI extension/client to a version supporting protocol_version {serverVersion}."
-            : $"server is too old; upgrade the VGI worker to a version supporting protocol_version {clientVersion}.";
-
-        return new ProtocolVersionException(
-            FormatProtocolMismatch(protocolName, clientVersion, serverVersion, direction),
-            protocolName, clientVersion, serverVersion);
+        var clientMm = $"{client.Major}.{client.Minor}";
+        var supports = Wire.ProtocolVersions.Parse(clientRanges).TryGetValue(protocolName, out var clientWindow)
+            ? $" (supports {clientWindow})"
+            : "";
+        var direction = VersionRange.Compare(mm, window.Min) < 0
+            ? $"The client is too old (this server is too new for it). Upgrade the client, or use a worker that supports {protocolName} {clientMm}."
+            : $"The server is too old (the client is too new for it). Upgrade the worker, or use a client that supports {protocolName} {window.Max.Major}.{window.Max.Minor}.";
+        return Refuse(clientVersion, $"{Unsupported}: client speaks {protocolName} {clientMm}{supports}; {serverWindow}. {direction}");
     }
-
-    private static string FormatProtocolMismatch(string protocolName, string? clientVersion, string serverVersion, string direction) =>
-        $"VGI client/worker protocol_version mismatch for protocol '{protocolName}'.\n" +
-        $"  Client: {clientVersion ?? "<not declared>"}\n" +
-        $"  Server: {serverVersion}\n" +
-        $"  Direction: {direction}";
 
     private static (int Major, int Minor, int Patch)? TryParseSemver(string version)
     {
         var parts = version.Split('.');
+        static bool Canonical(string p) => p.Length is > 0 and <= 9 && p.All(char.IsAsciiDigit) && (p.Length == 1 || p[0] != '0');
         if (parts.Length != 3
+            || !parts.All(Canonical)
             || !int.TryParse(parts[0], out var major)
             || !int.TryParse(parts[1], out var minor)
             || !int.TryParse(parts[2], out var patch))

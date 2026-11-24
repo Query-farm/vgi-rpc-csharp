@@ -63,6 +63,7 @@ public static class Cors
             "VGI-Externalization-Enabled",
             "VGI-Upload-URL-Support",
             "VGI-Max-Upload-Bytes",
+            Wire.ProtocolVersions.Header,
             "VGI-Supported-Encodings",
             RpcHttpEndpoints.AcceptMaxResponseBytesSupportHeader,
             ProxyProof.ProofRequiredHeader,

@@ -73,6 +73,12 @@ public sealed class LogMessage
             extra["error_kind"] = kind;
         }
 
+        // A version refusal names the server's windows on the batch itself too (PROTOCOL_VERSIONS_V1.md §4.3).
+        if (exception is ProtocolVersionException { ServerVersions: { } serverVersions })
+        {
+            extra["protocol_versions"] = serverVersions;
+        }
+
         var details = ErrorModel.DetailsOf(exception);
         if (details.Count > 0 && ErrorModel.Encode(details) is not null)
         {
@@ -146,6 +152,11 @@ public sealed class LogMessage
             if (Extra.TryGetValue("error_kind", out var kind) && kind is string kindString)
             {
                 result[MetadataKeys.ErrorKind] = kindString;
+            }
+
+            if (Level == VgiLogLevel.Exception && Extra.TryGetValue("protocol_versions", out var versions) && versions is string versionsString)
+            {
+                result[ProtocolVersions.Key] = versionsString;
             }
 
             // The other two layers of the error model ride the same way -- only on EXCEPTION: a

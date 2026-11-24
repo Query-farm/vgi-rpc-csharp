@@ -1660,3 +1660,54 @@ def conformance_state_ref_replicas(worker_binary: Path, conformance_fake_storage
 
 
 from vgi_rpc.conformance._pytest_suite import *  # noqa: E402,F401,F403
+
+
+# PROTOCOL_VERSIONS_V1.md §6, §9: the C# HttpRpcClient under negotiation, through the client
+# driver's `--negotiate` mode (one unary `ping` per stdin line, JSON reply per line).
+class _NegotiationError(Exception):
+    """A ping the C# client refused or the server rejected."""
+
+    def __init__(self, error_kind: str, message: str) -> None:
+        super().__init__(message)
+        self.error_kind = error_kind
+        self.error_message = message
+
+
+class _NegotiatingProxy:
+    def __init__(self, proc: subprocess.Popen[str]) -> None:
+        self._proc = proc
+
+    def ping(self) -> str:
+        assert self._proc.stdin is not None and self._proc.stdout is not None
+        self._proc.stdin.write("ping\n")
+        self._proc.stdin.flush()
+        line = self._proc.stdout.readline()
+        if not line:
+            raise RuntimeError("the client driver's --negotiate mode exited")
+        reply = json.loads(line)
+        if "ok" in reply:
+            return str(reply["ok"])
+        raise _NegotiationError(str(reply.get("error_kind", "")), str(reply.get("message", "")))
+
+
+@pytest.fixture
+def conformance_negotiating_client(client_driver_binary: Path) -> Callable[..., object]:
+    """The C# ``HttpRpcClient`` under test."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def factory(base_url: str, protocol: str, version: str, version_range: str) -> Iterator[_NegotiatingProxy]:
+        proc = subprocess.Popen(  # noqa: S603
+            [str(client_driver_binary), "--negotiate", base_url, protocol, version, version_range],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            yield _NegotiatingProxy(proc)
+        finally:
+            if proc.stdin is not None:
+                proc.stdin.close()
+            proc.wait(timeout=10)
+
+    return factory

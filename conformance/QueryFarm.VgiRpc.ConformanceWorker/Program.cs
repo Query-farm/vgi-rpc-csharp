@@ -132,6 +132,8 @@ if (options.Http)
     }
 
     var app = builder.Build();
+    // Ahead of CORS, so a preflight UseCors answers on its own still advertises (PROTOCOL_VERSIONS_V1.md §4.1).
+    app.UseVgiRpcProtocolVersions(server);
     if (corsEnabled)
     {
         app.UseCors();

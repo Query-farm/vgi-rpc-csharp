@@ -204,8 +204,20 @@ public static class RpcHttpEndpoints
         }
 
         var registry = new StreamCallRegistry(maxAge: tokenTtl);
+
+        // Responses no endpoint here produces (an unmatched path's 404, a CORS preflight, a
+        // framework 5xx) advertise too, when the host lets us join its pipeline. Hosts that build
+        // their own pipeline call UseVgiRpcProtocolVersions first themselves.
+        if (endpoints is IApplicationBuilder pipeline)
+        {
+            pipeline.UseVgiRpcProtocolVersions(server);
+        }
+
         void Stamp(HttpContext context)
         {
+            // Protocol version negotiation (PROTOCOL_VERSIONS_V1.md §4.1): every response names the
+            // window of every gated protocol, present even when empty ("negotiates, gates nothing").
+            context.Response.Headers[ProtocolVersions.Header] = server.ProtocolVersions;
             ApplyResponseBudgetCapabilities(context.Response, effectiveMaxRequestBytes, effectiveMaxResponseBytes);
             // Like the reference's capability headers: every response advertises the upload-URL
             // protocol, so a client holding any response (a 413 included) can tell v2 from v1.
@@ -270,6 +282,32 @@ public static class RpcHttpEndpoints
         }
 
         return endpoints;
+    }
+
+    /// <summary>
+    /// Stamps <c>VGI-Protocol-Versions</c> (PROTOCOL_VERSIONS_V1.md §4.1) on every response the
+    /// pipeline gives from here on, including ones no vgi-rpc endpoint produced: an unmatched
+    /// path's 404, a CORS preflight answered by <c>UseCors</c>, a framework error. Register it
+    /// ahead of <c>UseCors</c> and anything else that may answer on its own. <c>MapVgiRpc</c>
+    /// registers it itself when given a <c>WebApplication</c>; calling it twice is harmless.
+    /// </summary>
+    public static IApplicationBuilder UseVgiRpcProtocolVersions(this IApplicationBuilder app, RpcServer server)
+    {
+        ArgumentNullException.ThrowIfNull(server);
+        return app.Use(async (context, next) =>
+        {
+            var response = context.Response;
+            response.OnStarting(() =>
+            {
+                if (!response.Headers.ContainsKey(ProtocolVersions.Header))
+                {
+                    response.Headers[ProtocolVersions.Header] = server.ProtocolVersions;
+                }
+
+                return Task.CompletedTask;
+            });
+            await next(context).ConfigureAwait(false);
+        });
     }
 
     /// <summary>Below this <c>max_request_bytes</c> the server warns at startup and disables the
@@ -1392,7 +1430,7 @@ public static class RpcHttpEndpoints
 
         // Gated against the binding the path resolved to -- the reference wires the same gate
         // into its HTTP dispatch independently of the serve loop, and so must this.
-        if (RpcServer.GateVersion(binding, requestBatch) is { } unaryVersionMismatch)
+        if (server.GateVersion(binding, requestBatch) is { } unaryVersionMismatch)
         {
             await ErrorResultAsync(server, protocol, method, unaryVersionMismatch, StatusCodes.Status400BadRequest, info.ResultSchema, httpStatusForLog: StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel).ConfigureAwait(false);
             return;
@@ -1865,7 +1903,7 @@ public static class RpcHttpEndpoints
             return;
         }
 
-        if (RpcServer.GateVersion(binding, requestBatch) is { } initVersionMismatch)
+        if (server.GateVersion(binding, requestBatch) is { } initVersionMismatch)
         {
             await ErrorResultAsync(server, protocol, method, initVersionMismatch, StatusCodes.Status400BadRequest, s_emptySchema, StatusCodes.Status400BadRequest, context, encoding, useCustomHeader, compressionLevel, methodType: "stream").ConfigureAwait(false);
             return;

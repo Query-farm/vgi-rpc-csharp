@@ -25,6 +25,42 @@ const string DescribeVersion = "5";
 // The prefix the framework reserves for its own co-hosted protocols.
 const string ReservedProtocolPrefix = "vgi_rpc.";
 
+// `--negotiate <base_url> <protocol> <version> <range>`: the conformance_negotiating_client hook
+// (PROTOCOL_VERSIONS_V1.md §6, §9). Each stdin line "ping" makes one unary `ping` call on an HTTP
+// client with that window, answering {"ok": <result>} or {"error_kind", "message"}.
+if (args is ["--negotiate", var negotiateUrl, var negotiateProtocol, var negotiateVersion, var negotiateRange])
+{
+    await using var negotiating = new HttpRpcClient(new Uri(negotiateUrl), new HttpRpcClientOptions
+    {
+        Protocol = negotiateProtocol,
+        ProtocolVersion = negotiateVersion,
+        ProtocolVersionRange = negotiateRange,
+    });
+    using var noParams = new RecordBatch(new Schema([], metadata: null), [], 0);
+    while (await Console.In.ReadLineAsync() is { } pingLine)
+    {
+        if (pingLine.Trim() != "ping") continue;
+        JsonObject pingReply;
+        try
+        {
+            var answer = await negotiating.CallUnaryAsync("ping", noParams);
+            using (answer.Batch)
+            {
+                var column = answer.Batch.Schema.GetFieldIndex("result");
+                pingReply = new JsonObject { ["ok"] = column >= 0 && answer.Batch.Column(column) is StringArray strings ? strings.GetString(0) : "" };
+            }
+        }
+        catch (RpcException exception)
+        {
+            pingReply = new JsonObject { ["error_kind"] = exception.ErrorKind ?? "", ["message"] = exception.ErrorMessage };
+        }
+
+        Console.Out.WriteLine(pingReply.ToJsonString());
+        Console.Out.Flush();
+    }
+
+    return;
+}
 
 while (await Console.In.ReadLineAsync() is { } line)
 {

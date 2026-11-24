@@ -39,6 +39,13 @@ public sealed class HttpRpcClientOptions
     /// version, which gates every request against it on HTTP as on the byte stream.</summary>
     public string? ProtocolVersion { get; init; }
 
+    /// <summary>The <c>major.minor</c> window this client can speak for its protocol, as
+    /// <c>MIN-MAX</c> (PROTOCOL_VERSIONS_V1.md §6); <see langword="null"/> means exactly
+    /// <see cref="ProtocolVersion"/>. Before the server is heard from the client declares
+    /// <see cref="ProtocolVersion"/>; afterwards the highest version both windows share (with
+    /// <see cref="ProtocolVersion"/>'s patch), failing before sending when there is none.</summary>
+    public string? ProtocolVersionRange { get; init; }
+
     public int? CompressionLevel { get; init; } = 1;
 
     public ContentEncoding PreferredEncoding { get; init; } = ContentEncoding.Zstd;

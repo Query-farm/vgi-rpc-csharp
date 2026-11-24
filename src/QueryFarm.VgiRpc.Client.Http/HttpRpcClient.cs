@@ -256,18 +256,57 @@ public sealed partial class HttpRpcClient : IRpcClient, IProtocolAddressableClie
         }
     }
 
-    public async Task<AnnotatedBatch> CallUnaryAsync(
+    public Task<AnnotatedBatch> CallUnaryAsync(
         string method,
         RecordBatch parameters,
         IReadOnlyDictionary<string, string>? metadata = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        NegotiatedAsync(_protocol, async () =>
+        {
+            var responseBody = await PostBatchAsync(
+                $"{RpcPrefix}/{Uri.EscapeDataString(method)}",
+                parameters,
+                RequestMetadata(method, metadata),
+                cancellationToken).ConfigureAwait(false);
+            return await ReadUnaryAsync(responseBody, method, cancellationToken).ConfigureAwait(false);
+        });
+
+    /// <summary>The negotiation state for this client's own protocol, created on first use (the
+    /// protocol may be adopted after construction); <see langword="null"/> when the client declares
+    /// no protocol version.</summary>
+    private ProtocolNegotiation? Negotiation
     {
-        var responseBody = await PostBatchAsync(
-            $"{RpcPrefix}/{Uri.EscapeDataString(method)}",
-            parameters,
-            RequestMetadata(method, metadata),
-            cancellationToken).ConfigureAwait(false);
-        return await ReadUnaryAsync(responseBody, method, cancellationToken).ConfigureAwait(false);
+        get
+        {
+            if (Volatile.Read(ref _negotiation) is { } existing)
+            {
+                return existing;
+            }
+
+            if (_options.ProtocolVersion is not { } version || string.IsNullOrEmpty(_protocol))
+            {
+                return null;
+            }
+
+            _ = Interlocked.CompareExchange(ref _negotiation, ProtocolNegotiation.Create(_protocol, version, _options.ProtocolVersionRange), null);
+            return _negotiation;
+        }
+    }
+
+    private ProtocolNegotiation? _negotiation;
+
+    /// <summary>Runs one call, learning from a version refusal; a call safe to repeat
+    /// (reflection) is retried once at the version just learned (PROTOCOL_VERSIONS_V1.md §6).</summary>
+    private async Task<T> NegotiatedAsync<T>(string protocol, Func<Task<T>> call)
+    {
+        try
+        {
+            return await call().ConfigureAwait(false);
+        }
+        catch (RpcException refusal) when (Negotiation?.LearnRefusal(refusal) == true && ProtocolNegotiation.IsRetrySafe(protocol))
+        {
+            return await call().ConfigureAwait(false);
+        }
     }
 
     /// <summary>
@@ -288,12 +327,15 @@ public sealed partial class HttpRpcClient : IRpcClient, IProtocolAddressableClie
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(protocol);
-        var responseBody = await PostBatchAsync(
-            $"{_prefix}/{Uri.EscapeDataString(protocol)}/{Uri.EscapeDataString(method)}",
-            parameters,
-            RequestMetadata(method, metadata, protocol: protocol),
-            cancellationToken).ConfigureAwait(false);
-        return await ReadUnaryAsync(responseBody, method, cancellationToken).ConfigureAwait(false);
+        return await NegotiatedAsync(protocol, async () =>
+        {
+            var responseBody = await PostBatchAsync(
+                $"{_prefix}/{Uri.EscapeDataString(protocol)}/{Uri.EscapeDataString(method)}",
+                parameters,
+                RequestMetadata(method, metadata, protocol: protocol),
+                cancellationToken).ConfigureAwait(false);
+            return await ReadUnaryAsync(responseBody, method, cancellationToken).ConfigureAwait(false);
+        }).ConfigureAwait(false);
     }
 
     public async Task<HttpProducerSession> OpenProducerAsync(
@@ -615,7 +657,19 @@ public sealed partial class HttpRpcClient : IRpcClient, IProtocolAddressableClie
         }
 
         request.Content.Headers.ContentType = MediaTypeHeaderValue.Parse(ArrowContentType);
+        if (Negotiation is { } negotiation)
+        {
+            request.Headers.TryAddWithoutValidation(ProtocolVersions.ClientHeader, negotiation.ClientVersions);
+        }
+
         using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        // Every RPC response names the server's windows (§4.1); the capability probe does not
+        // count, so learning starts here.
+        if (response.Headers.TryGetValues(ProtocolVersions.Header, out var advertised))
+        {
+            Negotiation?.LearnAdvertisement(string.Join(", ", advertised));
+        }
+
         var responseMethod = MethodFromPath(path);
         RequireResponseBudgetSupport(response, responseMethod);
         var responseAdvertisedMaxResponseBytes = StrictOptionalResponseBudgetHeader(
@@ -912,7 +966,18 @@ public sealed partial class HttpRpcClient : IRpcClient, IProtocolAddressableClie
             // projection an edge can read without an Arrow parser, and the server refuses a
             // request whose two carriers disagree.
             result[MetadataKeys.Protocol] = RequireProtocol(protocol ?? _protocol);
-            if (_options.ProtocolVersion is not null)
+            if ((protocol is null || protocol == _protocol) && Negotiation is { } negotiation)
+            {
+                // Throws before anything is sent when the server's window is known to share
+                // nothing with this client's (§6).
+                if (!result.ContainsKey(MetadataKeys.ProtocolVersion))
+                {
+                    result[MetadataKeys.ProtocolVersion] = negotiation.VersionToSend();
+                }
+
+                result.TryAdd(ProtocolVersions.ClientKey, negotiation.ClientVersions);
+            }
+            else if (_options.ProtocolVersion is not null)
             {
                 result.TryAdd(MetadataKeys.ProtocolVersion, _options.ProtocolVersion);
             }

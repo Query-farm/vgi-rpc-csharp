@@ -56,6 +56,7 @@ public sealed partial class RpcClient : IRpcClient, IProtocolAddressableClient
     private readonly SemaphoreSlim _operationLock = new(1, 1);
     private ShmSegment? _sharedMemory;
     private bool _transportOptionsChecked;
+    private ProtocolNegotiation? _negotiation;
     private bool _disposed;
     private string _protocol;
 
@@ -138,6 +139,79 @@ public sealed partial class RpcClient : IRpcClient, IProtocolAddressableClient
         try
         {
             await EnsureTransportOptionsAsync(cancellationToken).ConfigureAwait(false);
+            await EnsureNegotiatedAsync(protocol, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                return await CallUnaryCoreAsync(method, parameters, metadata, cancellationToken, protocol).ConfigureAwait(false);
+            }
+            catch (RpcException refusal) when (Negotiation?.LearnRefusal(refusal) == true
+                && ProtocolNegotiation.IsRetrySafe(protocol is { Length: > 0 } ? protocol : _protocol))
+            {
+                // One retry at the version just learned, only for a call safe to repeat (§6).
+                return await CallUnaryCoreAsync(method, parameters, metadata, cancellationToken, protocol).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            _operationLock.Release();
+        }
+    }
+
+    /// <summary>The negotiation state for this connection's own protocol, created on first use
+    /// (the protocol may be adopted after construction); <see langword="null"/> when the client
+    /// declares no protocol version.</summary>
+    private ProtocolNegotiation? Negotiation
+    {
+        get
+        {
+            if (_negotiation is null && _options.ProtocolVersion is { } version && _protocol.Length > 0)
+            {
+                _negotiation = ProtocolNegotiation.Create(_protocol, version, _options.ProtocolVersionRange);
+            }
+
+            return _negotiation;
+        }
+    }
+
+    /// <summary>A byte stream carries no headers, so a client with a wide window asks reflection
+    /// (exempt from the gate, and carrying <c>vgi_rpc.protocol_versions</c>) before its first call
+    /// on its own protocol (PROTOCOL_VERSIONS_V1.md §6). A failed probe changes nothing.</summary>
+    private async Task EnsureNegotiatedAsync(string? protocol, CancellationToken cancellationToken)
+    {
+        if (protocol is { Length: > 0 } && protocol != _protocol)
+        {
+            return;
+        }
+
+        if (Negotiation is not { IsWide: true, Learned: false } negotiation)
+        {
+            return;
+        }
+
+        try
+        {
+            using var empty = ValueCodec.EmptyRow(new Schema([], metadata: null));
+            using var reply = (await CallUnaryCoreAsync(
+                ReflectionProtocol.ListProtocolsMethod, empty, null, cancellationToken, ReflectionProtocol.ProtocolName).ConfigureAwait(false)).Batch;
+        }
+        catch (RpcException)
+        {
+        }
+
+        if (!negotiation.Learned)
+        {
+            negotiation.LearnAdvertisement("");
+        }
+    }
+
+    private async Task<AnnotatedBatch> CallUnaryCoreAsync(
+        string method,
+        RecordBatch parameters,
+        IReadOnlyDictionary<string, string>? metadata,
+        CancellationToken cancellationToken,
+        string? protocol)
+    {
+        {
             _sharedMemory?.Reset();
             var requestMetadata = RequestMetadata(method, metadata, protocol);
             AddSharedMemoryMetadata(requestMetadata);
@@ -163,10 +237,6 @@ public sealed partial class RpcClient : IRpcClient, IProtocolAddressableClient
 
             return await ReadUnaryResponseAsync(method, cancellationToken).ConfigureAwait(false);
         }
-        finally
-        {
-            _operationLock.Release();
-        }
     }
 
     private async Task<AnnotatedBatch> ReadUnaryResponseAsync(string method, CancellationToken cancellationToken)
@@ -184,6 +254,7 @@ public sealed partial class RpcClient : IRpcClient, IProtocolAddressableClient
                     case IncomingBatchKind.Exception:
                         var exception = RpcErrorDecoder.Decode(batch);
                         batch.Batch.Dispose();
+                        _ = Negotiation?.LearnRefusal(exception);
                         throw exception;
                     case IncomingBatchKind.Log:
                         DispatchLog(batch);
@@ -191,6 +262,7 @@ public sealed partial class RpcClient : IRpcClient, IProtocolAddressableClient
                         break;
                     case IncomingBatchKind.Pointer:
                     case IncomingBatchKind.Data:
+                        Negotiation?.LearnAdvertisement(batch.GetMetadata(ProtocolVersions.Key));
                         terminal?.Batch.Dispose();
                         terminal = await ResolveIncomingAsync(batch, cancellationToken).ConfigureAwait(false);
                         break;
@@ -366,7 +438,18 @@ public sealed partial class RpcClient : IRpcClient, IProtocolAddressableClient
                 + "from the contract type.");
         result[MetadataKeys.RequestVersion] = MetadataKeys.CurrentRequestVersion;
         result.TryAdd(MetadataKeys.RequestId, Guid.NewGuid().ToString("n"));
-        if (_options.ProtocolVersion is not null)
+        if (routingKey == _protocol && Negotiation is { } negotiation)
+        {
+            // Throws before anything is written when the server's window is known to share
+            // nothing with this client's (§6).
+            if (!result.ContainsKey(MetadataKeys.ProtocolVersion))
+            {
+                result[MetadataKeys.ProtocolVersion] = negotiation.VersionToSend();
+            }
+
+            result.TryAdd(ProtocolVersions.ClientKey, negotiation.ClientVersions);
+        }
+        else if (_options.ProtocolVersion is not null)
         {
             result.TryAdd(MetadataKeys.ProtocolVersion, _options.ProtocolVersion);
         }

@@ -66,6 +66,10 @@ public static class MetadataKeys
         public const string MethodNotImplemented = "method_not_implemented";
         public const string ProtocolVersionMismatch = "protocol_version_mismatch";
 
+        /// <summary>A request's version is outside the server's window (PROTOCOL_VERSIONS_V1.md
+        /// §4.3); replaces <see cref="ProtocolVersionMismatch"/>, which clients still recognise.</summary>
+        public const string ProtocolVersionUnsupported = "protocol_version_unsupported";
+
         // Protocol routing (WIRE_PROTOCOL.md 3.1). Three distinct answers a client depends on
         // being able to tell apart: no routing key at all, a routing key naming a protocol this
         // server does not host, and a hosted protocol that lacks the method
