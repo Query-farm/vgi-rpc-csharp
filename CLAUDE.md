@@ -55,7 +55,9 @@ nested one per `src/`, `test/`, `conformance/`, `benchmark/`, `examples/` folder
   integration tests against RustFS/fake-gcs-server via Testcontainers, Docker-gated, deliberately
   **not** wired into the default `dotnet build`/`dotnet test` gate (mirrors vgi-rpc-java's own
   separate `integrationTest` Gradle source set) — run them explicitly:
-  `dotnet test test/QueryFarm.VgiRpc.S3.Tests test/QueryFarm.VgiRpc.Gcs.Tests`.
+  `dotnet test test/QueryFarm.VgiRpc.S3.Tests test/QueryFarm.VgiRpc.Gcs.Tests`. CI's `s3-lane`
+  job runs `.S3.Tests` through `scripts/s3-lane.sh` (RustFS http + TLS, static keys and STS
+  session tokens, credential rotation; fails on any skip). `.Gcs.Tests` is still not run in CI.
 - `test/` — xUnit unit/integration tests, one project per `src/` project (`QueryFarm.VgiRpc.Tests`,
   `.Http.Tests`, `.Http.OAuth.Tests`, `.OpenTelemetry.Tests`, `.Sentry.Tests`), plus the two
   Docker-gated `.S3.Tests`/`.Gcs.Tests` projects described above (not in `vgi-rpc-csharp.slnx`).

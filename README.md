@@ -415,6 +415,23 @@ app.MapVgiRpc(server, tokenKey: sharedKey, externalization: ExternalizationOptio
 `VendorBlobClient` stores raw byte blobs (purpose `fs`) for callers that keep their own
 references, verifying each read against the reference's size and SHA-256.
 
+### Direct storage (your own bucket)
+
+A self-hosted server can keep large values in its operator's bucket instead of the blob vendor
+(direct-storage contract v1). `VGI_STORAGE_BACKEND` = `vendor` | `s3` | `gcs` | `none` selects the
+backend (unset: inferred from `VGI_BLOB_VENDOR_URL` / `VGI_STORAGE_S3_BUCKET` /
+`VGI_STORAGE_GCS_BUCKET`; more than one is refused, see `StorageBackendEnvironment`).
+`S3StorageEnvironment.ExternalizationFromEnvironment()` (package `QueryFarm.VgiRpc.S3`) builds the
+options from `VGI_STORAGE_S3_BUCKET`, `_PREFIX`, `_ENDPOINT`, `_REGION` (`auto` for R2),
+`_FORCE_PATH_STYLE` (default on with an endpoint), `_PUBLIC_ENDPOINT` (host for the URLs handed to
+clients), `_CHECKSUM` (`sha256`, or `none`: no upload grants), `_VERIFY`, explicit
+`_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` / `_SESSION_TOKEN` (else the SDK's default credential
+chain), and `VGI_STORAGE_URL_TTL_SECONDS` (capped by the credentials' expiry).
+`GcsStorageEnvironment.ExternalizationFromEnvironment()` does the same for `VGI_STORAGE_GCS_*`. The
+SDK's CRC32 trailing checksum is off by default (`S3Storage.Builder.WithRequestChecksumCalculation`);
+PUTs carry an explicit SHA-256. Add a lifecycle rule expiring `<prefix>rpc/` and `<prefix>obj/`
+after 1–2 days; the server never deletes.
+
 ### Storage transfer timeouts
 
 Storage transfers (the vendor's signed PUT and GET, `S3Storage` PUT/GET, ExternalLocation fetches)

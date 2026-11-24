@@ -63,11 +63,27 @@ public sealed class ExternalizationOptions
     /// neither is set.
     /// </summary>
     /// <param name="environment">Variable lookup; defaults to the process environment.</param>
-    /// <exception cref="ArgumentException">A malformed or contradictory value.</exception>
+    /// <remarks>The backend follows <see cref="StorageBackendEnvironment.Select"/>: an explicit
+    /// <c>VGI_STORAGE_BACKEND=none</c> ignores a vendor URL, and <c>s3</c> / <c>gcs</c> must be built
+    /// with their packages' <c>ExternalizationFromEnvironment</c>.</remarks>
+    /// <exception cref="ArgumentException">A malformed or contradictory value, or an s3/gcs backend.</exception>
     public static ExternalizationOptions? FromEnvironment(Func<string, string?>? environment = null)
     {
         var maxRequest = BlobVendorEnvironment.PositiveInt(BlobVendorEnvironment.MaxRequestBytes, environment);
-        var external = BlobVendorEnvironment.ServerConfigFrom(environment);
+        var backend = StorageBackendEnvironment.Select(environment);
+        if (backend is StorageBackend.S3 or StorageBackend.Gcs)
+        {
+            throw new ArgumentException(
+                $"{StorageBackendEnvironment.Backend}={backend.ToString().ToLowerInvariant()} needs the QueryFarm.VgiRpc.{backend} package: "
+                + $"build the options with {(backend == StorageBackend.S3 ? "S3StorageEnvironment" : "GcsStorageEnvironment")}.ExternalizationFromEnvironment");
+        }
+
+        var external = backend == StorageBackend.Vendor ? BlobVendorEnvironment.ServerConfigFrom(environment) : null;
+        if (backend == StorageBackend.Vendor && external is null)
+        {
+            throw new ArgumentException($"{StorageBackendEnvironment.Backend}=vendor needs {BlobVendorEnvironment.Url}");
+        }
+
         if (external is null)
         {
             return maxRequest is null ? null : new ExternalizationOptions { MaxRequestBytes = maxRequest };

@@ -14,6 +14,30 @@ on:
     - cron: "17 9 * * *"
 
 jobs:
+  # QueryFarm.VgiRpc.S3.Tests, which the default gate does not run (it is not in the solution):
+  # the direct-storage env wiring against RustFS over plain http (path style) and TLS with a
+  # private CA, each with static keys and with an STS AssumeRole session token, a
+  # credential_process rotation test, then the whole project (RustFS via Testcontainers, the
+  # throttle tests). The script fails if a storage test skips.
+  s3-lane:
+    name: Direct S3 (RustFS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: AWS CLI (STS calls in the lane)
+        run: |
+          command -v aws || {
+            curl -sSfL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o "$RUNNER_TEMP/awscli.zip"
+            unzip -q "$RUNNER_TEMP/awscli.zip" -d "$RUNNER_TEMP" && sudo "$RUNNER_TEMP/aws/install"
+          }
+          aws --version
+      - name: Run the direct-S3 lane
+        run: scripts/s3-lane.sh "$RUNNER_TEMP/s3-lane"
+
   build-test:
     strategy:
       fail-fast: false
